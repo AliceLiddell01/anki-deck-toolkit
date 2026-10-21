@@ -1583,20 +1583,25 @@ impl RuntimeBatchState for PitchAccentBatch {
     }
 
     /// Состояние прежней схемы хранит свидетельства прежнего валидатора; оно не
-    /// разбирается и не переносит доверие, а требует нового пакета.
+    /// разбирается и не переносит доверие, а требует нового пакета. Отсутствующие
+    /// или нетиповые поля версии — повреждение, а не прежняя схема: они уходят в
+    /// типизированный разбор и дают `ManifestCorrupt`.
     fn check_stored_compatibility(raw: &serde_json::Value) -> Result<(), AssetError> {
-        if raw["schema_version"].as_u64() != Some(u64::from(PITCH_BATCH_SCHEMA_VERSION)) {
+        if let Some(version) = raw["schema_version"].as_u64()
+            && version != u64::from(PITCH_BATCH_SCHEMA_VERSION)
+        {
             return Err(AssetError::new(
                 ErrorCode::UnsupportedSchemaVersion,
                 format!(
-                    "версия состояния пакета pitch-accent {} не поддерживается (текущая {PITCH_BATCH_SCHEMA_VERSION}); создайте новый пакет",
-                    raw["schema_version"]
+                    "версия состояния пакета pitch-accent {version} не поддерживается (текущая {PITCH_BATCH_SCHEMA_VERSION}); создайте новый пакет"
                 ),
             ));
         }
         let current = PitchAccentImageValidator::validator_identity();
-        if raw["validator"]["id"].as_str() != Some(current.id.as_str())
-            || raw["validator"]["version"].as_str() != Some(current.version.as_str())
+        if let (Some(id), Some(version)) = (
+            raw["validator"]["id"].as_str(),
+            raw["validator"]["version"].as_str(),
+        ) && (id != current.id || version != current.version)
         {
             return Err(AssetError::new(
                 ErrorCode::UnsupportedSchemaVersion,

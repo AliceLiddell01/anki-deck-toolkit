@@ -280,6 +280,48 @@ fn stored_state_of_the_previous_validator_is_refused_before_typed_parsing() {
 }
 
 #[test]
+fn stored_state_with_damaged_version_fields_is_corrupt_rather_than_outdated() {
+    let temporary = temp_store();
+    let batch = batch("damaged-version-fields", "幽霊", Some("ゆうれい"));
+    drop(PitchAccentBatchRuntime::create(temporary.path(), &batch).unwrap());
+    let state_path = temporary
+        .path()
+        .join(".runtime/batches/damaged-version-fields/state.json");
+    let current: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+
+    let mut missing_schema = current.clone();
+    missing_schema
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    let mut textual_schema = current.clone();
+    textual_schema["schema_version"] = serde_json::json!("2");
+    let mut missing_validator = current.clone();
+    missing_validator
+        .as_object_mut()
+        .unwrap()
+        .remove("validator");
+    let mut numeric_validator_version = current;
+    numeric_validator_version["validator"]["version"] = serde_json::json!(5);
+
+    for damaged in [
+        missing_schema,
+        textual_schema,
+        missing_validator,
+        numeric_validator_version,
+    ] {
+        let stored = serde_json::to_vec(&damaged).unwrap();
+        std::fs::write(&state_path, &stored).unwrap();
+        let mut reopened =
+            PitchAccentBatchRuntime::open(temporary.path(), "damaged-version-fields").unwrap();
+        let error = reopened.load().unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::ManifestCorrupt);
+        assert_eq!(std::fs::read(&state_path).unwrap(), stored);
+    }
+}
+
+#[test]
 fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
     let temporary = temp_store();
     let root = temporary.path();
