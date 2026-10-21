@@ -34,7 +34,7 @@ use crate::pitch_accent::{
 use crate::validation::SemanticValidator;
 
 /// Версия формата предметного состояния пакета.
-pub const PITCH_BATCH_SCHEMA_VERSION: u32 = 2;
+pub const PITCH_BATCH_SCHEMA_VERSION: u32 = 3;
 /// Версия внешней схемы нормализованного плана pitch.
 pub const PITCH_PLAN_SCHEMA_VERSION: u32 = 1;
 /// Максимальный размер причины точечного действия.
@@ -1580,6 +1580,30 @@ impl RuntimeBatchState for PitchAccentBatch {
 
     fn validate(&self) -> Result<(), AssetError> {
         PitchAccentBatch::validate(self)
+    }
+
+    /// Состояние прежней схемы хранит свидетельства прежнего валидатора; оно не
+    /// разбирается и не переносит доверие, а требует нового пакета.
+    fn check_stored_compatibility(raw: &serde_json::Value) -> Result<(), AssetError> {
+        if raw["schema_version"].as_u64() != Some(u64::from(PITCH_BATCH_SCHEMA_VERSION)) {
+            return Err(AssetError::new(
+                ErrorCode::UnsupportedSchemaVersion,
+                format!(
+                    "версия состояния пакета pitch-accent {} не поддерживается (текущая {PITCH_BATCH_SCHEMA_VERSION}); создайте новый пакет",
+                    raw["schema_version"]
+                ),
+            ));
+        }
+        let current = PitchAccentImageValidator::validator_identity();
+        if raw["validator"]["id"].as_str() != Some(current.id.as_str())
+            || raw["validator"]["version"].as_str() != Some(current.version.as_str())
+        {
+            return Err(AssetError::new(
+                ErrorCode::UnsupportedSchemaVersion,
+                "состояние пакета pitch-accent использует устаревший валидатор; автоматическое доверие не переносится, создайте новый пакет",
+            ));
+        }
+        Ok(())
     }
 
     fn referenced_blobs(&self) -> Vec<RuntimeBlobRef> {

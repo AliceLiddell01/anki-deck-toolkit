@@ -11,10 +11,8 @@ use crate::model::{
     Provenance, SemanticStatus, ValidationRecord,
 };
 use crate::pitch_accent::{
-    PitchAccentCaptureRect, PitchAccentCoordinateSpace, PitchAccentDarkThemeProof,
-    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentEvidence,
-    PitchAccentGraphEvidence, PitchAccentImageValidator, PitchAccentProvider,
-    PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm,
+    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentImageValidator,
+    PitchAccentResolvedForm,
 };
 use crate::pitch_batch::{
     PitchAccentBatch, PitchAccentBatchRuntime, PitchBatchItemStatus, PitchBatchOwnerSnapshot,
@@ -97,76 +95,17 @@ fn browser() -> crate::browser_runtime::BrowserRuntimeProvenance {
 }
 
 fn metadata(surface: &str, reading: &str, vocabulary_id: u64) -> PitchAccentDomainMetadata {
-    let source_url = format!("https://jpdb.io/vocabulary/{vocabulary_id}/{surface}/{reading}#a");
-    let rect = PitchAccentCaptureRect {
-        x: 100.0,
-        y: 200.0,
-        width: 20.0,
-        height: 10.0,
-    };
-    PitchAccentDomainMetadata {
-        surface: surface.into(),
-        reading: reading.into(),
-        jpdb_vocabulary_id: vocabulary_id,
-        evidence: PitchAccentEvidence {
-            provider: PitchAccentProvider::Jpdb,
-            source_url,
-            resolved_forms: vec![PitchAccentResolvedForm {
-                surface: surface.into(),
-                reading: reading.into(),
-            }],
-            graph_count: 1,
-            render: PitchAccentRenderEvidence {
-                kind: PitchAccentRenderKind::BrowserRegionScreenshot,
-                selector: ".pitch-accent-graph".into(),
-                graphs: vec![PitchAccentGraphEvidence {
-                    index: 0,
-                    selector: ".pitch-accent-graph".into(),
-                    viewport_rect: PitchAccentCaptureRect {
-                        x: 100.0,
-                        y: 100.0,
-                        width: 20.0,
-                        height: 10.0,
-                    },
-                    document_rect: rect,
-                }],
-                coordinate_space: PitchAccentCoordinateSpace::Document,
-                viewport_width: 1280,
-                viewport_height: 900,
-                document_width: 1280,
-                document_height: 1800,
-                scroll_x: 0.0,
-                scroll_y: 100.0,
-                pixel_width: 60,
-                pixel_height: 30,
-                device_scale_factor: 3.0,
-                page_scale_factor: 1.0,
-                dark_theme: PitchAccentDarkThemeProof {
-                    document_element_classes: vec!["dark-mode".into()],
-                    prefers_color_scheme: "dark".into(),
-                    computed_color_scheme: "dark".into(),
-                    background_selector: ".subsection-pitch-accent".into(),
-                    background_rgb: [24, 36, 48],
-                },
-                graph_union_rect: rect,
-                capture_rect: rect,
-            },
-            browser: browser(),
-        },
-    }
+    crate::pitch_accent::test_support::single_variant_metadata(
+        surface,
+        reading,
+        vocabulary_id,
+        format!("https://jpdb.io/vocabulary/{vocabulary_id}/{surface}/{reading}#a"),
+        browser(),
+    )
 }
 
 fn png(alternate: bool) -> Vec<u8> {
-    let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
-    let start = if alternate { 12 } else { 10 };
-    for x in start..(start + 40) {
-        image.put_pixel(x, 15, image::Rgba([235, 235, 235, 255]));
-    }
-    let mut output = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(image)
-        .write_to(&mut output, image::ImageFormat::Png)
-        .unwrap();
-    output.into_inner()
+    crate::pitch_accent::test_support::single_variant_png(alternate)
 }
 
 fn acquired(surface: &str, alternate: bool) -> JpdbPitchOutcome {
@@ -287,6 +226,57 @@ fn legacy_batch_schema_without_exact_attempt_and_plan_identity_fails_closed() {
         .unwrap()
         .remove("current_candidate_attempt_index");
     assert!(serde_json::from_value::<PitchAccentBatch>(legacy).is_err());
+}
+
+#[test]
+fn stored_state_of_the_previous_validator_is_refused_before_typed_parsing() {
+    let temporary = temp_store();
+    let mut batch = batch("previous-validator-state", "幽霊", Some("ゆうれい"));
+    let mut runtime = PitchAccentBatchRuntime::create(temporary.path(), &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+    let token = batch.item_token("幽霊").unwrap();
+    assert!(
+        runtime
+            .record_outcome(&mut batch, &token, acquired("幽霊", false))
+            .unwrap()
+    );
+    drop(runtime);
+    let state_path = temporary
+        .path()
+        .join(".runtime/batches/previous-validator-state/state.json");
+    let current: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+
+    // Состояние схемы 2: валидатор v5 и свидетельства объединения всех графиков.
+    let mut previous = current.clone();
+    previous["schema_version"] = serde_json::json!(2);
+    previous["validator"]["version"] = serde_json::json!("5");
+    let evidence =
+        &mut previous["items"][0]["attempts"][0]["outcome"]["candidate"]["metadata"]["evidence"];
+    let evidence = evidence.as_object_mut().unwrap();
+    evidence.remove("variant_selection");
+    evidence.insert("graph_count".into(), serde_json::json!(1));
+    let render = evidence["render"].as_object_mut().unwrap();
+    render.remove("captured_graph_count");
+    render.remove("padding_css_px");
+    render.insert("graph_union_rect".into(), render["capture_rect"].clone());
+    let previous = serde_json::to_vec(&previous).unwrap();
+
+    let mut current_schema_old_validator = current;
+    current_schema_old_validator["validator"]["version"] = serde_json::json!("5");
+    let current_schema_old_validator = serde_json::to_vec(&current_schema_old_validator).unwrap();
+
+    for stored in [previous, current_schema_old_validator] {
+        std::fs::write(&state_path, &stored).unwrap();
+        let mut reopened =
+            PitchAccentBatchRuntime::open(temporary.path(), "previous-validator-state").unwrap();
+        let error = reopened.load().unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::error::ErrorCode::UnsupportedSchemaVersion
+        );
+        assert_eq!(std::fs::read(&state_path).unwrap(), stored);
+    }
 }
 
 #[test]

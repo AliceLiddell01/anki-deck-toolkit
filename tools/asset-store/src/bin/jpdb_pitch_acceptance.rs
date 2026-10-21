@@ -57,7 +57,7 @@ struct PlanItem {
     reading: Option<String>,
     expected_outcome: ExpectedOutcome,
     expected_vocabulary_id: Option<u64>,
-    min_graph_count: Option<u32>,
+    min_variant_count: Option<u32>,
     expected_candidate_ids: Option<Vec<u64>>,
     selection: Option<JpdbPitchSelection>,
 }
@@ -95,7 +95,7 @@ struct RawPlanItem {
     reading: Option<String>,
     expected_outcome: ExpectedOutcome,
     expected_vocabulary_id: Option<u64>,
-    min_graph_count: Option<u32>,
+    min_variant_count: Option<u32>,
     expected_candidate_ids: Option<Vec<u64>>,
     selection: Option<RawSelection>,
 }
@@ -319,7 +319,7 @@ fn base_row(index: usize, item: &PlanItem, outcome: &str) -> Value {
         "normalized_reading": item.reading.as_deref().map(str::trim),
         "expected_outcome": item.expected_outcome.as_str(),
         "expected_vocabulary_id": item.expected_vocabulary_id,
-        "min_graph_count": item.min_graph_count,
+        "min_variant_count": item.min_variant_count,
         "expected_candidate_ids": item.expected_candidate_ids,
         "selection": item.selection,
         "outcome": outcome,
@@ -452,8 +452,11 @@ fn render_outcome(
                     "jpdb_vocabulary_id": metadata.jpdb_vocabulary_id,
                     "detail_url": metadata.evidence.source_url,
                     "canonical_reading": metadata.reading,
-                    "graph_count": metadata.evidence.graph_count,
-                    "graphs": metadata.evidence.render.graphs,
+                    "detected_variant_count": metadata.evidence.variant_selection.detected_variant_count,
+                    "selected_variant_index": metadata.evidence.variant_selection.selected_index,
+                    "selection_basis": metadata.evidence.variant_selection.basis,
+                    "captured_graph_count": metadata.evidence.render.captured_graph_count,
+                    "variant_selection": metadata.evidence.variant_selection,
                     "dark_theme_proof": metadata.evidence.render.dark_theme,
                     "capture_geometry": metadata.evidence.render,
                     "browser": metadata.evidence.browser,
@@ -551,7 +554,8 @@ fn expectation_issues(
                 &metadata.surface,
                 &metadata.reading,
                 metadata.jpdb_vocabulary_id,
-                metadata.evidence.graph_count,
+                metadata.evidence.variant_selection.detected_variant_count,
+                metadata.evidence.render.captured_graph_count,
                 acquisition_verified,
             ));
         }
@@ -693,7 +697,8 @@ fn acquired_expectation_issues(
     actual_surface: &str,
     actual_reading: &str,
     actual_vocabulary_id: u64,
-    actual_graph_count: u32,
+    actual_variant_count: u32,
+    captured_graph_count: u32,
     acquisition_verified: bool,
 ) -> Vec<String> {
     let mut issues = Vec::new();
@@ -714,11 +719,16 @@ fn acquired_expectation_issues(
             "ожидался ID словарной записи {expected_id}, получен {actual_vocabulary_id}"
         ));
     }
-    if let Some(min_graph_count) = item.min_graph_count
-        && actual_graph_count < min_graph_count
+    if let Some(min_variant_count) = item.min_variant_count
+        && actual_variant_count < min_variant_count
     {
         issues.push(format!(
-            "ожидалось не менее {min_graph_count} графиков, получено {actual_graph_count}"
+            "ожидалось не менее {min_variant_count} обнаруженных вариантов графика, получено {actual_variant_count}"
+        ));
+    }
+    if captured_graph_count != 1 {
+        issues.push(format!(
+            "PNG должен содержать ровно один график, в свидетельствах {captured_graph_count}"
         ));
     }
     if !acquisition_verified {
@@ -776,9 +786,9 @@ fn read_plan_items(plan: &Value) -> Result<Vec<PlanItem>, Box<dyn std::error::Er
             )
             .into());
         }
-        if raw_item.min_graph_count == Some(0) {
+        if raw_item.min_variant_count == Some(0) {
             return Err(
-                format!("plan.items[{index}].min_graph_count должен быть положительным").into(),
+                format!("plan.items[{index}].min_variant_count должен быть положительным").into(),
             );
         }
         if raw_item
@@ -806,11 +816,11 @@ fn read_plan_items(plan: &Value) -> Result<Vec<PlanItem>, Box<dyn std::error::Er
         {
             return Err(format!("plan.items[{index}].expected_vocabulary_id допустим только для expected_outcome=acquired").into());
         }
-        if raw_item.min_graph_count.is_some()
+        if raw_item.min_variant_count.is_some()
             && raw_item.expected_outcome != ExpectedOutcome::Acquired
         {
             return Err(format!(
-                "plan.items[{index}].min_graph_count допустим только для expected_outcome=acquired"
+                "plan.items[{index}].min_variant_count допустим только для expected_outcome=acquired"
             )
             .into());
         }
@@ -865,7 +875,7 @@ fn read_plan_items(plan: &Value) -> Result<Vec<PlanItem>, Box<dyn std::error::Er
             reading: raw_item.reading,
             expected_outcome: raw_item.expected_outcome,
             expected_vocabulary_id: raw_item.expected_vocabulary_id,
-            min_graph_count: raw_item.min_graph_count,
+            min_variant_count: raw_item.min_variant_count,
             expected_candidate_ids: raw_item.expected_candidate_ids,
             selection,
         });
@@ -1047,7 +1057,20 @@ fn append_html_item(html: &mut String, index: usize, item: &PlanItem, row: Optio
         ("Кандидаты", value_text(&row["candidates"])),
         ("URL словарной записи", value_text(&row["detail_url"])),
         ("Каноническое чтение", value_text(&row["canonical_reading"])),
-        ("Число графиков", value_text(&row["graph_count"])),
+        (
+            "Обнаружено вариантов графика",
+            value_text(&row["detected_variant_count"]),
+        ),
+        (
+            "Выбранный вариант (индекс DOM)",
+            value_text(&row["selected_variant_index"]),
+        ),
+        ("Основание выбора", value_text(&row["selection_basis"])),
+        ("Графиков в PNG", value_text(&row["captured_graph_count"])),
+        (
+            "Варианты и оценки выбора",
+            value_text(&row["variant_selection"]),
+        ),
         (
             "Геометрия захвата (CSS px, координаты документа)",
             value_text(&row["capture_geometry"]),
@@ -1142,7 +1165,7 @@ mod tests {
             reading: Some("ごうせいご".into()),
             expected_outcome,
             expected_vocabulary_id: None,
-            min_graph_count: None,
+            min_variant_count: None,
             expected_candidate_ids: None,
             selection: None,
         }
@@ -1296,17 +1319,25 @@ mod tests {
     fn acquired_requires_verified_status_and_all_declared_constraints() {
         let mut item = plan_item(ExpectedOutcome::Acquired);
         item.expected_vocabulary_id = Some(42);
-        item.min_graph_count = Some(2);
-        assert!(acquired_expectation_issues(&item, "合成語", "ごうせいご", 42, 2, true).is_empty());
+        item.min_variant_count = Some(2);
+        assert!(
+            acquired_expectation_issues(&item, "合成語", "ごうせいご", 42, 2, 1, true).is_empty()
+        );
         let mut katakana_surface = plan_item(ExpectedOutcome::Acquired);
         katakana_surface.surface = "ネコ".into();
         katakana_surface.reading = Some("ねこ".into());
         assert!(
-            acquired_expectation_issues(&katakana_surface, "ネコ", "ネコ", 1467640, 1, true)
+            acquired_expectation_issues(&katakana_surface, "ネコ", "ネコ", 1467640, 1, 1, true)
                 .is_empty()
         );
-        let issues = acquired_expectation_issues(&item, "合成語", "ごうせいご", 43, 1, false);
+        let issues = acquired_expectation_issues(&item, "合成語", "ごうせいご", 43, 1, 1, false);
         assert_eq!(issues.len(), 3);
+        let issues = acquired_expectation_issues(&item, "合成語", "ごうせいご", 42, 3, 3, true);
+        assert_eq!(
+            issues,
+            ["PNG должен содержать ровно один график, в свидетельствах 3"],
+            "обнаружение нескольких вариантов допустимо, несколько графиков в PNG — нет"
+        );
     }
 
     #[test]
@@ -1317,7 +1348,7 @@ mod tests {
                 "reading": "ごうせいご",
                 "expected_outcome": "acquired",
                 "expected_vocabulary_id": 42,
-                "min_graph_count": 2,
+                "min_variant_count": 2,
                 "selection": {
                     "vocabulary_id": 42,
                     "detail_url": "https://jpdb.io/vocabulary/42/合成語/ごうせいご"

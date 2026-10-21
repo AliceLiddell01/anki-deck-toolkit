@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Cursor;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -20,10 +19,8 @@ use crate::jpdb::{
 };
 use crate::model::{AssetIdentity, HumanDecision, LifecycleState, Provenance, SemanticStatus};
 use crate::pitch_accent::{
-    PitchAccentCaptureRect, PitchAccentCoordinateSpace, PitchAccentDarkThemeProof,
-    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentEvidence,
-    PitchAccentGraphEvidence, PitchAccentImageValidator, PitchAccentProvider,
-    PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm,
+    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentImageValidator,
+    PitchAccentResolvedForm,
 };
 use crate::pitch_batch::{
     PitchAccentBatch, PitchAccentBatchRuntime, PitchBatchItemStatus, PitchBatchOwnerSnapshot,
@@ -192,74 +189,17 @@ fn browser() -> BrowserRuntimeProvenance {
 }
 
 fn metadata(surface: &str, reading: &str, vocabulary_id: u64) -> PitchAccentDomainMetadata {
-    let rect = PitchAccentCaptureRect {
-        x: 100.0,
-        y: 200.0,
-        width: 20.0,
-        height: 10.0,
-    };
-    PitchAccentDomainMetadata {
-        surface: surface.into(),
-        reading: reading.into(),
-        jpdb_vocabulary_id: vocabulary_id,
-        evidence: PitchAccentEvidence {
-            provider: PitchAccentProvider::Jpdb,
-            source_url: format!("https://jpdb.io/vocabulary/{vocabulary_id}/{surface}/{reading}"),
-            resolved_forms: vec![PitchAccentResolvedForm {
-                surface: surface.into(),
-                reading: reading.into(),
-            }],
-            graph_count: 1,
-            render: PitchAccentRenderEvidence {
-                kind: PitchAccentRenderKind::BrowserRegionScreenshot,
-                selector: ".pitch-graph".into(),
-                graphs: vec![PitchAccentGraphEvidence {
-                    index: 0,
-                    selector: ".pitch-graph".into(),
-                    viewport_rect: PitchAccentCaptureRect {
-                        x: 100.0,
-                        y: 100.0,
-                        width: 20.0,
-                        height: 10.0,
-                    },
-                    document_rect: rect,
-                }],
-                coordinate_space: PitchAccentCoordinateSpace::Document,
-                viewport_width: 1280,
-                viewport_height: 900,
-                document_width: 1280,
-                document_height: 1800,
-                scroll_x: 0.0,
-                scroll_y: 100.0,
-                pixel_width: 60,
-                pixel_height: 30,
-                device_scale_factor: 3.0,
-                page_scale_factor: 1.0,
-                dark_theme: PitchAccentDarkThemeProof {
-                    document_element_classes: vec!["dark-mode".into()],
-                    prefers_color_scheme: "dark".into(),
-                    computed_color_scheme: "normal".into(),
-                    background_selector: "body".into(),
-                    background_rgb: [24, 36, 48],
-                },
-                graph_union_rect: rect,
-                capture_rect: rect,
-            },
-            browser: browser(),
-        },
-    }
+    crate::pitch_accent::test_support::single_variant_metadata(
+        surface,
+        reading,
+        vocabulary_id,
+        format!("https://jpdb.io/vocabulary/{vocabulary_id}/{surface}/{reading}"),
+        browser(),
+    )
 }
 
 fn png() -> Vec<u8> {
-    let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
-    for x in 10..50 {
-        image.put_pixel(x, 15, image::Rgba([235, 235, 235, 255]));
-    }
-    let mut output = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(image)
-        .write_to(&mut output, image::ImageFormat::Png)
-        .unwrap();
-    output.into_inner()
+    crate::pitch_accent::test_support::single_variant_png(false)
 }
 
 fn store_at(root: &std::path::Path) -> AssetStore {
