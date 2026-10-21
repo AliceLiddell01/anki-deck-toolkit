@@ -1482,6 +1482,10 @@ fn cached_validator_decision_does_not_cover_forged_context_or_changed_bytes() {
         reopened.read_candidate(&loaded, &candidate).unwrap(),
         png(false)
     );
+    assert!(crate::pitch_batch::candidate_context_is_verified(
+        &candidate,
+        &PitchAccentImageValidator::validator_identity()
+    ));
 
     // Подделка решения с согласованно пересчитанным контекстом — новый контекст:
     // она снова проходит через PitchAccentImageValidator и отвергается.

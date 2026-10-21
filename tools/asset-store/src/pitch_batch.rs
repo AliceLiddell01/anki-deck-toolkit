@@ -2046,6 +2046,17 @@ fn verified_candidate_contexts() -> MutexGuard<'static, BTreeSet<(String, Valida
     CONTEXTS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+#[cfg(test)]
+pub(crate) fn candidate_context_is_verified(
+    candidate: &PitchBatchCandidate,
+    validator: &ValidatorIdentity,
+) -> bool {
+    verified_candidate_contexts().contains(&(
+        candidate.validation_context_sha256.clone(),
+        validator.clone(),
+    ))
+}
+
 pub(crate) fn with_validation_context(
     mut candidate: PitchBatchCandidate,
 ) -> Result<PitchBatchCandidate, AssetError> {
