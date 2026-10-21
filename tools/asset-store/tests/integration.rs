@@ -19,5 +19,10 @@ mod kanji_ocr_contract;
 mod pitch_cli_contract;
 #[path = "pitch_corpus_trust_contract.rs"]
 mod pitch_corpus_trust_contract;
+// Генераторы эталонов собираются только с `reference-generator`; общий модуль
+// публикации от resvg не зависит, и его тесты должны исполняться штатным
+// `cargo test --workspace`.
+#[path = "../src/bin/common/reference_output.rs"]
+mod reference_output;
 #[path = "temp_workspace_contract.rs"]
 mod temp_workspace_contract;
