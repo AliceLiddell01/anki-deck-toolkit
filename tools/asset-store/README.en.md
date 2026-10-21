@@ -4,23 +4,23 @@
 
 <!-- i18n-source-git-blob: 456ac92d1bcc66077437a533a6baf5ddbba10f05 -->
 
-`asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. It does not read deck media, modify `media_files`, or copy images into decks.
+`asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
 ## Data locations
 
 The Kanji CLI defaults to `.asset-store/kanji`. The separate pitch-accent domain uses `.asset-store/pitch-accent`; these published corpora do not share manifests or `assets/`.
 
 ```text
-.asset-store/                          # целиком игнорируется Git (/.asset-store/)
+.asset-store/                          # ignored by Git in its entirety (/.asset-store/)
 ├── kanji/
-│   ├── .owner.json                 # маркер владельца; в Git не публикуется
-│   ├── manifest.json               # только действующие VERIFIED-записи
+│   ├── .owner.json                 # owner marker; not published to Git
+│   ├── manifest.json               # only active VERIFIED entries
 │   ├── assets/
 │   │   ├── gif/漢.gif
 │   │   └── png/饅.png
-│   ├── .runtime/                   # кандидаты, карантин, наборы
-│   ├── .journal/events.jsonl       # журнал операций; только дополнение
-│   ├── .tmp/                       # подготовка и маркеры транзакций
+│   ├── .runtime/                   # candidates, quarantine, batches
+│   ├── .journal/events.jsonl       # operation journal; append-only
+│   ├── .tmp/                       # staging and transaction markers
 │   └── .lock
 └── pitch-accent/
     ├── .owner.json
@@ -32,35 +32,35 @@ The Kanji CLI defaults to `.asset-store/kanji`. The separate pitch-accent domain
     └── .lock
 ```
 
-The root `.gitignore` excludes `/.asset-store/` and `/decks/` completely, without exceptions. Neither `.owner.json`, `manifest.json`, asset bytes, `.runtime/`, nor journals are tracked; missing corpora in a clean clone are expected.
+The root `.gitignore` excludes `/.asset-store/` and `/decks/` in their entirety: there are no whitelist exceptions inside these areas, so neither `.owner.json`, nor `manifest.json`, nor asset bytes, nor `.runtime/`, nor the operation journal ever reach Git. A missing corpus in a clean clone is a normal state, not a reason to publish anything.
 
-The internal `storage_path` and consumer filename differ. For example `assets/gif/漢.gif` has `consumer_filename: "漢.gif"` and becomes `media/漢.gif`; `anki-repo` uses that explicit consumer filename rather than deriving it from the storage layout.
+The internal `storage_path` and the consumer filename are different manifest values. For example, `assets/gif/漢.gif` has `consumer_filename: "漢.gif"` and lands in `media/漢.gif`. `anki-repo` uses the explicit consumer filename rather than deriving it from the asset store layout.
 
-`.runtime/manifest.json` shares `store_id` with the canonical manifest; `verify_integrity` checks both. `Pending` and `Quarantined` entries live under `.runtime`, while verified-corpus checks also exclude identity overlap between the two areas. A missing corpus is allowed.
+`.runtime/manifest.json` uses the same `store_id` as the main manifest. `verify_integrity` checks both areas. `Pending` and `Quarantined` entries stay in `.runtime`; the check of verified entries only compares the canonical corpus and the absence of identity overlap with `.runtime`. A missing corpus is allowed.
 
 ## Domain policy and manifest
 
 `AssetDomainPolicy` defines permitted identities, canonical storage location, consumer filename, formats, and size limits. `GenericDomainPolicy` preserves content-hash paths for unpublished generic assets. Domain policies reject foreign namespaces: `KanjiDomainPolicy` owns `kanji` and `PitchAccentDomainPolicy` owns `pitch_accent`.
 
-Legacy consumer filenames require separate proof through `AssetDomainPolicy::proves_legacy_consumer_filename(identity, filename)`. Default and generic policies provide none. Kanji accepts only exact `<key>.gif` or `<key>.png`, pitch-accent only `<key>.png`, always as safe basenames. This does not consult `legacy_location`, which describes an old internal manifest path rather than Anki's old media filename.
+Legacy consumer filenames require separate proof through `AssetDomainPolicy::proves_legacy_consumer_filename(identity, filename)`. Default and generic policies provide none. Kanji accepts only exact `<key>.gif` or `<key>.png`, pitch-accent only `<key>.png`, always as safe basenames. This does not consult `legacy_location`, which describes an old location inside the manifest rather than the name Anki sees in `media/`.
 
 Kanji GIF and PNG assets occupy separate `assets/gif/` and `assets/png/` directories, named exactly after a character and extension. For pitch-accent, the identity key is the exact surface form, not the reading: `assets/png/<surface>.png` is published to consumers as `<surface>.pitch.png`. For `飴`, storage is `assets/png/飴.png`, while Anki receives `飴.pitch.png`, independently of kanji media named `飴.png`. Reading and positive JPDB vocabulary ID are preserved as metadata/evidence.
 
-The store owns canonical consumer filenames but never rewrites existing note references. `anki-repo migrate-media` handles a legacy `<surface>.png` pitch reference (see [anki-repo documentation](../anki-repo/README.en.md)); the store provides verified bytes but does not rename its own files. Reading comparison treats hiragana/katakana as equivalent but requires the exact surface/reading pair to match a form of the selected dictionary entry, retaining the original JPDB reading in `evidence`.
+The store owns the **canonical** consumer filename but never rewrites existing note references. `anki-repo migrate-media` handles a legacy `<surface>.png` pitch reference (see [anki-repo documentation](../anki-repo/README.en.md)); the store provides verified bytes but does not rename its own files. Reading comparison treats hiragana/katakana as equivalent but requires the exact surface/reading pair to match a form of the selected dictionary entry, retaining the original JPDB reading in `evidence`.
 
-Decoding a PNG alone does not justify `VERIFIED`. `PitchAccentImageValidator` checks surface/reading, the real page of the entry with matching ID, at least one pitch graph, and dark-mode proof. Evidence records each graph rectangle in viewport and document coordinates, their geometric union, and `capture_rect`. A single graph is captured at its exact DOM rectangle; multiple graphs at their union, preserving natural gaps and adding no margin. Native CDP `clip` rounding permits PNG dimension deviations of up to 3 pixels. Dark-mode evidence links browser color-scheme settings, document class, computed background and PNG pixels. At least one background pixel must differ by no more than 8 per RGB channel from the observed color, and at least eight graph pixels must differ by more than 16 in some channel. Every PNG pixel must have `alpha=255`; the entire image is checked. Browser provenance is compulsory. Validator v5 enforces the current rendering contract: v4 proof does not inherit trust; incomplete proof yields `UNCERTAIN`.
+Decoding a PNG alone does not justify `VERIFIED`. `PitchAccentImageValidator` checks surface/reading, the real page of the entry with matching ID, at least one pitch graph, and dark-mode proof. Evidence records each graph rectangle in viewport and document coordinates, their geometric union, and `capture_rect`. A single graph is captured at its exact DOM rectangle; multiple graphs at their union, preserving natural gaps and adding no margin. Native CDP `clip` rounding permits PNG dimension deviations of up to 3 pixels. Dark-mode evidence links browser color-scheme settings, document class, computed background and PNG pixels. At least one background pixel must differ by no more than 8 per RGB channel from the observed color, and at least eight graph pixels must differ by more than 16 in some channel. Every PNG pixel must have `alpha=255`. These checks inspect the entire capture, so an artificial dark border is not needed. Browser provenance is compulsory. Validator v5 enforces the current rendering contract: v4 proof does not inherit trust; incomplete proof yields `UNCERTAIN`.
 
-Manifest schema is version `5`. In addition to SHA-256, byte size, format, state, origin and semantic decision, each entry has `consumer_filename`, and the store has `domain_id`. Automatic `ValidationRecord` and optional `HumanAttestation` bind to exact identity and SHA. For pitch-accent, human `Approve` cannot replace the current automatic `VERIFIED` from the expected `PitchAccentImageValidator` v5 ID/version. Human approval cannot rehabilitate old/incomplete evidence or `REJECTED`/`CORRUPT`; Kanji's existing approval policy remains unchanged. New bytes never inherit trust from a previous SHA, and record replacement requires compare-and-swap using the expected old SHA.
+Manifest schema is version `5`. In addition to SHA-256, byte size, format, state, origin and semantic decision, each entry has `consumer_filename`, and the store has `domain_id`. Automatic `ValidationRecord` and optional `HumanAttestation` bind to exact identity and SHA. For pitch-accent, a human `Approve` does not replace the automatic `ValidationRecord`: the same bytes still require a record with status `VERIFIED` and the expected `validator.id`/`validator.version` for `PitchAccentImageValidator` v5. Human approval cannot rehabilitate old/incomplete evidence or `REJECTED`/`CORRUPT`; Kanji's existing approval policy remains unchanged. New bytes never inherit trust from a previous SHA, and record replacement requires compare-and-swap using the expected old SHA.
 
 Schema v3/v4 and the legacy flat Kanji layout can be read. A mutating open performs versioned migration under an exclusive lock: preserves old bytes with hard links, checks SHA-256, atomically updates the manifest and removes old flat links. `.tmp/` transaction markers support completion or rollback after interruption. Unchanged SHA, `ValidationRecord`, and `HumanAttestation` remain, without refetching. After commit, old/new canonical paths do not coexist. CLI JSON reports `store.layout_migrated_on_open`.
 
-`AssetStore::read_verified` remains a read-compatible Kanji API. Other domains use `read_verified_with_policy`, which can read v3/v4 with legacy mapping and return the explicit consumer filename without modifying manifests, making state/lock files, changing layout, or performing recovery. Only a mutating open migrates. Exact bytes, checksum, size, format, validator identity, and human decision are checked.
+`AssetStore::read_verified` remains a read API compatible with `KanjiDomainPolicy`. Other domains use `read_verified_with_policy`, which can read v3/v4 with legacy mapping and return the explicit consumer filename without modifying manifests, making state/lock files, changing layout, or performing recovery. Only a mutating open migrates. Exact bytes, checksum, size, format, validator identity, and human decision are checked.
 
-The shared batch runtime owns safe filesystem operations under `.runtime/batches/<batch-id>`: `NOFOLLOW`, locks, revisions/CAS, atomic state writes, bounded reads, and SHA-addressed payloads. It deliberately does not know `KanjiBatch`, `KanjiMetrics`, Yarxi data, or HTML reports: domain adapters own those. A plain-text test state exercises reopening and reading blobs without kanji or image semantics.
+The shared batch runtime owns safe filesystem operations under `.runtime/batches/<batch-id>`: `NOFOLLOW`, locks, revisions/CAS, atomic state writes, bounded reads, and SHA-addressed payloads. It does not know about `KanjiBatch`, `KanjiMetrics`, Yarxi data, or HTML reports: domain adapters own those. A plain-text test state exercises reopening and reading blobs without kanji or image semantics.
 
 Shared Chromium sessions, executable discovery, launch diagnostics, CDP metrics, and technical network telemetry live in `browser_runtime.rs`. Yarxi retains selectors, URLs, TLS policies, filters, fallback, dark theme, and screenshot geometry. The shared runtime supports a separate `3.0` scale factor. JPDB uses isolated sessions; `pitch-assets` manages its own batches and publishes verified PNGs. Integration with `anki-repo` remains separate.
 
-The root `.gitignore` must keep all user areas private. The regression script copies it into a temporary repository, proves through real `git check-ignore` that all paths in both areas (including `.owner.json`, `manifest.json`, `assets/**`, `.runtime/**`, `.journal/events.jsonl`, legacy grouping directories and descendants) are ignored, and ensures `git add -A` never indexes them:
+User areas are not published through Git, in whole or in part: the root `.gitignore` excludes `/.asset-store/` and `/decks/` in their entirety, and there are no exceptions inside them. You can verify these rules with a real `git check-ignore` through a dedicated regression script — it copies the root `.gitignore` into a temporary repository, proves that all paths inside the two areas (including `.owner.json`, `manifest.json`, `assets/**`, `.runtime/**`, `.journal/events.jsonl`, legacy grouping directories, and nested directories) are ignored, and checks that after `git add -A` not a single such path remains in the index:
 
 ```bash
 bash tools/asset-store/tests/gitignore_regression.sh
@@ -122,30 +122,30 @@ If a process dies after `save_manifest` but before closing, `journal reconcile` 
 - Actual state equals prior `previous_*`: `outcome: aborted`.
 - Neither: `outcome: unknown`, with `reason`.
 
-Validator and human-trust decisions modify `validation` or `human_attestation` without altering SHA/lifecycle; the manifest cannot distinguish an applied from an unapplied transition. Their dangling intents therefore close as `unknown` with an explicit explanation, never a guessed `refused`. Reconciliation is idempotent.
+Validator and human-trust decisions modify `validation` or `human_attestation` without altering SHA/lifecycle, so the manifest cannot distinguish an applied from an unapplied transition. Their dangling intents therefore close as `unknown` with the reason `манифест не различает применённое и неприменённое изменение` ("the manifest does not distinguish an applied from an unapplied change"), and a failing transition body is never passed off as `refused`: the outcome stays unknown rather than guessed. Reconciliation is idempotent: a repeated call appends no events.
 
 ### Commands
 
-Both CLIs read their own `--store` journal:
+Both CLIs read the journal of their own store, which the shared `--store` option selects:
 
 ```bash
-# События по возрастанию seq; --limit оставляет последние N.
+# Events in ascending seq order; --limit keeps the last N.
 kanji-assets --store .asset-store/kanji journal list --limit 20
 pitch-assets --store .asset-store/pitch-accent journal list \
   --identity 幽霊 --operation verified_published
 
-# Целостность: строгая нумерация seq, уникальность event_id, корректность event_key;
-# результат ссылается на предшествующий Pending той же области и операции;
-# также проверяются допустимые однофазные события, оборванный хвост,
-# битые строки и ревизия не выше фактической.
-# Код возврата 3, если найдена проблема; открытые интенты перечисляются.
-# Журнал больше предела полного чтения — journal_too_large (код 4).
+# Integrity: strict seq numbering, unique event_id, valid event_key;
+# the result references the preceding Pending of the same area and operation;
+# allowed single-phase events, a truncated tail, broken lines, and a revision
+# that is not above the actual one are checked as well.
+# Exit code 3 if a problem is found; open intents are listed.
+# A journal above the full-read limit yields journal_too_large (exit code 4).
 kanji-assets --store .asset-store/kanji journal check
 
-# Сверка незакрытых интентов; печатает дописанные события.
+# Reconcile open intents; prints the appended events.
 kanji-assets --store .asset-store/kanji journal reconcile
 
-# Одно событие baseline со снимком текущего состояния; повтор отклоняется.
+# One baseline event with a snapshot of the current state; a repeat is refused.
 kanji-assets --store .asset-store/kanji journal baseline
 ```
 
@@ -228,11 +228,11 @@ Exit codes for `pitch-assets`:
 CLI argument parsing errors return `2` before execution. Store errors follow `AssetError::exit_code()`, not the batch outcome.
 
 ```bash
-# Просмотр и проверка корпуса без сетевого получения.
+# Inspect and check the corpus without a network acquisition.
 cargo run --locked -p asset-store --bin pitch-assets -- corpus list
 cargo run --locked -p asset-store --bin pitch-assets -- corpus check
 
-# Одно получение или пакет по строгому JSON-плану.
+# A single acquisition, or a batch driven by a strict JSON plan.
 cargo run --locked -p asset-store --bin pitch-assets -- ensure \
   --surface '幽霊' --reading 'ゆうれい'
 cargo run --locked -p asset-store --bin pitch-assets -- batch start \
@@ -240,7 +240,7 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch start \
 cargo run --locked -p asset-store --bin pitch-assets -- batch run \
   --batch-id my-pitch-batch --workers 4
 
-# Состояние, отчёт проверки и продолжение после решения.
+# State, review report, and continuation after a decision.
 cargo run --locked -p asset-store --bin pitch-assets -- batch status \
   --batch-id my-pitch-batch
 cargo run --locked -p asset-store --bin pitch-assets -- batch review \
@@ -248,7 +248,7 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch review \
 cargo run --locked -p asset-store --bin pitch-assets -- batch resume \
   --batch-id my-pitch-batch --workers 4
 
-# Явный выбор кандидата, адресный или пакетный повтор, отказ для точного SHA.
+# Explicit candidate selection, addressed or batch retry, and rejection for an exact SHA.
 cargo run --locked -p asset-store --bin pitch-assets -- batch select \
   --batch-id my-pitch-batch --surface '重複語' --vocabulary-id 101 \
   --detail-url 'https://jpdb.io/vocabulary/101/重複語/ちょうふくご'
@@ -312,11 +312,11 @@ On `Ctrl+C`, the coordinator stops dispatching and signals active requests. A re
 
 Publication reads metadata and `evidence` **only** from the identified attempt and requires its current `VERIFIED` result from `PitchAccentImageValidator` v5. `AssetStore::ingest_verified` rechecks bytes and CAS against the expected previous SHA before writing. Storage uses `assets/png/<surface>.png` and consumer name `<surface>.pitch.png`. If fresh reconciliation proves an existing canonical entry is valid under the current validator, it can be reused without a new network acquisition.
 
-Explicit `reacquire` starts a new generation and captures the owner's current SHA as the CAS baseline. If the store owner changes later, `batch status` detects `refresh_owner_drift` and blocks publishing the stale candidate. `batch reacquire --reason` archives the conflicting intent, adopts the current owner SHA as new baseline, starts another generation, and unlinks the old attempt so it cannot publish. If reacquisition produces the same SHA, metadata/evidence update only after v5 revalidation and matching CAS at that same store SHA. Publication always uses metadata from the exact active attempt. Visual rejection binds to one SHA and is not inherited by different bytes.
+Explicit `reacquire` starts a new generation and captures the owner's current SHA as the CAS baseline. If the store owner changes later, `batch status` detects `refresh_owner_drift` and blocks publishing the stale candidate. `batch reacquire` with the required `--reason` archives the conflicting publication intent, adopts the current owner SHA as new baseline, starts another generation, and unlinks the old attempt so it cannot publish. If reacquisition produces the same SHA, metadata/evidence update only after v5 revalidation and matching CAS at that same store SHA. Publication always uses metadata from the exact active attempt. Visual rejection binds to one SHA and is not inherited by different bytes.
 
 Addressed `retry` handles retryable technical failures without resetting neighboring completed items. After reconciliation, a record may be `ExistingVerified` although the latest batch outcome is a recoverable technical failure; targeted `retry` is then allowed to clear `ExistingVerified`, start a new generation, and set the current owner SHA as CAS baseline.
 
-`batch retry-technical --reason` applies the **same criterion** across all batch items, starting new generations for all currently retryable technical failures. It does not change nonretryable failures, published items, unfinished publication intents, ambiguous entries, no-pitch results, not-found results, conflicting items, or `pending` items. The transition is all-or-nothing; repeating a successful operation selects nothing. If owner reconciliation saves no other changes, `changed: false`; otherwise `changed` includes them. Selected identities are returned as `retried_identities` in plan order, absent for an empty selection. `no_pitch_accent_on_source` completes only the *current batch*, creating no empty record or permanent negative cache; `vocabulary_not_found` remains separately unresolved.
+`batch retry-technical` with the required `--reason` applies the **same criterion** across all batch items, starting new generations for all currently retryable technical failures. It does not change nonretryable failures, published items, unfinished publication intents, ambiguous entries, no-pitch results, not-found results, conflicting items, or `pending` items. The transition is all-or-nothing; repeating a successful operation selects nothing. If owner reconciliation saves no other changes, `changed: false`; otherwise `changed` includes them. Selected identities are returned as `retried_identities` in plan order, absent for an empty selection. `no_pitch_accent_on_source` completes only the *current batch*, creating no empty record or permanent negative cache; `vocabulary_not_found` remains separately unresolved.
 
 `batch review` saves `review.html` inside ignored batch `.runtime`. It shows acquired and canonical PNGs, surface/reading, JPDB detail link, graph count, SHA-256, size, validator status, and provenance/rendering proof. Ambiguous outcomes list all candidates; no-pitch, not-found, and technical failures are typed, without invented images. Text is escaped, and HTML neither modifies state nor establishes authority. Use explicit `select`, `reject`, `retry`, or `reacquire` for decisions; there is no manual bypass of current automatic verification.
 
@@ -326,7 +326,7 @@ Each `ensure` creates a new automatically generated batch directory and does not
 
 ## Acquisition from Yarxi
 
-`ensure` starts an isolated headless Chromium session and interacts with the real dynamic interface at `https://www.yarxi.su/`. It searches only within the kanji-search container, using the “Reading” input and “Find” button. On the “Information” tab, the provider requires the exact Unicode code point of the requested character and rejects unrelated entries. Yarxi article number and source metadata become image provenance.
+`ensure` starts an isolated headless Chromium session and interacts with the real dynamic interface at `https://www.yarxi.su/`. It searches only within the kanji-search container, its “Чтение” (Reading) field, and its “Найти” (Find) button. After the “Информация” (Information) tab is opened, the provider requires the exact Unicode code point of the requested character; a mismatched entry is rejected. The Yarxi article number and source metadata become image provenance.
 
 Normal `ensure` prioritizes primary `img.kakijun-gif` and reads its GIF bytes via shared browser asset facilities. Fallback is permitted only after **proving GIF absence**: the image area and tab are ready, Unicode matches, relevant network requests completed without network/HTTP/JavaScript errors, DOM has been stable for two seconds, and the GIF node is absent. A pending/failed GIF request, timeout, unfinished image, network or JS problem is an acquisition error, never `gif_absent`.
 
@@ -395,7 +395,7 @@ cargo run --locked --features session-rotation-acceptance -p asset-store --bin k
   --acceptance-rotate-after-items 1
 ```
 
-Check with `status` that existing checkpoints survived; another `batch run` resumes outstanding items. The acceptance flag changes only when a browser session rotates.
+Check with `status` that existing checkpoints survived; another `batch run` resumes outstanding items. The acceptance flag controls only the moment of browser-session rotation and does not change batch semantics.
 
 ### Temporary trees and acceptance ZIP artifacts
 
@@ -429,7 +429,7 @@ Acceptance programs run `cleanup_legacy_orphans(min_age)` at startup and before 
 
 ### Yarxi certificate
 
-Chrome can currently show `ERR_CERT_AUTHORITY_INVALID` for Yarxi. By default the tool may follow only the Chrome warning page's “Proceed to site” link for the original URL with exact host `www.yarxi.su`, exact error code `ERR_CERT_AUTHORITY_INVALID` (case-insensitive), and an actual proceed link. It does **not** enable global `--ignore-certificate-errors` or process-wide TLS verification bypass. The exception is restricted to Yarxi; `--allow-insecure-tls=false` requires a valid certificate. Different host, TLS error, or URL form still aborts.
+Chrome can currently show `ERR_CERT_AUTHORITY_INVALID` for Yarxi. By default the tool may follow only the Chrome warning page's “Перейти на сайт” (Proceed to site) link for the original URL with exact host `www.yarxi.su`, exact error code `ERR_CERT_AUTHORITY_INVALID` (case-insensitive), and an actual proceed link. It does **not** enable global `--ignore-certificate-errors` or process-wide TLS verification bypass. The exception is restricted to Yarxi; `--allow-insecure-tls=false` requires a valid certificate. Different host, TLS error, or URL form still aborts.
 
 ## Semantic validator and calibration run
 
@@ -482,40 +482,40 @@ Calibration covers pinned glyphs and their closest incorrect identities but **do
 Run from the workspace root:
 
 ```bash
-# Идемпотентно получить и проверить один или несколько кандзи.
+# Idempotently acquire and validate one or more kanji.
 cargo run --locked --bin kanji-assets -- \
   --output json ensure 漢 字
 
-# Проверить только новые или устаревшие решения проверки.
+# Validate only new or outdated validation decisions.
 cargo run --locked --bin kanji-assets -- --output json validate --mode new
 
-# Перепроверить все ресурсы.
+# Revalidate all assets.
 cargo run --locked --bin kanji-assets -- --output json validate --mode full
 
-# Просмотреть состояние и детерминированный план проверки.
+# Inspect state and the deterministic validation plan.
 cargo run --locked --bin kanji-assets -- --output json list
 cargo run --locked --bin kanji-assets -- --output json plan \
   --mode new --validator-id kanjivg-pixel-chamfer \
   --validator-version kanjivg-r20250816-5581e65d-noto-serif-jp-24fc2d26-ea6231b1-mask64-v6
 
-# Вручную импортировать локальный кандидат (он останется в состоянии pending).
+# Manually import a local candidate (it stays in the pending state).
 cargo run --locked --bin kanji-assets -- --output json ingest \
   --character 漢 --file ./candidate.png
 
-# Создать пакет (ID генерируется автоматически) и пройти до пяти раундов обхода по ширине.
+# Create a batch (the ID is generated automatically) and run up to five breadth-first rounds.
 cargo run --locked --bin kanji-assets -- --output json batch start 漢 字
 cargo run --locked --bin kanji-assets -- --output json batch run --batch-id <id>
 
-# Продолжить пакет позже, посмотреть состояние в JSON или записать локальный HTML-отчёт.
+# Continue the batch later, inspect state as JSON, or write a local HTML report.
 cargo run --locked --bin kanji-assets -- --output json batch status --batch-id <id>
 cargo run --locked --bin kanji-assets -- --output json batch review --batch-id <id>
 
-# Применить явное решение пользователя по точному SHA-256.
+# Apply an explicit user decision for an exact SHA-256.
 cargo run --locked --bin kanji-assets -- --output json batch decide \
   --batch-id <id> --character 漢 --sha256 <sha256> \
   --action confirm --reason "пользователь подтвердил текущий кандидат"
 
-# После серии технических сбоев разрешить новое поколение получения.
+# After a series of technical failures, allow a new acquisition generation.
 cargo run --locked --bin kanji-assets -- --output json batch retry \
   --batch-id <id> --character 字 --reason "источник снова доступен"
 ```
@@ -532,7 +532,7 @@ JSON output includes `schema_version`, `operation`, `store`, `mode`, `assets`, `
 
 `batch start [--batch-id ID] CHARACTER...` deduplicates identities, creates versioned `.runtime/batches/<id>/` state, and marks resources already confirmed as currently `verified` by their owner before acquisition. Reusing an ID requires identical requested identities and validator and resumes saved state instead of starting over.
 
-`batch run --batch-id ID [--rounds 1..5] [--interactive-review]` performs up to five acquisition rounds. New batches use `kanji-single-candidate-v1`: a technically valid but `UNCERTAIN` or `REJECTED` candidate immediately becomes `awaiting_human`, without redownloading alternatives or inflating trust by averaging. Retryable technical failures may still use five rounds. Each round processes the current queue before retry; existing published/verified entries are not reacquired. Per-item failures remain in `issues` without undoing neighboring results. Browsers run without holding the batch lock. After each actual result, CLI reacquires the runtime lock, checks generation and attempt count, saves candidate bytes/evidence and atomically checkpoints state before processing the next item. Stale results are discarded.
+`batch run --batch-id ID [--rounds 1..5] [--interactive-review]` performs up to five acquisition rounds. New batches use `kanji-single-candidate-v1`: a technically valid but `UNCERTAIN` or `REJECTED` candidate immediately becomes `awaiting_human`, without redownloading alternatives or inflating trust by averaging. Retryable technical failures remain limited to five rounds. Each round processes the current queue before retry; existing published/verified entries are not reacquired. Per-item failures remain in `issues` without undoing neighboring results. Browsers run without holding the batch lock. After each actual result, CLI reacquires the runtime lock, checks generation and attempt count, saves candidate bytes/evidence and atomically checkpoints state before processing the next item. A result is discarded as stale if the item's state changed during acquisition.
 
 `batch run --workers` allows `1`–`4` workers, default `4`, with independent browser sessions. The default came from comparative live measurements on an identical set of 300 kanji.
 
@@ -552,7 +552,7 @@ Shared per-item/per-stage DEBUG events are `browser_acquisition_item` and `brows
 
 Required event fields: `event`, `schema`, `schema_version`, `provider`, sanitized `identity`, `attempt`, `generation`, `stage`, `stage_duration_ms`, `item_duration_ms`, `outcome`, `retryable`. Optional: `worker`, `worker_session`, `browser_session`, `failure_code`, `stop_reason`, `runtime_snapshot`. Providers are `jpdb` and `yarxi-suu-browser`. Pitch worker/session IDs are local to that worker; they may be absent elsewhere. `browser_session` identifies a browser session. `provider`, `outcome`, `failure_code`, and `stop_reason` are restricted to safe tokens, replacing invalid entries with `redacted`. Identity is sanitized and bounded at 256 bytes. On failure/interruption, `failure_code` and available final `runtime_snapshot` are included; `stop_reason` identifies the stop independently. `retryable` represents the provider's decision, not whether retry occurred. `generation` is Kanji owner generation or `null` for provider-only use—never a synthetic zero. When a monitor/session fails **after** a domain outcome, the item keeps its original result, while `stop_reason`/fresh snapshot explain queue termination.
 
-`stage` names correspond to actual execution boundaries. JPDB uses `browser_launch`, `configure_browser`, `request_validation`, `search_resolution`, `search_navigation`, `search_readiness`, `detail_navigation`, `detail_readiness`, `detail_verification`, `pitch_inspection`, `capture`, `post_capture_verification`, `candidate_validation`, `outcome_validation`, `checkpoint`. The final three represent pitch-result validation and persistence, including lock reacquisition, state reread and CAS. Redirects directly to detail pages may omit `detail_navigation`. A custom `PitchRunDriver` using the default method records `provider_acquisition` rather than detailed JPDB stages. Yarxi uses `search_submission`, `information_tab`, `article_verification`, `media_readiness`, `media_selection`, `dark_theme`, `resource_read`, `font_sample_capture`, `retry_backoff`, `retry_recovery`, `semantic_validation`, `final_validation`, `checkpoint`. The last three cover image semantics, candidate checks and CAS checkpoint. Nested or parallel durations may overlap; **never sum them** as sequential intervals. Successful stages use `outcome: "success"`. Successful JPDB item outcomes are `acquired`, `no_pitch_accent_on_source`, `ambiguous_vocabulary`, `vocabulary_not_found`; errors/interruption are `failure`/`interrupted`, with `failure_code`. Successful Yarxi item outcome is `success`.
+`stage` names correspond to actual execution boundaries. JPDB uses `browser_launch`, `configure_browser`, `request_validation`, `search_resolution`, `search_navigation`, `search_readiness`, `detail_navigation`, `detail_readiness`, `detail_verification`, `pitch_inspection`, `capture`, `post_capture_verification`, `candidate_validation`, `outcome_validation`, `checkpoint`. The final three represent pitch-result validation and persistence, including lock reacquisition, state reread and CAS. Redirects directly to detail pages may omit `detail_navigation`. A custom `PitchRunDriver` using the default method records `provider_acquisition` for the whole acquisition, whereas the production JPDB driver records the specific provider stages. Yarxi uses `search_submission`, `information_tab`, `article_verification`, `media_readiness`, `media_selection`, `dark_theme`, `resource_read`, `font_sample_capture`, `retry_backoff`, `retry_recovery`, `semantic_validation`, `final_validation`, `checkpoint`. The last three cover image semantics, candidate checks and CAS checkpoint. Nested or parallel durations may overlap; **never sum them** as sequential intervals. Successful stages use `outcome: "success"`. Successful JPDB item outcomes are `acquired`, `no_pitch_accent_on_source`, `ambiguous_vocabulary`, `vocabulary_not_found`; errors/interruption are `failure`/`interrupted`, with `failure_code`. Successful Yarxi item outcome is `success`.
 
 `runtime_snapshot` is a JSON projection of latest CDP telemetry encoded as a string, limited to **32 KiB**. It includes `epoch`, `pending_request_count`, `network_failure_count`, `http_error_count`, up to 16 records each in `pending_requests`, `network_failures`, `http_errors`, plus `javascript_exceptions` and `monitor_failed`. Stale-epoch counts/collections are `stale_pending_request_count`, `stale_network_failure_count`, `stale_http_error_count`, `stale_pending_requests`, `stale_network_failures`, `stale_http_errors`; JavaScript exceptions are separated into current, startup and stale groups. Every current/stale collection is capped at 16. A sample has hashed `request_key` (SHA-256, never raw CDP ID), resource type, epoch, whether current/top-level, observation age, HTTP status and network error category. No raw URL, headers, cookies, DOM or CDP messages enter snapshots. If too large, a compact object with `truncated: true` retains current epoch, current/stale counts, JS exception breakdown and `monitor_failed`, using the same diagnostic projection for counts.
 
@@ -573,7 +573,7 @@ Before publication, candidates/attempts are stored in batch `.runtime`. A single
 
 After exhausting technical retries, items without candidates become `awaiting_human`; valid uncertain candidates in new batches reach it after the first persisted attempt. `batch review` creates an ignored local HTML report with animated GIFs, all distinct candidate images, exact SHAs, automatic verdicts, attempt evidence and aggregate metrics. Candidate blobs remain SHA-addressed in `candidates/`; HTML is never authoritative.
 
-`batch decide` accepts only structured `confirm`, `reject`, `reacquire` for current `--character`/`--sha256`. `confirm` requires technically valid GIF/PNG, exact comparison to expected source SHA, domain-owned automatic evidence, and complete decoding **before** human approval. `reject` stores the person's decision against the exact candidate and starts a new generation for that identity alone; `reacquire` plans a targeted refresh without determining semantic suitability. After five technical failures with no candidate, use `batch retry` **without** `--sha256`; with an existing candidate, SHA is required.
+`batch decide` accepts only structured `confirm`, `reject`, `reacquire` for current `--character`/`--sha256`. `confirm` requires technically valid GIF/PNG, exact comparison and replacement of the expected source SHA, domain-owned automatic evidence, and complete decoding **before** human approval. `reject` stores the person's decision against the exact candidate and starts a new generation for that identity alone; `reacquire` plans a targeted refresh without determining semantic suitability. After five technical failures with no candidate, use `batch retry` **without** `--sha256`; with an existing candidate, SHA is required.
 
 `batch status` returns state; `batch review` also writes the report. Batch JSON includes `batch_id`, `counts`, `items`, per-item `issues`, `blockers`, optional `review_artifact`, and complete `batch` state/evidence. `run` returns 0 only when all assets are resolved in the canonical store; unresolved human review/partial progress returns 3. Individual errors remain attached to their identities. Successful `start`, `status`, `review`, `decide`, `retry` return 0; boundary/schema/integrity system failures use the owner library's usual exit codes.
 
@@ -585,7 +585,7 @@ Ordinary commands, pipelines and JSON mode never prompt or open applications. An
 
 ```bash
 cargo run --quiet --locked --bin kanji-assets -- batch run --batch-id ID --interactive-review
-# Вернуться к сохранённым кандидатам без получения из сети:
+# Return to saved candidates without a network acquisition:
 cargo run --quiet --locked --bin kanji-assets -- batch review-interactive --batch-id ID
 ```
 
@@ -595,7 +595,7 @@ GUI-free commands:
 
 ```bash
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-export --batch-id ID
-# Отредактировать указанный review_artifact, затем применить его review_id:
+# Edit the indicated review_artifact, then apply its review_id:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-apply --batch-id ID --review-id FULL_REVIEW_SHA256
 ```
 
@@ -629,38 +629,38 @@ Old `kanji-distinct-mean-v2` batches remain readable under their prior rules. Ex
 `batch ocr` processes an **already saved** batch sequentially. Ordinary `start`, `run`, `status`, `review`, verified reads and all pitch-accent operations do not contact Ollama. The owner first checks canonical-store integrity and current trust, reusing verified assets. OCR is permitted **only** for current, technically valid `awaiting_human` candidates with validator-v6 `Uncertain`. `Verified`, `Rejected`, `Corrupt` and resolved entries do not even trigger Ollama discovery. No Yarxi refetch occurs.
 
 ```bash
-# Обычный путь, без OCR:
+# The ordinary path, without OCR:
 cargo run --quiet --locked --bin kanji-assets -- batch start --batch-id my-kanji 漢 字
 cargo run --quiet --locked --bin kanji-assets -- batch run --batch-id my-kanji
 
-# Явно включить OCR сохранённых неопределённых кандидатов:
+# Explicitly enable OCR for saved uncertain candidates:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
   --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' \
   --endpoint 'http://127.0.0.1:11434' --timeout-seconds 120
 
-# Для Windows-host из WSL задайте реально доступный адрес вместо примера:
+# For a Windows host from WSL, set a reachable address instead of the example:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
   --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' \
   --endpoint 'http://192.168.1.2:11434' --allow-remote
 
-# Получить TSV и index.html рядом с ним; решения изначально пустые, '-' означает явный пропуск:
+# Get the TSV and the index.html beside it; decisions start empty, '-' means an explicit skip:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-export --batch-id my-kanji
-# После просмотра группы совпадений оставьте подтверждаемые строки пустыми, '-' поставьте для пропуска;
-# внесите явные решения для остальных строк в TSV.
-# Команда применит их вместе с подтверждённой группой совпадений.
+# After reviewing a matching group, leave confirmable rows empty and put '-' to skip them;
+# enter explicit decisions for the other rows in the TSV.
+# The command applies them together with the confirmed matching group.
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-confirm-matches \
   --batch-id my-kanji --review-id FULL_REVIEW_SHA256 --confirm-reviewed
-# После применения группы создайте новый снимок для оставшихся строк.
+# After applying the group, create a new snapshot for the remaining rows.
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-export --batch-id my-kanji
-# Внесите оставшиеся решения и примените с новым review_id:
+# Enter the remaining decisions and apply them with the new review_id:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-apply \
   --batch-id my-kanji --review-id NEW_REVIEW_SHA256
-# Явный повтор OCR, включая сохранённые отказы:
+# An explicit OCR re-run, including saved refusals:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
   --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' --rescan
 ```
 
-After confirming one matching group, create a new `review-export` for remaining rows because their state changed. `review-confirm-matches` uses the same full TSV, SHA, generation, copied-image verification and atomic `human_decisions` checks as `review-apply`. Only empty rows in the matching group receive new approvals; `-` explicitly skips a row. Already populated TSV decisions are applied too. `--confirm-reviewed` means the human actually examined images, acknowledging possible OCR misidentification. Neither generating nor opening a report approves anything. Row order is matches, mismatches, unknown/refused and no OCR. Additional TSV columns (`observed`, match flag, refusal, suggestion key) are protected metadata and cannot be edited. Old snapshots lacking these columns remain readable.
+After applying a matching group, create a new `review-export` for the remaining rows: their state has changed, and the previous snapshot still contains the rows already applied. `review-confirm-matches` uses the same full TSV, SHA, generation, copied-image verification and atomic `human_decisions` checks as `review-apply`. Only empty rows in the matching group receive new approvals; `-` explicitly skips a row. Already populated TSV decisions are applied too. `--confirm-reviewed` means the human actually examined images, acknowledging possible OCR misidentification. Neither generating nor opening a report approves anything. Row order is matches, mismatches, unknown/refused and no OCR. Additional TSV columns (`observed`, match flag, refusal, suggestion key) are protected metadata and cannot be edited. Old snapshots lacking these columns remain readable.
 
 The base URL must be HTTP, without credentials, path, query or fragment. **Anything other than literal loopback IPv4/IPv6** requires `--allow-remote`, including DNS names and private WSL hosts; this explicitly permits sending images to the selected server. Proxies and HTTP redirects are disabled. Users install Ollama/models and run their own server; the tool does neither. `/api/tags` pins the installed model digest; `/api/show` requires `vision` capability and rejects declared `remote_host` cloud models. Model/endpoint are configurable; `127.0.0.1` inside WSL does not automatically address the Windows host.
 

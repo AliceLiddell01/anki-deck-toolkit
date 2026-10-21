@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 4f88ee07c3bb52f37816e0637494b90b6f667c9b -->
+<!-- i18n-source-git-blob: cf4c051e39d649969d08fa819a37cdfe7c7332e2 -->
 
 `anki-repo` 是一套用于确定性分析 CrowdAnki 导出数据、并对其内容实施严格受限修改的工具。它使智能体能够快速、可预测地了解 `deck.json` 的结构，而无需人工通读数 MB 的 JSON 文件。
 
@@ -49,7 +49,7 @@
 cargo build --release --workspace
 ./target/release/anki-repo --help
 
-# или без установки
+# 或不安装
 cargo run --quiet --bin anki-repo -- inspect decks/output/Words__N3
 ```
 
@@ -101,13 +101,13 @@ anki-repo inspect decks/output/Words__N1 --verbose
 按稳定条件查找笔记。必须且只能指定一种条件：`--guid`，或者同时提供 `--field` 和 `--value`。
 
 ```bash
-# поиск по guid: identity lookup
+# 按 guid 查找：identity lookup
 anki-repo find decks/output/Words__N1 --guid 'D!TAYVuHi,'
 
-# поиск по сырому значению поля: содержит подстроку
+# 按字段原始值查找：包含子串
 anki-repo find decks/output/Words__N1 --field Слово --value 偶然
 
-# общий поиск по любому имени поля: подстрока и точное совпадение
+# 按任意字段名进行通用查找：子串或精确匹配
 anki-repo find decks/output/Words__N2 --field 'Часть речи' --value Существительное
 anki-repo find decks/output/Words__N1 --field 'Часть речи' --value Существительное --match exact
 ```
@@ -187,7 +187,7 @@ anki-repo --json qa decks/output/Words__N5 > findings.json
 - `error` 表示对读者而言的缺陷严重程度，而非命令失败；即使发现 `error` 级问题，`qa` 也返回退出码 `0`。
 - 纯空白字符字段会同时触发 `leading_whitespace` 和 `trailing_whitespace`。
 - 空值与缺失值不同：`""` 和纯空格字符串都会被检查；`null` 或非字符串不算空字段，由 `validate` 处理。
-- `duplicate_note_content` 比较相同笔记类型下整个原始字段值数组及其位置，不对 HTML 或空白字符进行规范化。不假设存在“主字段”，因为主字段的语义属于特定笔记类型，不属于通用 CrowdAnki 格式。调用者可在 `find` 或 `review` 中明确指定 `--field`、`--value` 进行分组。
+- `duplicate_note_content` 比较相同笔记类型下整个原始字段值数组及其位置，不对 HTML 或空白字符进行规范化。不假设存在“主字段”，因为主字段的语义属于特定笔记类型，不属于通用 CrowdAnki 格式，因此工具集无法为其定义正确的通用语义。调用者可在 `find` 或 `review` 中明确指定 `--field`、`--value` 进行分组。
 - 注册表**恰好只有以上五个代码**。`duplicate_primary_field` 及“`Слово` 必然是主字段”的假设被有意移除（参见“公共契约变更”）。请求已删除的规则会得到 `unknown_qa_code`。
 - 规则不依赖笔记类型和字段名称：同样的值换成其他字段名或类型后仍得到相同问题。
 - QA 问题不会导致导出结构无效，也不会阻止 `edit`。`error | warning | info` 描述内容缺陷，独立于 `validate`；QA `error` 不是结构错误。
@@ -201,13 +201,13 @@ anki-repo --json qa decks/output/Words__N5 > findings.json
 为外部审阅生成紧凑且数量受限的笔记数据包。`qa` 主要描述问题；`review` 则提供需要实际阅读和思考的内容：按 `ord` 排序的笔记字段及各笔记已有的 QA 问题。
 
 ```bash
-# отобрать заметки по найденной проблеме
+# 按已发现的问题筛选笔记
 anki-repo review decks/output/Words__N1 --qa-code empty_field_value --limit 25
 
-# следующая страница
+# 下一页
 anki-repo review decks/output/Words__N1 --qa-code empty_field_value --offset 25
 
-# выбор по содержимому и точный lookup
+# 按内容筛选和精确查找
 anki-repo review decks/output/Words__N2 --field 'Часть речи' --value Существительное
 anki-repo review decks/output/Words__N1 --guid 'D!TAYVuHi,'
 ```
@@ -236,14 +236,14 @@ anki-repo review decks/output/Words__N1 --guid 'D!TAYVuHi,'
 根据导出的**当前**状态验证外部智能体的修改建议。命令只读，不会写入 `deck.json` 或任何辅助文件。
 
 ```bash
-# проверить предложения и получить готовый запрос для `edit`
+# 验证建议并生成可直接交给 `edit` 的请求
 anki-repo --json review-check decks/output/Words__N1 \
   --proposals proposals.json | jq .result.edit_request > request.json
 
-# то же со stdin
+# 相同操作，改用 stdin
 anki-repo review-check decks/output/Words__N1 --proposals - < proposals.json
 
-# готовый запрос уходит в существующую границу записи
+# 生成的请求走既有的写入边界
 anki-repo edit decks/output/Words__N1 --request request.json
 anki-repo edit decks/output/Words__N1 --request request.json --apply
 anki-repo validate decks/output/Words__N1
@@ -314,15 +314,15 @@ anki-repo validate decks/output/Words__N1
 ```bash
 EXPORT=decks/output/Words__N1
 
-# модели корневой колоды экспорта (селектор по умолчанию — preorder 0)
+# 导出根牌组的笔记类型（默认选择器：preorder 0）
 anki-repo models "$EXPORT"
 
-# колода по имени, по идентичности или по позиции в обходе
+# 按名称、身份或遍历顺序选择牌组
 anki-repo models "$EXPORT" --deck "Words::N1"
 anki-repo models "$EXPORT" --deck-uuid 00000000-0000-0000-0000-000000000000
 anki-repo models "$EXPORT" --deck-preorder 1
 
-# сколько примеров значений показывать на поле (1..10, по умолчанию 3)
+# 每个字段显示多少个示例值（1..10，默认 3）
 anki-repo models "$EXPORT" --sample-limit 5
 ```
 
@@ -349,16 +349,16 @@ anki-repo models "$EXPORT" --sample-limit 5
 EXPORT=decks/output/Words__N1
 REQUEST=create.json
 
-# 1. сначала dry-run: посмотреть, что получится
+# 1. 先 dry-run：查看结果
 anki-repo create "$EXPORT" --request "$REQUEST"
 
-# 2. записать ту же самую заметку
+# 2. 写入同一条笔记
 anki-repo create "$EXPORT" --request "$REQUEST" --apply
 
-# 3. зафиксировать результат в переносимом виде
+# 3. 以可移植形式记录结果
 anki-repo create "$EXPORT" --request "$REQUEST" --apply --emit-resolved resolved.json
 
-# запрос можно читать со stdin
+# 请求也可以从 stdin 读取
 cat "$REQUEST" | anki-repo create "$EXPORT" --request -
 ```
 
@@ -524,10 +524,10 @@ Dry-run 会运行全部预检，不写入 JSON、`media/`、规则文件或存�
 将经过证明的媒体引用从旧文件名迁移到所属资源域当前的规范文件名。这是唯一允许修改已有笔记字段的狭义例外。
 
 ```bash
-# 1. сначала dry-run: доказать семантику ссылок и посмотреть план
+# 1. 先 dry-run：证明引用语义并查看计划
 anki-repo migrate-media EXPORT --namespace pitch_accent --key 飴 --from 飴.png
 
-# 2. записать: переписать ссылки, разместить канонические байты, освободить имя
+# 2. 写入：重写引用、放置规范字节、释放旧文件名
 anki-repo migrate-media EXPORT --namespace pitch_accent --key 飴 --from 飴.png --apply
 ```
 
@@ -600,10 +600,10 @@ anki-repo migrate-media EXPORT --namespace pitch_accent --key 飴 --from 飴.png
 将仓库旧布局中 `decks/` 下的导出目录一次性、安全地迁移到扁平的 `decks/output/<导出根名称>/`。不改变导出内部的 `deck.json`、`media/` 或身份标识。
 
 ```bash
-# 1. сначала план: что и куда переедет
+# 1. 先查看计划：哪些内容移动到何处
 anki-repo migrate-layout --root . --json
 
-# 2. запись: перенести и снять placeholder-файлы прежней раскладки
+# 2. 写入：移动导出目录并移除旧布局的占位文件
 anki-repo migrate-layout --root . --apply
 ```
 
@@ -651,13 +651,13 @@ anki-repo migrate-layout --root . --apply
 ```bash
 EXPORT=decks/output/Words__N1
 
-# dry-run по одному guid
+# 单个 guid 的 dry-run
 anki-repo retire "$EXPORT" --guid "w0Wc3Ip@N#" --tag "archived::auto"
 
-# запись
+# 写入
 anki-repo retire "$EXPORT" --guid "w0Wc3Ip@N#" --tag "archived::auto" --apply
 
-# несколько заметок и пакетный запрос из файла или stdin
+# 多条笔记，以及来自文件或 stdin 的批量请求
 anki-repo retire "$EXPORT" --guid "…" --guid "…" --tag "archived::auto" --apply
 anki-repo retire "$EXPORT" --request retire.json --apply
 cat retire.json | anki-repo retire "$EXPORT" --request - --apply
@@ -716,14 +716,14 @@ cat retire.json | anki-repo retire "$EXPORT" --request - --apply
 ```bash
 EXPORT=decks/output/Words__N1
 
-# сравнить колоду с её изменённой копией
+# 对比牌组与其修改后的副本
 anki-repo visual-report \
   --before "$EXPORT" \
   --after /path/to/после \
   --out /path/to/отчёт \
   --retire-tag "archived::auto"
 
-# сколько заметок показать подробно в каждом разделе (по умолчанию 200, максимум 1000)
+# 每个分区详细显示多少条笔记（默认 200，最多 1000）
 anki-repo visual-report --before … --after … --out … --preview-limit 50
 ```
 
@@ -845,20 +845,20 @@ anki-repo visual-report --before … --after … --out … --preview-limit 50
 ```bash
 EXPORT=decks/output/Words__N1
 
-# 1. что вообще есть в экспорте
+# 1. 导出中究竟有什么
 anki-repo qa "$EXPORT"
 
-# 2. компактный batch по найденной проблеме
+# 2. 针对已发现问题的紧凑批次
 anki-repo --json review "$EXPORT" --qa-code empty_field_value --limit 25 > batch.json
 
-# 3. внешний агент читает batch.json и возвращает документ предложений
+# 3. 外部智能体读取 batch.json 并返回建议文档
 #    (schema_version, proposals: proposal_id, guid, field, expected, replacement)
 
-# 4. проверка предложений против текущего состояния экспорта
+# 4. 按导出当前状态验证建议
 anki-repo --json review-check "$EXPORT" --proposals proposals.json \
   | jq .result.edit_request > request.json
 
-# 5. dry-run, запись и проверка результата — существующими командами
+# 5. 用现有命令完成 dry-run、写入和结果验证
 anki-repo edit "$EXPORT" --request request.json
 anki-repo edit "$EXPORT" --request request.json --apply
 anki-repo validate "$EXPORT"
@@ -869,19 +869,19 @@ anki-repo validate "$EXPORT"
 ```bash
 EXPORT=decks/output/Words__N1
 
-# 1. фактическая схема полей: как поля называются и что в них лежит
+# 1. 实际字段结构：字段名称及其中内容
 anki-repo models "$EXPORT"
 
-# 2. по умолчанию новые значения не содержат медиассылок;
-#    исключение — явно настроенный обработчик домена
+# 2. 默认情况下新值不含媒体引用；
+#    例外是显式配置的资源域处理器
 anki-repo create "$EXPORT" --request create.json            # dry-run
 anki-repo create "$EXPORT" --request create.json --apply --emit-resolved create.resolved.json
 anki-repo validate "$EXPORT"
 
-# 3. устаревшая заметка не удаляется, а помечается тегом
+# 3. 停用的笔记不会被删除，只会打上标签
 anki-repo retire "$EXPORT" --guid "…" --tag "archived::auto" --apply
 
-# 4. что именно изменилось — статическим отчётом по двум состояниям
+# 4. 用两个状态的静态报告说明具体改了什么
 anki-repo visual-report --before "$ЭТАЛОН" --after "$EXPORT" --out /tmp/отчёт \
   --retire-tag "archived::auto"
 ```
@@ -912,18 +912,18 @@ anki-repo visual-report --before "$ЭТАЛОН" --after "$EXPORT" --out /tmp/о
 不带 `--apply` 时执行完整的 **dry-run**：计算候选文件并执行全部验证，但不写入。带 `--apply` 时仅在所有检查通过后原子替换文件。
 
 ```bash
-# одиночная правка: dry-run
+# 单条编辑：dry-run
 anki-repo edit decks/output/Words__N1 \
   --guid 'D!TAYVuHi,' --field 'Значение' --expect 'было' --set 'стало'
 
-# та же правка с записью
+# 相同编辑并写入
 anki-repo edit decks/output/Words__N1 \
   --guid 'D!TAYVuHi,' --field 'Значение' --expect 'было' --set 'стало' --apply
 
-# пакетная правка из файла запроса
+# 从请求文件批量编辑
 anki-repo edit decks/output/Words__N1 --request edits.json --apply
 
-# пакетная правка со stdin
+# 从 stdin 批量编辑
 anki-repo edit decks/output/Words__N1 --request - --apply < edits.json
 ```
 
@@ -1140,7 +1140,7 @@ JSON 模式下，笔记字段以对象表示，键按类型的 `ord` 顺序排�
 | `missing_field_value` | 3 | `models` / `create` 的请求缺少某个必需字段 |
 | `internal_error` | 70 | 内部错误，包括字节级编辑不变量被破坏 |
 
-对于 `visual-report`，输出目录检查会产生 `invalid_request` 及如下 `details.reason`：`out_dir_inside_decks`（`--out` 位于 `decks/**`）、`out_dir_overlaps_export`（位于或等于被比较的导出）、`out_dir_not_owned`（非空但没有有效报告清单）、`out_dir_manifest_invalid`（清单损坏、不是本报告、指向目录外或引用自身）、`out_dir_not_a_directory`、`out_dir_is_symlink`、`out_dir_entry_conflict`、`before_equals_after`、`invalid_tag`（`--retire-tag` 不合法，`retire` 也会使用该原因）。
+对于 `visual-report`，输出目录检查会产生 `invalid_request` 及如下 `details.reason`：`out_dir_inside_decks`（`--out` 位于 `decks/**`）、`out_dir_overlaps_export`（位于或等于被比较的导出）、`out_dir_not_owned`（非空但没有有效报告清单）、`out_dir_manifest_invalid`（清单损坏、不是本报告、指向目录外或引用自身）、`out_dir_not_a_directory`（`--out` 已存在但不是目录）、`out_dir_is_symlink`（`--out` 是符号链接）、`out_dir_entry_conflict`（报告目录内含有符号链接，或存在与所有权证明相矛盾的名称）、`before_equals_after`（两个状态是同一目录）、`invalid_tag`（`--retire-tag` 不合法，`retire` 也会使用该原因）。
 
 目录检查后如果生成报告失败，则是 `write_failed` 及以下 `reason`：`report_write_failed`、`media_copy_failed`、`preview_not_offline`、`index_not_offline`、`report_file_not_moved`、`stale_file_not_removed`、`staging_not_created`、`staging_destination_not_created`、`report_file_outside_out_dir`、`out_dir_entry_conflict`（预检后才出现外来条目）、`report_file_not_confined`、`manifest_not_serializable`。
 

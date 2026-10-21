@@ -4,23 +4,23 @@
 
 <!-- i18n-source-git-blob: 456ac92d1bcc66077437a533a6baf5ddbba10f05 -->
 
-`asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具**不读取牌组媒体、不更改 `media_files`，也不会把图片复制到牌组中**。
+`asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
 ## 数据存放位置
 
 汉字 CLI 默认使用 `.asset-store/kanji`。独立的音高重音领域使用 `.asset-store/pitch-accent`；两个已发布资源库不共享清单或 `assets/` 目录。
 
 ```text
-.asset-store/                          # целиком игнорируется Git (/.asset-store/)
+.asset-store/                          # 整个目录被 Git 忽略（/.asset-store/）
 ├── kanji/
-│   ├── .owner.json                 # маркер владельца; в Git не публикуется
-│   ├── manifest.json               # только действующие VERIFIED-записи
+│   ├── .owner.json                 # 所有者标记；不会发布到 Git
+│   ├── manifest.json               # 只包含有效的 VERIFIED 记录
 │   ├── assets/
 │   │   ├── gif/漢.gif
 │   │   └── png/饅.png
-│   ├── .runtime/                   # кандидаты, карантин, наборы
-│   ├── .journal/events.jsonl       # журнал операций; только дополнение
-│   ├── .tmp/                       # подготовка и маркеры транзакций
+│   ├── .runtime/                   # 候选、隔离区、批次
+│   ├── .journal/events.jsonl       # 操作日志；只追加
+│   ├── .tmp/                       # 暂存与事务标记
 │   └── .lock
 └── pitch-accent/
     ├── .owner.json
@@ -32,7 +32,7 @@
     └── .lock
 ```
 
-根目录 `.gitignore` 完整忽略 `/.asset-store/` 和 `/decks/`，且没有白名单例外。因此 `.owner.json`、`manifest.json`、资源字节、`.runtime/` 和操作日志都不会进入 Git。干净克隆中没有资源库是正常状态，不应将其发布。
+根目录 `.gitignore` 完整忽略 `/.asset-store/` 和 `/decks/`，且没有白名单例外。因此 `.owner.json`、`manifest.json`、资源字节、`.runtime/` 和操作日志都不会进入 Git。干净克隆中没有资源库是正常状态，而不是发布任何内容的理由。
 
 清单中的内部 `storage_path` 与消费者文件名不同。例如 `assets/gif/漢.gif` 的 `consumer_filename: "漢.gif"`，使用时对应 `media/漢.gif`。`anki-repo` 读取明确声明的消费者文件名，而不是由资源存储布局猜测。
 
@@ -50,9 +50,9 @@
 
 仅成功解码 PNG 不足以获得 `VERIFIED`。`PitchAccentImageValidator` 验证词形和读音、与指定 ID 对应的真实词条页面、至少一个音高图以及深色主题的证据。证据保存每个图在视口和文档坐标中的矩形、几何并集和 `capture_rect`。单个图的截图恰好覆盖 DOM 矩形；多个图覆盖并集，保留自然间隔，不增加边框。原生 CDP `clip` 的坐标舍入允许 PNG 尺寸误差最多 **3 像素**。
 
-深色主题证据关联浏览器配色设置、文档类、计算得到的背景颜色与 PNG 像素。至少一个背景像素与观察到的颜色在**每个 RGB 通道**上相差不超过 **8**；至少八个图形像素在至少一个通道上相差**超过 16**。PNG **所有**像素必须 `alpha=255`，会检查整张图，不需要人工添加黑边。必须有浏览器来源证据。验证器 v5 实现现行绘制/证据契约；v4 证据不会继承可信状态，不完整证据返回 `UNCERTAIN`。
+深色主题证据关联浏览器配色设置、文档类、计算得到的背景颜色与 PNG 像素。至少一个背景像素与观察到的颜色在**每个 RGB 通道**上相差不超过 **8**；至少八个图形像素在至少一个通道上相差**超过 16**。PNG **所有**像素必须 `alpha=255`，会检查整张图，无需人为添加深色边缘。必须有浏览器来源证据。验证器 v5 实现现行绘制/证据契约；v4 证据不会继承可信状态，不完整证据返回 `UNCERTAIN`。
 
-清单版本为 `5`。每条记录包括 SHA-256、字节大小、格式、状态、来源、语义判断及 `consumer_filename`；存储整体包括 `domain_id`。自动 `ValidationRecord` 与可选 `HumanAttestation` 绑定准确身份和 SHA。对于音高重音，人的 `Approve` **不能取代**当前预期 ID/版本的 `PitchAccentImageValidator` v5 自动 `VERIFIED` 记录。人工批准无法使旧版、不完整证据或 `REJECTED`、`CORRUPT` 变得可信；汉字领域原有人工批准规则不变。新 SHA 不继承旧字节的决定；替换记录必须按预期旧 SHA 做 compare-and-swap。
+清单版本为 `5`。每条记录包括 SHA-256、字节大小、格式、状态、来源、语义判断及 `consumer_filename`；存储整体包括 `domain_id`。自动 `ValidationRecord` 与可选 `HumanAttestation` 绑定准确身份和 SHA。对于音高重音，人的 `Approve` 不能取代自动 `ValidationRecord` 记录：相同字节仍需要一条状态为 `VERIFIED`、且 `validator.id`/`validator.version` 符合 `PitchAccentImageValidator` v5 预期的记录。人工批准无法使旧版、不完整证据或 `REJECTED`、`CORRUPT` 变得可信；汉字领域原有人工批准规则不变。新 SHA 不继承旧字节的决定；替换记录必须按预期旧 SHA 做 compare-and-swap。
 
 旧版 v3/v4 清单和原先平铺的汉字目录仍可读取。以写入模式打开时会在独占锁内执行版本迁移：通过硬链接保留旧字节、验证 SHA-256、原子更新清单，再删除旧平铺链接。`.tmp/` 中的事务标记允许中断后继续或回滚。未变化的 SHA、`ValidationRecord`、`HumanAttestation` 均保留，无需重新下载。完成后新旧规范路径不会同时存在。CLI JSON 报告 `store.layout_migrated_on_open`。
 
@@ -62,7 +62,7 @@
 
 公共 Chromium 会话、可执行文件定位、启动诊断、CDP 指标和网络技术遥测在 `browser_runtime.rs` 中。Yarxi 保留自身选择器、URL、TLS 策略、过滤器、后备来源、深色主题和截图几何；公共运行时支持独立的 `3.0` 缩放系数。JPDB 使用隔离会话，`pitch-assets` 独立处理批次并发布已验证 PNG。与 `anki-repo` 的集成仍是单独能力。
 
-必须保证所有用户区域完全不进入 Git。回归脚本将根 `.gitignore` 复制到临时仓库，使用真实 `git check-ignore` 验证两个区域下的全部路径（包括 `.owner.json`、`manifest.json`、`assets/**`、`.runtime/**`、`.journal/events.jsonl`、旧分组目录和嵌套目录），并确保 `git add -A` 后索引没有这些文件：
+用户区域不会通过 Git 发布，无论是整体还是部分：根目录 `.gitignore` 完整忽略 `/.asset-store/` 和 `/decks/`，这两个区域内没有任何例外。可以用真实的 `git check-ignore` 通过专门的回归脚本验证这些规则——脚本将根 `.gitignore` 复制到临时仓库，证明两个区域下的全部路径（包括 `.owner.json`、`manifest.json`、`assets/**`、`.runtime/**`、`.journal/events.jsonl`、旧分组目录及嵌套目录）都被忽略，并检查 `git add -A` 之后索引中不再残留任何此类路径：
 
 ```bash
 bash tools/asset-store/tests/gitignore_regression.sh
@@ -124,30 +124,30 @@ cargo run --quiet --locked -p asset-store --bin pitch-corpus-gate
 - 实际状态等于先前 `previous_*` → `outcome: aborted`。
 - 两者均不符合 → `outcome: unknown`，附上 `reason`。
 
-验证器决定和人工信任只修改 `validation` 或 `human_attestation`，不改变 SHA/生命周期，所以清单无法判别此转换是否应用。其悬空意图会标为 `unknown` 并说明原因，绝不猜测为 `refused`。对账操作幂等，重复执行不会追加事件。
+验证器决定和人工信任只修改 `validation` 或 `human_attestation`，不改变 SHA/生命周期，因此清单无法区分已应用与未应用的变更。其未结束意图会以原因 `манифест не различает применённое и неприменённое изменение`（即“清单无法区分已应用与未应用的变更”）标为 `unknown`，转换本体的失败绝不会被当作 `refused`：结果保持未知，而不是靠猜测得出。对账是幂等的：重复调用不会追加任何事件。
 
 ### 命令
 
 两个 CLI 都通过自己的 `--store` 读取相应日志：
 
 ```bash
-# События по возрастанию seq; --limit оставляет последние N.
+# 事件按 seq 升序排列；--limit 只保留最后 N 条。
 kanji-assets --store .asset-store/kanji journal list --limit 20
 pitch-assets --store .asset-store/pitch-accent journal list \
   --identity 幽霊 --operation verified_published
 
-# Целостность: строгая нумерация seq, уникальность event_id, корректность event_key;
-# результат ссылается на предшествующий Pending той же области и операции;
-# также проверяются допустимые однофазные события, оборванный хвост,
-# битые строки и ревизия не выше фактической.
-# Код возврата 3, если найдена проблема; открытые интенты перечисляются.
-# Журнал больше предела полного чтения — journal_too_large (код 4).
+# 完整性：严格的 seq 编号、唯一的 event_id、正确的 event_key；
+# 结果必须引用同一区域和操作的先前 Pending；
+# 还会检查允许的单阶段事件、被截断的尾部、
+# 损坏的行，以及不高于实际值的修订号。
+# 发现问题时返回退出码 3；未结束意图会被列出。
+# 日志超过完整读取上限时返回 journal_too_large（退出码 4）。
 kanji-assets --store .asset-store/kanji journal check
 
-# Сверка незакрытых интентов; печатает дописанные события.
+# 对账未结束意图；打印追加的事件。
 kanji-assets --store .asset-store/kanji journal reconcile
 
-# Одно событие baseline со снимком текущего состояния; повтор отклоняется.
+# 写入一条带当前状态快照的 baseline 事件；重复写入会被拒绝。
 kanji-assets --store .asset-store/kanji journal baseline
 ```
 
@@ -230,11 +230,11 @@ CLI 获取音高重音图片、保存批次状态，并将已验证 PNG 发布�
 CLI 参数解析失败在运行前返回 `2`。存储错误根据 `AssetError::exit_code()`，而不是批次状态确定。
 
 ```bash
-# Просмотр и проверка корпуса без сетевого получения.
+# 在不进行网络获取的情况下查看和检查资源库。
 cargo run --locked -p asset-store --bin pitch-assets -- corpus list
 cargo run --locked -p asset-store --bin pitch-assets -- corpus check
 
-# Одно получение или пакет по строгому JSON-плану.
+# 单次获取，或按严格的 JSON 计划执行批次。
 cargo run --locked -p asset-store --bin pitch-assets -- ensure \
   --surface '幽霊' --reading 'ゆうれい'
 cargo run --locked -p asset-store --bin pitch-assets -- batch start \
@@ -242,7 +242,7 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch start \
 cargo run --locked -p asset-store --bin pitch-assets -- batch run \
   --batch-id my-pitch-batch --workers 4
 
-# Состояние, отчёт проверки и продолжение после решения.
+# 查看状态、复核报告，并在作出决定后继续。
 cargo run --locked -p asset-store --bin pitch-assets -- batch status \
   --batch-id my-pitch-batch
 cargo run --locked -p asset-store --bin pitch-assets -- batch review \
@@ -250,7 +250,7 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch review \
 cargo run --locked -p asset-store --bin pitch-assets -- batch resume \
   --batch-id my-pitch-batch --workers 4
 
-# Явный выбор кандидата, адресный или пакетный повтор, отказ для точного SHA.
+# 显式选择候选、按条目或按批次重试、针对精确 SHA 的拒绝。
 cargo run --locked -p asset-store --bin pitch-assets -- batch select \
   --batch-id my-pitch-batch --surface '重複語' --vocabulary-id 101 \
   --detail-url 'https://jpdb.io/vocabulary/101/重複語/ちょうふくご'
@@ -314,11 +314,11 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch reject \
 
 发布只读取**指定当前尝试**的元数据和 `evidence`，要求 `PitchAccentImageValidator` v5 给出当前 `VERIFIED`。写入前 `AssetStore::ingest_verified` 再次验证字节，通过 compare-and-swap 核对上一记录的预期 SHA。规范路径为 `assets/png/<surface>.png`，消费者名为 `<surface>.pitch.png`。如果最新存储对账证明已有规范记录符合现行验证器，可不联网而复用。
 
-显式 `reacquire` 开始新世代，并记录资源所有者当前 SHA 作为 CAS 基线。如果此后所有者 SHA 变化，`batch status` 会显示 `refresh_owner_drift`，阻止发布过期候选。`batch reacquire --reason` 将冲突发布意图归档，采用当前 SHA 作为新基线、开启下一世代，并解除对旧尝试的引用，保证其不会发布。重新获取即使产生相同 SHA，也只有通过 v5 再验证且 CAS 与存储 SHA 一致时，才更新元数据/证据；发布总采用准确的当前尝试。视觉拒绝绑定具体 SHA，其他字节不会继承。
+显式 `reacquire` 开始新世代，并记录资源所有者当前 SHA 作为 CAS 基线。如果此后所有者 SHA 变化，`batch status` 会显示 `refresh_owner_drift`，阻止发布过期候选。`batch reacquire` 必须配合 `--reason`，将冲突的发布意图归档，采用当前所有者 SHA 作为新 CAS 基线、开启下一世代，并解除对旧尝试的引用，使其无法发布。重新获取即使产生相同 SHA，也只有通过 v5 再验证且 CAS 与存储 SHA 一致时，才更新元数据/证据；发布总采用准确的当前尝试。视觉拒绝绑定具体 SHA，其他字节不会继承。
 
 定向 `retry` 只处理可重试技术失败，不影响相邻已完成项目。对账后可能出现存储为 `ExistingVerified`、而批次最后一次结果仍是可恢复技术错误；此时仍允许 `retry`，清除 `ExistingVerified`、开始新世代，并记录当前所有者 SHA 作为 CAS 基线。
 
-`batch retry-technical --reason` 对全批次按**相同条件**选择可重试技术失败，并为其开始新世代。不可重试错误、已发布项、未完成发布意图、歧义、无重音、找不到词条、冲突项、`pending` 均不变。该操作要么全部应用，要么全部不应用；成功后重复执行不会再选中项目。若所有者对账没有造成其他保存变化，返回 `changed: false`，否则 `changed` 包含该变化。JSON 中 `retried_identities` 按原计划顺序列出选中身份；空集则不提供此字段。`no_pitch_accent_on_source` 只结束**当前批次**，不会创建空记录或永久负缓存；`vocabulary_not_found` 保持独立未解决结果。
+`batch retry-technical` 必须配合 `--reason`，对全批次按**相同条件**选择可重试技术失败，并为其开始新世代。不可重试错误、已发布项、未完成发布意图、歧义、无重音、找不到词条、冲突项、`pending` 均不变。该操作要么全部应用，要么全部不应用；成功后重复执行不会再选中项目。若所有者对账没有造成其他保存变化，返回 `changed: false`，否则 `changed` 包含该变化。JSON 中 `retried_identities` 按原计划顺序列出选中身份；空集则不提供此字段。`no_pitch_accent_on_source` 只结束**当前批次**，不会创建空记录或永久负缓存；`vocabulary_not_found` 保持独立未解决结果。
 
 `batch review` 将 `review.html` 保存到被 Git 忽略的批次 `.runtime` 中。页面显示获取及规范 PNG、词形/读音、JPDB 链接、图形数量、SHA-256、大小、验证状态及来源/渲染证据。歧义列出全部候选；无重音图、词条不存在、技术故障以有类型结果显示，绝不伪造图片。文字经过转义；HTML 不修改批次状态，也不是权威来源。决策使用明确的 `select`、`reject`、`retry` 和 `reacquire`；没有绕过现行自动验证而手动发布字节的办法。
 
@@ -328,7 +328,7 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch reject \
 
 ## 从 Yarxi 获取图片
 
-`ensure` 创建独立的无界面 Chromium 会话，与 `https://www.yarxi.su/` 的真实动态页面交互。搜索只在汉字搜索容器中进行，使用“读音”输入框和“查找”按钮。切换到“信息”页后，提供者必须验证所请求字符的**准确 Unicode 码点**，拒绝其他词条。Yarxi 文章编号与来源元数据加入图片来源证据。
+`ensure` 创建独立的无界面 Chromium 会话，与 `https://www.yarxi.su/` 的真实动态页面交互。搜索限制在汉字搜索容器、其中的“Чтение”（读音）输入框和“Найти”（查找）按钮之内。打开“Информация”（信息）标签页后，提供者必须核对所请求字符的准确 Unicode 码点，不匹配的词条会被拒绝。Yarxi 文章编号与来源元数据加入图片来源证据。
 
 普通 `ensure` 优先采用主图片 `img.kakijun-gif`，通过公共浏览器资源层读取 GIF 字节。只有**证明 GIF 不存在**才允许后备方案：标签页及图片区准备就绪、码点准确、相关网络请求无网络/HTTP/JavaScript 错误地完成、DOM 稳定两秒，而且 GIF 元素确实不存在。仍在等待或加载失败的 GIF、超时、未完成图片、网络/JS 问题都属于获取错误，**绝不能**解释成 `gif_absent`。
 
@@ -397,7 +397,7 @@ cargo run --locked --features session-rotation-acceptance -p asset-store --bin k
   --acceptance-rotate-after-items 1
 ```
 
-使用 `status` 确认已有检查点保留，第二次 `batch run` 继续剩余项目。验收参数只改变浏览器会话轮换时机。
+使用 `status` 确认已有检查点保留，第二次 `batch run` 继续剩余项目。验收参数只控制浏览器会话轮换的时机，不改变批次语义。
 
 ### 临时目录树与验收 ZIP
 
@@ -431,7 +431,7 @@ ZIP 必需项：`summary.md`、`manifest.sha256`、`raw-evidence/events.jsonl`�
 
 ### Yarxi 证书
 
-目前 Chrome 可能显示 Yarxi 的 `ERR_CERT_AUTHORITY_INVALID`。默认仅允许在 Chrome 警告页对**原始 URL**、准确主机 `www.yarxi.su`、大小写不敏感的准确错误码 `ERR_CERT_AUTHORITY_INVALID`、并存在真实继续访问链接时点击“继续访问”。**不会**启用全局 `--ignore-certificate-errors` 或关闭整个进程的 TLS 验证。例外仅限 Yarxi；`--allow-insecure-tls=false` 强制使用有效证书。其他主机、TLS 错误或 URL 形式都导致运行终止。
+目前 Chrome 可能显示 Yarxi 的 `ERR_CERT_AUTHORITY_INVALID`。默认仅允许在 Chrome 警告页对**原始 URL**、准确主机 `www.yarxi.su`、大小写不敏感的准确错误码 `ERR_CERT_AUTHORITY_INVALID`、并存在真实继续访问链接时点击“Перейти на сайт”（继续访问）。**不会**启用全局 `--ignore-certificate-errors` 或关闭整个进程的 TLS 验证。例外仅限 Yarxi；`--allow-insecure-tls=false` 强制使用有效证书。其他主机、TLS 错误或 URL 形式都导致运行终止。
 
 ## 语义验证器与校准测试
 
@@ -484,40 +484,40 @@ cargo test -p asset-store offline_threshold_calibration -- --nocapture
 从工作区根目录执行：
 
 ```bash
-# Идемпотентно получить и проверить один или несколько кандзи.
+# 幂等地获取并验证一个或多个汉字。
 cargo run --locked --bin kanji-assets -- \
   --output json ensure 漢 字
 
-# Проверить только новые или устаревшие решения проверки.
+# 只验证新增或已过期的验证决定。
 cargo run --locked --bin kanji-assets -- --output json validate --mode new
 
-# Перепроверить все ресурсы.
+# 重新验证全部资源。
 cargo run --locked --bin kanji-assets -- --output json validate --mode full
 
-# Просмотреть состояние и детерминированный план проверки.
+# 查看状态和确定性的验证计划。
 cargo run --locked --bin kanji-assets -- --output json list
 cargo run --locked --bin kanji-assets -- --output json plan \
   --mode new --validator-id kanjivg-pixel-chamfer \
   --validator-version kanjivg-r20250816-5581e65d-noto-serif-jp-24fc2d26-ea6231b1-mask64-v6
 
-# Вручную импортировать локальный кандидат (он останется в состоянии pending).
+# 手动导入本地候选文件（它将保持 pending 状态）。
 cargo run --locked --bin kanji-assets -- --output json ingest \
   --character 漢 --file ./candidate.png
 
-# Создать пакет (ID генерируется автоматически) и пройти до пяти раундов обхода по ширине.
+# 创建批次（ID 自动生成），并最多执行五轮广度优先遍历。
 cargo run --locked --bin kanji-assets -- --output json batch start 漢 字
 cargo run --locked --bin kanji-assets -- --output json batch run --batch-id <id>
 
-# Продолжить пакет позже, посмотреть состояние в JSON или записать локальный HTML-отчёт.
+# 稍后继续批次、以 JSON 查看状态，或写入本地 HTML 报告。
 cargo run --locked --bin kanji-assets -- --output json batch status --batch-id <id>
 cargo run --locked --bin kanji-assets -- --output json batch review --batch-id <id>
 
-# Применить явное решение пользователя по точному SHA-256.
+# 针对精确 SHA-256 应用明确的用户决定。
 cargo run --locked --bin kanji-assets -- --output json batch decide \
   --batch-id <id> --character 漢 --sha256 <sha256> \
   --action confirm --reason "пользователь подтвердил текущий кандидат"
 
-# После серии технических сбоев разрешить новое поколение получения.
+# 在一系列技术故障之后，允许新的获取世代。
 cargo run --locked --bin kanji-assets -- --output json batch retry \
   --batch-id <id> --character 字 --reason "источник снова доступен"
 ```
@@ -589,7 +589,7 @@ jq -c 'select(.level == "ERROR") | .fields' \
 
 ```bash
 cargo run --quiet --locked --bin kanji-assets -- batch run --batch-id ID --interactive-review
-# Вернуться к сохранённым кандидатам без получения из сети:
+# 在没有网络获取的情况下回到已保存的候选：
 cargo run --quiet --locked --bin kanji-assets -- batch review-interactive --batch-id ID
 ```
 
@@ -599,7 +599,7 @@ cargo run --quiet --locked --bin kanji-assets -- batch review-interactive --batc
 
 ```bash
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-export --batch-id ID
-# Отредактировать указанный review_artifact, затем применить его review_id:
+# 编辑指定的 review_artifact，然后用其 review_id 应用：
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-apply --batch-id ID --review-id FULL_REVIEW_SHA256
 ```
 
@@ -633,38 +633,38 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch review-appl
 `batch ocr` 按顺序处理**已经保存**的批次。普通 `start`、`run`、`status`、`review`、已验证资源读取及所有音高重音操作都不会连接 Ollama。首先核对规范资源库完整性和现行信任，复用已经确认的资源。只有当前技术有效、处于 `awaiting_human` 且 v6 验证器为 `Uncertain` 的候选可使用 OCR。`Verified`、`Rejected`、`Corrupt` 和已经解决的项目**甚至不会触发 Ollama discovery**，也不会重新访问 Yarxi。
 
 ```bash
-# Обычный путь, без OCR:
+# 常规路径，不使用 OCR：
 cargo run --quiet --locked --bin kanji-assets -- batch start --batch-id my-kanji 漢 字
 cargo run --quiet --locked --bin kanji-assets -- batch run --batch-id my-kanji
 
-# Явно включить OCR сохранённых неопределённых кандидатов:
+# 显式对已保存的不确定候选启用 OCR：
 cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
   --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' \
   --endpoint 'http://127.0.0.1:11434' --timeout-seconds 120
 
-# Для Windows-host из WSL задайте реально доступный адрес вместо примера:
+# 从 WSL 访问 Windows 主机时，请改成实际可用的地址，而不是示例地址：
 cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
   --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' \
   --endpoint 'http://192.168.1.2:11434' --allow-remote
 
-# Получить TSV и index.html рядом с ним; решения изначально пустые, '-' означает явный пропуск:
+# 获取 TSV 及其旁边的 index.html；决定最初为空，'-' 表示显式跳过：
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-export --batch-id my-kanji
-# После просмотра группы совпадений оставьте подтверждаемые строки пустыми, '-' поставьте для пропуска;
-# внесите явные решения для остальных строк в TSV.
-# Команда применит их вместе с подтверждённой группой совпадений.
+# 查看匹配分组后，把可确认的行留空，跳过的行填 '-'；
+# 在 TSV 中为其余行填入明确决定。
+# 该命令会把它们与已确认的匹配分组一起应用。
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-confirm-matches \
   --batch-id my-kanji --review-id FULL_REVIEW_SHA256 --confirm-reviewed
-# После применения группы создайте новый снимок для оставшихся строк.
+# 应用该分组后，为剩余行创建新的快照。
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-export --batch-id my-kanji
-# Внесите оставшиеся решения и примените с новым review_id:
+# 填入剩余决定，并用新的 review_id 应用：
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-apply \
   --batch-id my-kanji --review-id NEW_REVIEW_SHA256
-# Явный повтор OCR, включая сохранённые отказы:
+# 显式重跑 OCR，包括已保存的拒绝结果：
 cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
   --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' --rescan
 ```
 
-确认一组匹配之后，应重新 `review-export` 剩余行，因为之前快照包含状态已变化的项目。`review-confirm-matches` 与 `review-apply` 采用完全相同的 TSV/SHA/世代/图片副本检查和原子 `human_decisions`。只会为匹配组中的**空白行**新增确认；`-` 明确跳过。TSV 中显式填入的其他决定也会应用。`--confirm-reviewed` 表示使用者实际检查图片，并知晓 OCR 可能误识别；仅生成/打开报告不会确认任何内容。行顺序为匹配、不匹配、无法识别/失败、没有 OCR。增加的 TSV 列（`observed`、匹配标志、拒绝原因、建议键）属于受保护元数据，**不可编辑**；缺少这些列的旧快照仍可读取。
+应用一组匹配之后，应为剩余行重新执行 `review-export`：它们的状态已经变化，之前的快照仍包含已应用的行。`review-confirm-matches` 与 `review-apply` 采用完全相同的 TSV/SHA/世代/图片副本检查和原子 `human_decisions`。只会为匹配组中的**空白行**新增确认；`-` 明确跳过。TSV 中显式填入的其他决定也会应用。`--confirm-reviewed` 表示使用者实际检查图片，并知晓 OCR 可能误识别；仅生成/打开报告不会确认任何内容。行顺序为匹配、不匹配、无法识别/失败、没有 OCR。增加的 TSV 列（`observed`、匹配标志、拒绝原因、建议键）属于受保护元数据，**不可编辑**；缺少这些列的旧快照仍可读取。
 
 Ollama 基础 URL 只支持 HTTP，不允许 credentials、路径、query 或 fragment。除**字面 IPv4/IPv6 loopback** 外的任何地址——包括 DNS 名称及私有 WSL 主机——都必须指定 `--allow-remote`，明确允许向该服务器发送图片。禁用代理和 HTTP 重定向。用户自行安装 Ollama、模型并启动服务器；工具不会下载模型或启动服务。`/api/tags` 固定已安装模型 digest，`/api/show` 要求 `vision` 能力，并拒绝声明 `remote_host` 的云模型。模型/地址可配置；WSL 内的 `127.0.0.1` 不一定能访问 Windows 主机。
 

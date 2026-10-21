@@ -4,7 +4,7 @@
 
 <!-- i18n-source-git-blob: 2630521deeff475a4b9958ebae7ebbc40e95ebd7 -->
 
-`repository-maintenance` 是一个独立的 Cargo 软件包，用于监测本地构建产物，并安全清理能够重新生成的数据。它与 `anki-repo` 分开实现，因为它不处理 CrowdAnki 导出数据，而是负责磁盘空间的生命周期管理。
+`repository-maintenance` 是一个独立的 Cargo 软件包，用于监测本地产物，并安全清理能够重新生成的数据。它与 `anki-repo` 分开实现，因为它不处理 CrowdAnki 导出数据，而是负责磁盘空间的生命周期管理。
 
 ## 审计结果
 
@@ -17,7 +17,7 @@
 | 进程、浏览器及测试的临时数据 | `asset-store` 创建带有私有所有权标记的 `TempWorkspace`；浏览器在该目录树内使用独立配置目录和 `TMPDIR`。 | 沿用 `asset-store` 对进程身份、PID 启动时间、进程引用、`NOFOLLOW` 和挂载点边界的处理。此工具调用相同的公共垃圾回收逻辑。 |
 | 证据 ZIP 压缩包 | `tools/asset-store/src/bin/common/evidence_zip.rs` 将压缩包写入 `<temp_dir>/anki-decks-evidence`，或写入 `--output` 指定的位置。 | ZIP 保存证据，因此新的垃圾回收器只会将其列入清单。默认不会删除没有可验证所有权标记的目录或文件。已识别、但缺少标记的旧目录，只有在显式执行 `clean --cleanup-legacy --apply` 后才可以删除。如果显式指定的 `--output` 路径不在扫描根目录内，则不纳入清单。 |
 | 持久化存储和事务性 `.tmp` 文件 | `asset-store` 在自行管理的目录中保存数据；临时文件名用于原子操作以及未完成状态转换的恢复。 | 这些属于业务领域状态，而不是通用 Cargo 垃圾，磁盘清理不会触及。 |
-| 持久化的外部 Cargo 构建目录 | 当前源代码中没有专门长期运行、并在 `~/.cache` 下创建 Cargo 构建目录的进程。某次本地故障中发现的任意目录，并不能证明其归本项目所有。 | 对明确需要复用的缓存，使用 `cache init` 和 `cache run` 创建标记、更新时间及按总容量限制进行管理。未知目录不会清理。 |
+| 持久化的外部 Cargo 构建目录 | 当前源代码中没有专门长期运行、并在 `~/.cache` 下创建 Cargo 构建目录的进程。某次本地故障中发现的任意目录，并不能证明其归本项目所有。 | 对明确需要复用的缓存，提供了 `cache init` 和 `cache run`：它们会创建标记、更新最后使用时间，并受总容量上限约束。未知目录不会清理。 |
 
 本工具不修改 Cargo 构建配置（profile）。一次性构建始终限制在 `TempWorkspace` 内，不会另外创建持久化的外部测试构建目录。
 
@@ -67,11 +67,11 @@ anki-repo maintenance disable
 
 失败快照的 `message` 仅保存错误消息前 2000 个 Unicode 字符；原始 GC 错误仍会完整返回。这限制了概要记录的大小，包括解析器因配置中存在过长行而生成的错误消息。
 
-未知或不完整的测量结果会明确标记。JSON 保持标准的 `schema_version, command, result` 外层结构；`result` 包含 `schema_version`、`preference`、`automatic`、`installed_workspace`、`measurement`、`last_attempt` 和 `diagnostics`，其中的 `code` 与 `severity` 是稳定值。自动启动和当前运行情况通过 `timer_enabled`、`timer_active` 和 `service_active` 分别表示。`automatic=enabled` 表示经过验证的定时器已启用自动启动、当前处于活动状态，或其服务仍在运行。因此，`timer_enabled=false, timer_active=true` 不会被误判为已禁用。若用户偏好是 `yes`，完整启用维护要求自动启动和实际活动这两项事实均为 `true`；若用户偏好为 `no`，任何正在生效的状态都会导致 `preference_mismatch`。`timer status` 与 `maintenance status` 使用同一事实来源。`systemctl` 的未知响应对应 `unknown`；用户 systemd 不可用则对应 `unavailable`。这些状态不允许成功保存拒绝偏好 `no`。
+未知或不完整的测量结果会明确标记。JSON 保持标准的 `schema_version, command, result` 外层结构；`result` 包含 `schema_version`、`preference`、`automatic`、`installed_workspace`、`measurement`、`last_attempt` 和 `diagnostics`，其中的 `code` 与 `severity` 是稳定值。自动启动和当前运行情况通过 `timer_enabled`、`timer_active` 和 `service_active` 分别表示。`automatic=enabled` 表示经过验证的定时器已启用自动启动、当前处于活动状态，或其服务仍在运行。因此，`timer_enabled=false, timer_active=true` 不会被误判为已禁用。若用户偏好是 `yes`，完整启用维护要求这两项相关事实均为 `true`；若用户偏好为 `no`，任何正在生效的状态都会导致 `preference_mismatch`。`timer status` 与 `maintenance status` 使用同一事实来源。`systemctl` 的未知响应对应 `unknown`；用户 systemd 不可用则对应 `unavailable`。这些状态不允许成功保存拒绝偏好 `no`。
 
 安装归属需通过私有配置、磁盘上准确匹配的受管理 unit 模板，以及已加载 unit 的属性共同验证：`LoadState`、`FragmentPath`、`ExecStart`、`DropInPaths`、`NeedDaemonReload`。被替换或过期的 unit、未知的 drop-in，以及不安全的链接或权限都会阻止对安装进行修改。如果其余证据均匹配，可以再次执行 `enable` 来恢复缺失的已安装二进制文件。仅凭所有权标记、但没有经过验证的工作副本，不足以允许执行 `maintenance disable`；文件会保留用于诊断。
 
-`enable` 与 `disable` 均在验证开始到偏好保存完毕期间持有同一把共享锁。如果安装失败，程序会有意保留 `yes` 偏好、单独返回错误；再次运行 `enable` 可以修复安装。禁用操作在删除文件前，必须验证定时器**和**服务都已停止；只有确认自动启动和活动状态均不存在，才保存 `no`。诊断命令包含对当前工作副本路径正确进行 shell 转义的 `--workspace-root`；建议的 `clean` 命令均不带 `--apply`，只是预览。文本输出使用俄语的“是/否/未知”、上次运行距今的时间，以及俄语的模式和结果名称；JSON 仍保留机器可读值。
+`enable` 与 `disable` 均在验证开始到偏好保存完毕期间持有同一把共享锁。如果安装失败，程序会有意保留 `yes` 偏好、单独返回错误；再次运行 `enable` 可以修复安装。禁用操作在删除文件前，必须验证定时器**和**服务都已停止；只有确认自动启动和活动状态均不存在，才保存 `no`。诊断命令包含对当前工作副本路径正确进行 shell 转义的 `--workspace-root`；建议的 `clean` 命令均不带 `--apply`，只是预览。文本输出使用俄语的“да/нет/неизвестно”（是/否/未知）、上次运行距今的时间，以及俄语的模式和结果名称；JSON 仍保留机器可读值。
 
 公开的 JSON 仅在形如 `anki-decks-<uid>` 的路径片段中隐藏 UID，包括工作副本路径和最近一次运行记录路径。私有快照保存完整、准确的路径，供与当前工作副本比对。建议执行的命令则包含准确路径，以便直接运行。如果路径包含非 UTF-8 字节，诊断信息会使用替换无效字节后的字符串表示，并且不会生成包含该路径的操作建议（`action: null`）。私有快照不会进行此类替换：序列化失败会向调用方返回错误，并保留原文件。
 

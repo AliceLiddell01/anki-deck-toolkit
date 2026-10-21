@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 4f88ee07c3bb52f37816e0637494b90b6f667c9b -->
+<!-- i18n-source-git-blob: cf4c051e39d649969d08fa819a37cdfe7c7332e2 -->
 
 `anki-repo` is a toolkit for deterministic analysis of CrowdAnki exports and strictly constrained edits to their contents in the `Anki-decks` repository. It gives agents fast, predictable access to the structure of `deck.json` without requiring them to read a multi-megabyte JSON file manually.
 
@@ -39,7 +39,7 @@ The “create and verify” workflow uses `models` to obtain the actual note-mod
 - **Linux only.** Verified reads depend on the Linux-only `asset-store` library, which does not build on other platforms.
 - Rust toolchain using edition 2024. The minimum supported Rust version (MSRV) is declared once, in `[workspace.package] rust-version` of the root `Cargo.toml`. Workspace members inherit it (`edition.workspace = true`, `rust-version.workspace = true`), so `tools/anki-repo/Cargo.toml` does not duplicate the version. Verified using stable `rustc`/`cargo` and the declared MSRV.
 - The root Cargo workspace (`/Cargo.toml`, containing `tools/anki-repo`) is the sole build entry point; `Cargo.lock` also resides at the repository root. Build and test from the root, not the package directory.
-- No external services or networking: export operations use local files only, and no command calls LLM APIs or any other external service. The sole system-service interaction is the `maintenance` group: following an explicit user command or consent, it manages the `repository-maintenance` user's `systemd --user` timer and stores preferences in a private file. It neither reads nor changes an export.
+- No external services or networking: export operations use local files only, and no command calls LLM APIs or any other external service. The sole system-service interaction is the `maintenance` group: following an explicit user command or consent, it manages the user timer (`systemd --user`) of the `repository-maintenance` package and stores the user's choice in a private file. It neither reads nor changes an export.
 
 ## Build and run
 
@@ -49,7 +49,7 @@ From the repository root:
 cargo build --release --workspace
 ./target/release/anki-repo --help
 
-# или без установки
+# or without installing
 cargo run --quiet --bin anki-repo -- inspect decks/output/Words__N3
 ```
 
@@ -101,13 +101,13 @@ anki-repo inspect decks/output/Words__N1 --verbose
 Search notes by stable criteria. Exactly one criterion is required: `--guid`, or `--field` together with `--value`.
 
 ```bash
-# поиск по guid: identity lookup
+# search by guid: identity lookup
 anki-repo find decks/output/Words__N1 --guid 'D!TAYVuHi,'
 
-# поиск по сырому значению поля: содержит подстроку
+# search by raw field value: contains a substring
 anki-repo find decks/output/Words__N1 --field Слово --value 偶然
 
-# общий поиск по любому имени поля: подстрока и точное совпадение
+# generic search over any field name: substring and exact match
 anki-repo find decks/output/Words__N2 --field 'Часть речи' --value Существительное
 anki-repo find decks/output/Words__N1 --field 'Часть речи' --value Существительное --match exact
 ```
@@ -187,7 +187,7 @@ Behavior:
 - Severity `error` describes the defect's significance to readers, not command failure: `qa` still returns exit code `0` even if it finds `error`-severity issues.
 - A field consisting entirely of whitespace produces both `leading_whitespace` and `trailing_whitespace`.
 - An empty value is not the same as a missing one: both `""` and a whitespace-only string receive findings; `null` and nonstring values are not treated as empty fields (those are handled by `validate`).
-- `duplicate_note_content` compares complete positional arrays of raw field values for notes of the same model without normalizing HTML or whitespace. It does not identify a “primary” field: primary-field semantics belong to individual note models, not to CrowdAnki itself. Callers can explicitly group by field value using `--field` and `--value` in `find` or `review`.
+- `duplicate_note_content` compares complete positional arrays of raw field values for notes of the same model without normalizing HTML or whitespace. It does not identify a “primary” field: primary-field semantics belong to individual note models, not to the CrowdAnki format, so the toolkit has no correct universal semantics for it. Callers can explicitly group by field value using `--field` and `--value` in `find` or `review`.
 - The registry contains exactly these five codes. `duplicate_primary_field` was deliberately removed, along with the assumption that a field named `Слово` is universally primary (see “Public contract changes”). Asking for a removed code returns `unknown_qa_code`, not an empty result.
 - Rules are independent of model and field names: the same field values under renamed fields or a different model produce the same findings.
 - Findings never make an export structurally invalid or block `edit`. The `error | warning | info` scale describes content quality independently of `validate`; a QA `error` is not a structural export error.
@@ -201,13 +201,13 @@ Every finding identifies the note's export position (`note_index`), `guid`, deck
 Produces a bounded, compact set of notes for external review. Unlike `qa`, which reports problems, `review` supplies the material to examine: note fields in `ord` order and previously detected QA findings for each note.
 
 ```bash
-# отобрать заметки по найденной проблеме
+# select notes for a detected problem
 anki-repo review decks/output/Words__N1 --qa-code empty_field_value --limit 25
 
-# следующая страница
+# next page
 anki-repo review decks/output/Words__N1 --qa-code empty_field_value --offset 25
 
-# выбор по содержимому и точный lookup
+# selection by content and exact lookup
 anki-repo review decks/output/Words__N2 --field 'Часть речи' --value Существительное
 anki-repo review decks/output/Words__N1 --guid 'D!TAYVuHi,'
 ```
@@ -236,14 +236,14 @@ Package contents:
 Validates proposals from an external agent against the **current** export state. The command is read-only: neither `deck.json` nor any auxiliary file is written.
 
 ```bash
-# проверить предложения и получить готовый запрос для `edit`
+# validate proposals and get a ready request for `edit`
 anki-repo --json review-check decks/output/Words__N1 \
   --proposals proposals.json | jq .result.edit_request > request.json
 
-# то же со stdin
+# the same with stdin
 anki-repo review-check decks/output/Words__N1 --proposals - < proposals.json
 
-# готовый запрос уходит в существующую границу записи
+# the ready request goes through the existing write boundary
 anki-repo edit decks/output/Words__N1 --request request.json
 anki-repo edit decks/output/Words__N1 --request request.json --apply
 anki-repo validate decks/output/Words__N1
@@ -314,15 +314,15 @@ Displays the actual field schema for models in the selected scope: field names, 
 ```bash
 EXPORT=decks/output/Words__N1
 
-# модели корневой колоды экспорта (селектор по умолчанию — preorder 0)
+# note models of the export's root deck (default selector: preorder 0)
 anki-repo models "$EXPORT"
 
-# колода по имени, по идентичности или по позиции в обходе
+# a deck by name, by identity, or by position in the traversal
 anki-repo models "$EXPORT" --deck "Words::N1"
 anki-repo models "$EXPORT" --deck-uuid 00000000-0000-0000-0000-000000000000
 anki-repo models "$EXPORT" --deck-preorder 1
 
-# сколько примеров значений показывать на поле (1..10, по умолчанию 3)
+# how many sample values to show per field (1..10, default 3)
 anki-repo models "$EXPORT" --sample-limit 5
 ```
 
@@ -349,16 +349,16 @@ Adds new notes to an **existing** deck using an **existing** note model. It does
 EXPORT=decks/output/Words__N1
 REQUEST=create.json
 
-# 1. сначала dry-run: посмотреть, что получится
+# 1. dry-run first: see what the result will be
 anki-repo create "$EXPORT" --request "$REQUEST"
 
-# 2. записать ту же самую заметку
+# 2. write that very same note
 anki-repo create "$EXPORT" --request "$REQUEST" --apply
 
-# 3. зафиксировать результат в переносимом виде
+# 3. record the result in a portable form
 anki-repo create "$EXPORT" --request "$REQUEST" --apply --emit-resolved resolved.json
 
-# запрос можно читать со stdin
+# the request can be read from stdin
 cat "$REQUEST" | anki-repo create "$EXPORT" --request -
 ```
 
@@ -524,10 +524,10 @@ If publishing JSON fails, the existing `write_failed` / exit 8 and `details.oper
 Migrates proven media references from a legacy filename to the domain's current canonical filename. This is the only narrowly scoped exception allowing a change to an existing note's field.
 
 ```bash
-# 1. сначала dry-run: доказать семантику ссылок и посмотреть план
+# 1. dry-run first: prove the reference semantics and inspect the plan
 anki-repo migrate-media EXPORT --namespace pitch_accent --key 飴 --from 飴.png
 
-# 2. записать: переписать ссылки, разместить канонические байты, освободить имя
+# 2. write: rewrite references, place the canonical bytes, free the old name
 anki-repo migrate-media EXPORT --namespace pitch_accent --key 飴 --from 飴.png --apply
 ```
 
@@ -600,10 +600,10 @@ Manual `deck.json` edits, direct file deletion/renaming in `media/`, and other b
 A one-time controlled repository export-layout migration: legacy exports under `decks/` move to flat `decks/output/<export_root_name>/`. Export contents—including `deck.json`, `media/`, and identities—remain unchanged.
 
 ```bash
-# 1. сначала план: что и куда переедет
+# 1. plan first: what moves where
 anki-repo migrate-layout --root . --json
 
-# 2. запись: перенести и снять placeholder-файлы прежней раскладки
+# 2. write: move the exports and remove the previous layout's placeholder files
 anki-repo migrate-layout --root . --apply
 ```
 
@@ -646,18 +646,18 @@ Legacy placeholder files (zero-byte `.gitkeep`) and empty directories are remove
 
 ### `retire`
 
-Retires a note by appending exactly one tag; nothing else changes. The toolkit cannot physically delete notes. The note remains recoverable, and a human can delete it in Anki when appropriate.
+Retires a note by appending exactly one tag; nothing else changes. The toolkit cannot physically delete notes, so a note cannot be lost unnoticed; a human deletes it in Anki when they see fit.
 
 ```bash
 EXPORT=decks/output/Words__N1
 
-# dry-run по одному guid
+# dry-run for a single guid
 anki-repo retire "$EXPORT" --guid "w0Wc3Ip@N#" --tag "archived::auto"
 
-# запись
+# write
 anki-repo retire "$EXPORT" --guid "w0Wc3Ip@N#" --tag "archived::auto" --apply
 
-# несколько заметок и пакетный запрос из файла или stdin
+# several notes and a batch request from a file or stdin
 anki-repo retire "$EXPORT" --guid "…" --guid "…" --tag "archived::auto" --apply
 anki-repo retire "$EXPORT" --request retire.json --apply
 cat retire.json | anki-repo retire "$EXPORT" --request - --apply
@@ -716,14 +716,14 @@ Report interactivity is self-contained in the generated files: light/dark theme 
 ```bash
 EXPORT=decks/output/Words__N1
 
-# сравнить колоду с её изменённой копией
+# compare a deck with its modified copy
 anki-repo visual-report \
   --before "$EXPORT" \
   --after /path/to/после \
   --out /path/to/отчёт \
   --retire-tag "archived::auto"
 
-# сколько заметок показать подробно в каждом разделе (по умолчанию 200, максимум 1000)
+# how many notes to show in detail in each section (default 200, maximum 1000)
 anki-repo visual-report --before … --after … --out … --preview-limit 50
 ```
 
@@ -845,20 +845,20 @@ The report is deterministic: identical input states produce byte-identical files
 ```bash
 EXPORT=decks/output/Words__N1
 
-# 1. что вообще есть в экспорте
+# 1. what the export actually contains
 anki-repo qa "$EXPORT"
 
-# 2. компактный batch по найденной проблеме
+# 2. a compact batch for a detected problem
 anki-repo --json review "$EXPORT" --qa-code empty_field_value --limit 25 > batch.json
 
-# 3. внешний агент читает batch.json и возвращает документ предложений
+# 3. an external agent reads batch.json and returns a proposal document
 #    (schema_version, proposals: proposal_id, guid, field, expected, replacement)
 
-# 4. проверка предложений против текущего состояния экспорта
+# 4. validate the proposals against the current export state
 anki-repo --json review-check "$EXPORT" --proposals proposals.json \
   | jq .result.edit_request > request.json
 
-# 5. dry-run, запись и проверка результата — существующими командами
+# 5. dry-run, write and verify the result with the existing commands
 anki-repo edit "$EXPORT" --request request.json
 anki-repo edit "$EXPORT" --request request.json --apply
 anki-repo validate "$EXPORT"
@@ -869,19 +869,19 @@ Adding a new note and retiring an old one follow a similar path:
 ```bash
 EXPORT=decks/output/Words__N1
 
-# 1. фактическая схема полей: как поля называются и что в них лежит
+# 1. the actual field schema: what the fields are called and what they hold
 anki-repo models "$EXPORT"
 
-# 2. по умолчанию новые значения не содержат медиассылок;
-#    исключение — явно настроенный обработчик домена
+# 2. by default new values contain no media references;
+#    the exception is an explicitly configured domain handler
 anki-repo create "$EXPORT" --request create.json            # dry-run
 anki-repo create "$EXPORT" --request create.json --apply --emit-resolved create.resolved.json
 anki-repo validate "$EXPORT"
 
-# 3. устаревшая заметка не удаляется, а помечается тегом
+# 3. a retired note is not deleted but tagged
 anki-repo retire "$EXPORT" --guid "…" --tag "archived::auto" --apply
 
-# 4. что именно изменилось — статическим отчётом по двум состояниям
+# 4. what exactly changed — a static report over the two states
 anki-repo visual-report --before "$ЭТАЛОН" --after "$EXPORT" --out /tmp/отчёт \
   --retire-tag "archived::auto"
 ```
@@ -912,18 +912,18 @@ The command that edits **field values of existing notes**. Each edit targets one
 Without `--apply` it performs a complete **dry-run**, calculating the candidate and all checks without writing it. With `--apply`, it atomically replaces the file only after every check succeeds.
 
 ```bash
-# одиночная правка: dry-run
+# single edit: dry-run
 anki-repo edit decks/output/Words__N1 \
   --guid 'D!TAYVuHi,' --field 'Значение' --expect 'было' --set 'стало'
 
-# та же правка с записью
+# the same edit with writing
 anki-repo edit decks/output/Words__N1 \
   --guid 'D!TAYVuHi,' --field 'Значение' --expect 'было' --set 'стало' --apply
 
-# пакетная правка из файла запроса
+# batch edit from a request file
 anki-repo edit decks/output/Words__N1 --request edits.json --apply
 
-# пакетная правка со stdin
+# batch edit from stdin
 anki-repo edit decks/output/Words__N1 --request - --apply < edits.json
 ```
 
@@ -1043,7 +1043,7 @@ The human-readable report includes mode, before/after sizes, changed-line count,
 
 ### Removed entities
 
-Two features were deliberately removed because they imposed one particular note model's semantics as a universal toolkit contract. The toolkit handles arbitrary CrowdAnki exports and assumes no specific field names.
+Two features were deliberately removed: their semantics were defined by one particular note model, so they turned the makeup of the current user decks into a permanent toolkit contract. The toolkit handles arbitrary CrowdAnki exports and assumes no specific field names.
 
 - Removed `--word` from `find` and `review`. It was merely an alias for substring matching on raw values of the field `Слово`, which is model-specific. The same functionality remains available explicitly through `--field <field name> --value <value> --match contains`.
 - Removed QA rule `duplicate_primary_field`: the concept of a primary/headword field belongs to individual note models, not the CrowdAnki format. Exactly five QA rules remain (`empty_field_value`, `leading_whitespace`, `trailing_whitespace`, `forbidden_white_span`, `duplicate_note_content`); group metadata (`related`, `group_size`, `related_truncated`) belongs to `duplicate_note_content`.
@@ -1140,7 +1140,7 @@ Domain `error.code` values and corresponding exit codes are listed below. `valid
 | `missing_field_value` | 3 | `models` / `create`: model requires a field omitted from request |
 | `internal_error` | 70 | Internal error, including byte-level edit-invariant violation |
 
-For `visual-report`, output-directory checks produce `invalid_request` with `details.reason` values: `out_dir_inside_decks` (`--out` in `decks/**`), `out_dir_overlaps_export` (within or equal to a compared export), `out_dir_not_owned` (nonempty directory without a valid report manifest), `out_dir_manifest_invalid` (corrupt, foreign, outside-pointing, or self-referential manifest), `out_dir_not_a_directory`, `out_dir_is_symlink`, `out_dir_entry_conflict`, `before_equals_after`, and `invalid_tag` (invalid `--retire-tag`; also used by `retire`).
+For `visual-report`, output-directory checks produce `invalid_request` with `details.reason` values: `out_dir_inside_decks` (`--out` in `decks/**`), `out_dir_overlaps_export` (within or equal to a compared export), `out_dir_not_owned` (nonempty directory without a valid report manifest), `out_dir_manifest_invalid` (corrupt, foreign, outside-pointing, or self-referential manifest), `out_dir_not_a_directory` (`--out` exists and is not a directory), `out_dir_is_symlink` (`--out` is a symbolic link), `out_dir_entry_conflict` (the report directory contains a symbolic link or a name that contradicts the ownership proof), `before_equals_after` (both states are the same directory), and `invalid_tag` (invalid `--retire-tag`; also used by `retire`).
 
 Failures during report generation after directory checks are `write_failed` with `reason` values: `report_write_failed`, `media_copy_failed`, `preview_not_offline`, `index_not_offline`, `report_file_not_moved`, `stale_file_not_removed`, `staging_not_created`, `staging_destination_not_created`, `report_file_outside_out_dir`, `out_dir_entry_conflict` (a foreign entry appeared after preflight), `report_file_not_confined`, and `manifest_not_serializable`.
 

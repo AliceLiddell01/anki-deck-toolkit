@@ -4,7 +4,7 @@
 
 <!-- i18n-source-git-blob: 2630521deeff475a4b9958ebae7ebbc40e95ebd7 -->
 
-`repository-maintenance` is a separate Cargo package for monitoring local build artifacts and safely cleaning up reproducible data. It is independent of `anki-repo`: it does not work with CrowdAnki exports and instead manages the lifecycle of disk usage.
+`repository-maintenance` is a separate Cargo package for monitoring local artifacts and safely cleaning up reproducible data. It is independent of `anki-repo`: it does not work with CrowdAnki exports and instead manages the lifecycle of disk usage.
 
 ## Audit findings
 
@@ -15,7 +15,7 @@ At the current `HEAD`, the relevant data sources are as follows:
 | Cargo workspace | A single root workspace; the normal `target` directory is resolved via `cargo metadata`. Build and test profiles are declared in the root `Cargo.toml`. | Measure both `target` and the configured Cargo `build-dir` within the workspace; perform cleanup only through `cargo clean`. |
 | Nested builds | The `code-review` check in `anki-repo` runs Cargo Clippy; synthetic Cargo scenarios set `CARGO_TARGET_DIR` within their own `TempWorkspace`. | The temporary directory is removed by its owner or the existing orphan-directory collector. |
 | Process, browser, and test temporary data | `asset-store` creates a `TempWorkspace` with a private ownership marker; the browser gets a separate profile and `TMPDIR` inside that tree. | Apply process identity, PID start time, process references, `NOFOLLOW`, and mount-point boundaries implemented by `asset-store`. This tool invokes the same public garbage-collection paths. |
-| Evidence ZIP archives | `tools/asset-store/src/bin/common/evidence_zip.rs` writes archives to `<temp_dir>/anki-decks-evidence` or a path supplied via `--output`. | ZIP files contain evidence, so the new collector only lists them in its inventory. Directories and files without verifiable ownership markers are not deleted by default. Recognized legacy directories without markers can be deleted only by an explicit `clean --cleanup-legacy --apply`. An explicit `--output` outside the scanned roots is excluded from inventory. |
+| Evidence ZIP archives | `tools/asset-store/src/bin/common/evidence_zip.rs` writes archives to `<temp_dir>/anki-decks-evidence` or a path supplied via `--output`. | ZIP files contain evidence, so the new collector only lists them in its inventory. Directories and files without a verifiable ownership marker are not deleted by default. Recognized legacy directories without markers can be deleted only by an explicit `clean --cleanup-legacy --apply`. An explicit `--output` outside the scanned roots is excluded from inventory. |
 | Persistent storage and transactional `.tmp` files | `asset-store` keeps its data in a directory that it manages; temporary names are used for atomic operations and recovery from incomplete transitions. | This is application-domain state, not general Cargo waste; disk cleanup does not touch it. |
 | Persistent external Cargo build directories | There is currently no dedicated long-running process in the source code creating Cargo build directories under `~/.cache`. Arbitrary directories found during a local incident do not establish ownership. | `cache init` and `cache run` support explicitly reusable caches by creating a marker, updating their last-use time, and applying a shared size limit. Unknown directories are never cleaned. |
 
@@ -46,7 +46,7 @@ The only tracked source of default values is [`policy.toml`](policy.toml):
 | Orphaned `TempWorkspace` | Existing owner's policy | Schema 1 requires a TTL of at least 24 hours; schema 2 uses evidence of process identity and current references. |
 | Number of largest entries shown per inventory root | 20 | `--detail` shows every top-level entry. |
 
-`--policy FILE` overrides the TOML values. Test scenarios can override thresholds in bytes and seconds—for example, `target_hard_limit_bytes=2`—so cleanup decisions can be tested on small files without allocating gigabytes.
+`--policy FILE` overrides the TOML values. For test scenarios, thresholds can be overridden in bytes and seconds—for example, `target_hard_limit_bytes=2`—so cleanup decisions can be tested on small files without allocating gigabytes.
 
 ## Initial setup and self-diagnostics
 
@@ -71,7 +71,7 @@ Unknown or incomplete measurements are explicitly labeled. JSON retains the stan
 
 Installation ownership is established from private configuration, exact managed unit templates on disk, and loaded unit properties: `LoadState`, `FragmentPath`, `ExecStart`, `DropInPaths`, and `NeedDaemonReload`. Replaced or outdated units, unknown drop-ins, and unsafe links or permissions prevent changes to the installation. A missing installed binary can be restored by rerunning `enable` if the remaining evidence matches. An ownership marker alone, without a verified checkout, is not enough to permit `maintenance disable`; the files are preserved for diagnosis.
 
-Both `enable` and `disable` hold the shared lock from verification until the preference is saved. Preference `yes` is deliberately retained if installation fails; the error is returned separately and a subsequent `enable` repairs the installation. Disabling verifies that **both** timer and service have stopped before deleting files; `no` is saved only after verifying that neither autostart nor activity remains. Diagnostic commands include a shell-escaped `--workspace-root` for the current checkout; suggested `clean` commands are previews without `--apply`. Text output shows "yes/no/unknown", the age of the last attempt, and Russian names for the mode and result; JSON retains machine-readable values.
+Both `enable` and `disable` hold the shared lock from verification until the preference is saved. Preference `yes` is deliberately retained if installation fails; the error is returned separately and a subsequent `enable` repairs the installation. Disabling verifies that **both** timer and service have stopped before deleting files; `no` is saved only after verifying that neither autostart nor activity remains. Diagnostic commands include a shell-escaped `--workspace-root` for the current checkout; suggested `clean` commands are previews without `--apply`. Text output shows “да/нет/неизвестно” (yes/no/unknown), the age of the last attempt, and Russian names for the mode and result; JSON retains machine-readable values.
 
 External JSON masks the UID only in path components matching `anki-decks-<uid>`, including checkout paths and the latest-attempt path. The private snapshot retains exact paths for matching to the current checkout. Suggested executable commands include the exact path so they can be run. When a path contains non-UTF-8 bytes, diagnostics use a lossy string representation and no path-bearing suggested command is emitted (`action: null`). Private snapshots do not replace such paths: serialization fails and the prior file is preserved.
 

@@ -6,7 +6,7 @@
 
 <!-- i18n-source-git-blob: a8fdb96a13158e6f1828e0a58f4717180c5d9e4b -->
 
-**Rust CLI tools for inspecting and validating CrowdAnki JSON exports, making targeted edits, and visually comparing versions.**
+**Rust CLI tools for inspecting and validating CrowdAnki JSON exports, making targeted edits, and visually comparing exports.**
 
 [![Repository checks](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLiddell01/anki-deck-toolkit/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-workspace-000000?logo=rust&logoColor=white)
@@ -15,7 +15,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-2f81f7?logo=readthedocs&logoColor=white)](https://deepwiki.com/AliceLiddell01/anki-deck-toolkit)
 
-A toolkit for Anki deck maintainers and developers: inspect exports, validate structure and media references, review note quality, perform safe edits with `dry-run`, create notes using existing note models, and generate HTML before/after reports. The tools do not call LLM APIs but support an auditable workflow with external AI agents.
+A toolkit for Anki deck maintainers and developers: inspect exports, validate structure and media references, review note quality, perform safe edits with `dry-run`, create notes using existing note models, and generate HTML before/after reports. The tools do not call LLM APIs but support a verifiable workflow with external AI agents.
 
 **This is not a catalog of ready-made decks.** Users' CrowdAnki exports, media files, and local asset corpora are not published through Git.
 
@@ -81,7 +81,7 @@ The tools deliberately separate **structural operations** from **content decisio
 
 ## Quick start
 
-You need Linux and the Rust toolchain. The minimum supported Rust version is declared in the root `Cargo.toml`; it is intentionally not duplicated in this documentation.
+You need Linux and the Rust toolchain. The minimum supported Rust version is declared in the root `Cargo.toml`; this documentation does not keep a separate copy of the version.
 
 ```bash
 git clone https://github.com/AliceLiddell01/anki-deck-toolkit.git
@@ -163,7 +163,7 @@ Yarxi
   └─ other     ──→ local current-data store / quarantine
 ```
 
-The verified corpus is trusted local state in the working copy. It contains only confirmed assets and their provenance information; the key files are `manifest.json` and `.owner.json`. Unverified candidates never enter the corpus, and it is not published through Git. Each user has their own corpus, and its absence in a fresh clone is normal. `asset-store` does not scan deck media directories under `decks/` or treat user media directories as data sources.
+The verified corpus is trusted local state in the working copy. It contains only confirmed assets and their provenance information; the key files are `manifest.json` and `.owner.json`. Unverified candidates never enter the corpus, and it is not published through Git. Each user has their own corpus, and its absence in a fresh clone is normal. `asset-store` does not scan `decks/**/media/` and does not use user media directories as a data source.
 
 [Full `asset-store` contract →](tools/asset-store/README.en.md)
 
