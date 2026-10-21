@@ -3052,8 +3052,12 @@ mod tests {
             assert!(snapshot.stale_pending_requests.is_empty());
         }
         assert!(!state.monitor_failed);
-        assert!(state.completed_order.len() <= MAX_COMPLETED_REQUESTS);
+        assert_eq!(state.completed_order.len(), MAX_COMPLETED_REQUESTS);
         assert_eq!(state.completed_requests.len(), state.completed_order.len());
+        assert!(!state.completed_requests.contains("0.0"));
+        let newest = format!("{}.7", MAX_TRACKED_REQUESTS - 1);
+        assert!(state.completed_requests.contains(&newest));
+        assert_eq!(state.completed_order.back(), Some(&newest));
     }
 
     #[test]
