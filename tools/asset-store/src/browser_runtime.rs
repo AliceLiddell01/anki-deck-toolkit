@@ -1,6 +1,6 @@
 //! Повторно используемая среда Chromium и техническая телеметрия CDP.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::future::Future;
 use std::io::{self, Read};
@@ -31,6 +31,9 @@ use crate::temp_workspace::TempWorkspace;
 
 const MAX_TRACKED_REQUESTS: usize = 256;
 const MAX_NETWORK_OUTCOMES: usize = 256;
+/// События ответа из кэша разделены долями миллисекунды, поэтому такой объём памяти
+/// завершённых запросов с большим запасом покрывает задержку между слушателями.
+const MAX_COMPLETED_REQUESTS: usize = 1024;
 const MAX_NETWORK_DIAGNOSTIC_ITEMS: usize = 3;
 const MAX_NETWORK_DIAGNOSTIC_PATH_CHARS: usize = 160;
 /// Максимум записей каждой коллекции в диагностическом JSON.
@@ -1178,6 +1181,10 @@ struct RuntimeState {
     main_frame_id: String,
     active_epoch: u64,
     next_epoch: u64,
+    // Слушатели событий CDP разных типов работают независимо, поэтому терминальное
+    // событие ответа из кэша может быть обработано раньше его `requestWillBeSent`.
+    completed_requests: HashSet<String>,
+    completed_order: VecDeque<String>,
 }
 
 impl RuntimeState {
@@ -1201,6 +1208,21 @@ impl RuntimeState {
             self.monitor_failed = true;
             return;
         }
+        let is_top_level = frame_id.is_some_and(|id| id == self.main_frame_id);
+        // Исход, обработанный раньше запроса, получает его URL и принадлежность кадру:
+        // без них критический сбой страницы не распознаётся как критический.
+        for outcome in self
+            .network_failures
+            .iter_mut()
+            .chain(self.http_errors.iter_mut())
+            .filter(|outcome| outcome.request_id == request_id)
+        {
+            outcome.url.get_or_insert_with(|| url.clone());
+            outcome.is_top_level |= is_top_level;
+        }
+        if self.completed_requests.contains(&request_id) {
+            return;
+        }
         if !self.relevant_requests.contains_key(&request_id)
             && self.relevant_requests.len() >= MAX_TRACKED_REQUESTS
         {
@@ -1211,7 +1233,6 @@ impl RuntimeState {
             .relevant_requests
             .get(&request_id)
             .map_or(self.active_epoch, |request| request.epoch);
-        let is_top_level = frame_id.is_some_and(|id| id == self.main_frame_id);
         self.request_observed_at
             .entry(request_id.clone())
             .or_insert_with(Instant::now);
@@ -1227,6 +1248,29 @@ impl RuntimeState {
         );
     }
 
+    fn record_finished(&mut self, request_id: &str) {
+        self.relevant_requests.remove(request_id);
+        self.request_observed_at.remove(request_id);
+        self.remember_completed(request_id);
+    }
+
+    /// Терминальное событие окончательно: поздний `requestWillBeSent` того же запроса
+    /// (в том числе шаг перенаправления) уже не делает его ожидающим.
+    fn remember_completed(&mut self, request_id: &str) {
+        if request_id.len() > MAX_RUNTIME_REQUEST_ID_BYTES
+            || self.completed_requests.contains(request_id)
+        {
+            return;
+        }
+        if self.completed_order.len() >= MAX_COMPLETED_REQUESTS
+            && let Some(oldest) = self.completed_order.pop_front()
+        {
+            self.completed_requests.remove(&oldest);
+        }
+        self.completed_requests.insert(request_id.to_owned());
+        self.completed_order.push_back(request_id.to_owned());
+    }
+
     fn record_network_failure(
         &mut self,
         request_id: String,
@@ -1235,6 +1279,7 @@ impl RuntimeState {
     ) {
         let tracked = self.relevant_requests.remove(&request_id);
         self.request_observed_at.remove(&request_id);
+        self.remember_completed(&request_id);
         if request_id.len() > MAX_RUNTIME_REQUEST_ID_BYTES
             || failure_reason.len() > MAX_RUNTIME_REASON_BYTES
         {
@@ -1483,9 +1528,7 @@ impl CdpRuntimeMonitor {
             tasks.push(tokio::spawn(async move {
                 let mut events = finished_events;
                 while let Some(event) = events.next().await {
-                    let mut state = lock_state(&state);
-                    state.relevant_requests.remove(event.request_id.as_ref());
-                    state.request_observed_at.remove(event.request_id.as_ref());
+                    lock_state(&state).record_finished(event.request_id.as_ref());
                 }
                 mark_monitor_failed(&state);
             }));
@@ -2942,6 +2985,132 @@ mod tests {
         }
         assert_eq!(state.javascript_exceptions.len(), MAX_NETWORK_OUTCOMES);
         assert!(state.monitor_failed);
+    }
+
+    #[test]
+    fn completion_handled_before_its_request_does_not_leave_pending_request() {
+        // Ответ из memory cache: `requestWillBeSent` и `loadingFinished` приходят почти
+        // одновременно, а их независимые слушатели могут обработать их в обратном порядке.
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let epoch = state.begin_epoch();
+        state.record_finished("cached-style");
+        state.record_request(
+            "cached-style".into(),
+            ResourceType::Stylesheet,
+            "https://jpdb.io/static/site.css".into(),
+            Some("main"),
+        );
+        // Шаг перенаправления после завершения тоже не воскрешает запрос.
+        state.record_request(
+            "cached-style".into(),
+            ResourceType::Stylesheet,
+            "https://jpdb.io/static/site-redirected.css".into(),
+            Some("main"),
+        );
+        let snapshot = state.snapshot(epoch);
+        assert!(snapshot.pending_requests.is_empty());
+        assert!(snapshot.stale_pending_requests.is_empty());
+        assert!(state.request_observed_at.is_empty());
+        assert!(!snapshot.monitor_failed);
+
+        // Обычный порядок по-прежнему отслеживает незавершённый запрос.
+        state.record_request(
+            "live-script".into(),
+            ResourceType::Script,
+            "https://jpdb.io/static/app.js".into(),
+            Some("main"),
+        );
+        assert_eq!(state.snapshot(epoch).pending_requests.len(), 1);
+        state.record_finished("live-script");
+        assert!(state.snapshot(epoch).pending_requests.is_empty());
+    }
+
+    #[test]
+    fn repeated_cached_navigations_do_not_exhaust_request_tracking() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        // Больше навигаций, чем помещается в MAX_TRACKED_REQUESTS при прежней утечке.
+        for navigation in 0..MAX_TRACKED_REQUESTS {
+            let epoch = state.begin_epoch();
+            for resource in 0..8 {
+                let id = format!("{navigation}.{resource}");
+                state.record_finished(&id);
+                state.record_request(
+                    id,
+                    ResourceType::Font,
+                    format!("https://jpdb.io/static/{resource}.woff2"),
+                    Some("main"),
+                );
+            }
+            let snapshot = state.snapshot(epoch);
+            assert!(snapshot.pending_requests.is_empty());
+            assert!(snapshot.stale_pending_requests.is_empty());
+        }
+        assert!(!state.monitor_failed);
+        assert!(state.completed_order.len() <= MAX_COMPLETED_REQUESTS);
+        assert_eq!(state.completed_requests.len(), state.completed_order.len());
+    }
+
+    #[test]
+    fn outcome_handled_before_its_request_gets_url_and_main_frame_scope() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let epoch = state.begin_epoch();
+        state.record_network_failure(
+            "document".into(),
+            ResourceType::Document,
+            "net::ERR_CONNECTION_RESET".into(),
+        );
+        state.record_http_error(
+            "throttled".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=x".into(),
+            429,
+        );
+        state.record_request(
+            "document".into(),
+            ResourceType::Document,
+            "https://jpdb.io/vocabulary/1/x".into(),
+            Some("main"),
+        );
+        state.record_request(
+            "throttled".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=x".into(),
+            Some("main"),
+        );
+        let snapshot = state.snapshot(epoch);
+        let failure = &snapshot.network_failures[0];
+        assert_eq!(
+            failure.url.as_deref(),
+            Some("https://jpdb.io/vocabulary/1/x")
+        );
+        assert!(failure.is_top_level);
+        assert!(snapshot.http_errors[0].is_top_level);
+        // Неудачный запрос завершён, а ответ с ошибкой ещё может получить loadingFinished.
+        assert_eq!(snapshot.pending_requests.len(), 1);
+        assert_eq!(snapshot.pending_requests[0].request_id, "throttled");
+
+        // Подкадр не становится главным кадром из-за позднего запроса.
+        state.record_network_failure(
+            "frame".into(),
+            ResourceType::Document,
+            "net::ERR_ABORTED".into(),
+        );
+        state.record_request(
+            "frame".into(),
+            ResourceType::Document,
+            "https://ads.example/frame".into(),
+            Some("child"),
+        );
+        assert!(!state.snapshot(epoch).network_failures[1].is_top_level);
     }
 
     #[test]

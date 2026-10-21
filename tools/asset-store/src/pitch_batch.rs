@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
@@ -2013,6 +2014,13 @@ fn validate_candidate_bytes(
             "контекст проверки кандидата pitch-accent не совпадает с метаданными или свидетельствами",
         ));
     }
+    let key = (
+        candidate.validation_context_sha256.clone(),
+        validator.clone(),
+    );
+    if verified_candidate_contexts().contains(&key) {
+        return Ok(());
+    }
     let identity = AssetIdentity::new("pitch_accent", candidate.metadata.surface.clone())
         .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
     let fresh = validate_candidate(&identity, &candidate.metadata, bytes, validator)?;
@@ -2022,10 +2030,23 @@ fn validate_candidate_bytes(
             "результат PitchAccentImageValidator не совпадает с сохранёнными точными свидетельствами",
         ));
     }
+    verified_candidate_contexts().insert(key);
     Ok(())
 }
 
-fn with_validation_context(
+/// Контексты кандидатов, уже подтверждённые `PitchAccentImageValidator` в этом процессе.
+///
+/// Контекст фиксирует SHA-256 и длину байтов, метаданные и сохранённое решение
+/// валидатора, а байты, длина, сигнатура PNG и сам контекст сверяются при каждом
+/// вызове. Поэтому повторный прогон детерминированного валидатора на тех же входах
+/// ничего не доказывает, но при каждой загрузке пакета стоил O(числа кандидатов)
+/// декодирований PNG. Новый процесс, в том числе `resume`, проверяет кандидатов заново.
+fn verified_candidate_contexts() -> MutexGuard<'static, BTreeSet<(String, ValidatorIdentity)>> {
+    static CONTEXTS: Mutex<BTreeSet<(String, ValidatorIdentity)>> = Mutex::new(BTreeSet::new());
+    CONTEXTS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+pub(crate) fn with_validation_context(
     mut candidate: PitchBatchCandidate,
 ) -> Result<PitchBatchCandidate, AssetError> {
     candidate.validation_context_sha256 = candidate_context(&candidate)?;

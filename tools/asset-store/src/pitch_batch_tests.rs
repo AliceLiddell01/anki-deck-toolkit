@@ -1459,6 +1459,63 @@ fn batch_wide_retry_rolls_back_after_first_item_changes_and_second_overflows() {
 }
 
 #[test]
+fn cached_validator_decision_does_not_cover_forged_context_or_changed_bytes() {
+    let temporary = temp_store();
+    let root = temporary.path();
+    let mut batch = batch("validator-memo", "幽霊", Some("ゆうれい"));
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+    let sha = record_provider_outcome(&mut runtime, &mut batch, "幽霊", acquired("幽霊", false));
+    drop(runtime);
+
+    // Повторные загрузки подтверждённого кандидата остаются успешными.
+    let mut reopened = PitchAccentBatchRuntime::open(root, "validator-memo").unwrap();
+    let loaded = reopened.load().unwrap().unwrap();
+    assert!(reopened.load().unwrap().is_some());
+    let candidate = loaded
+        .item("幽霊")
+        .unwrap()
+        .candidate(&sha)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        reopened.read_candidate(&loaded, &candidate).unwrap(),
+        png(false)
+    );
+
+    // Подделка решения с согласованно пересчитанным контекстом — новый контекст:
+    // она снова проходит через PitchAccentImageValidator и отвергается.
+    let mut forged = candidate.clone();
+    forged.validation.evidence[0].summary = "подделанное свидетельство".into();
+    let forged = crate::pitch_batch::with_validation_context(forged).unwrap();
+    assert_ne!(
+        forged.validation_context_sha256,
+        candidate.validation_context_sha256
+    );
+    let mut forged_batch = loaded.clone();
+    let attempt = forged_batch
+        .item_mut("幽霊")
+        .unwrap()
+        .attempts
+        .last_mut()
+        .unwrap();
+    attempt.outcome = crate::pitch_batch::PitchBatchOutcome::Acquired {
+        candidate: Box::new(forged.clone()),
+    };
+    let error = reopened.read_candidate(&forged_batch, &forged).unwrap_err();
+    assert_eq!(error.code, crate::error::ErrorCode::IntegrityMismatch);
+
+    // Изменённые байты того же контекста отвергает проверка SHA до кэша.
+    let blob = root
+        .join(".runtime/batches/validator-memo")
+        .join(&candidate.blob.storage_path);
+    std::fs::write(&blob, png(true)).unwrap();
+    let error = reopened.read_candidate(&loaded, &candidate).unwrap_err();
+    assert_eq!(error.code, crate::error::ErrorCode::IntegrityMismatch);
+    assert!(reopened.load().is_err());
+}
+
+#[test]
 fn batch_wide_retry_and_runtime_load_reject_corrupt_attempt_history() {
     let temporary = temp_store();
     let mut batch = batch("batch-wide-invalid-history", "幽霊", Some("ゆうれい"));
