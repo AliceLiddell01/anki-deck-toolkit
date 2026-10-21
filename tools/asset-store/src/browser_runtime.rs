@@ -1,6 +1,6 @@
 //! Повторно используемая среда Chromium и техническая телеметрия CDP.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::future::Future;
 use std::io::{self, Read};
@@ -751,7 +751,7 @@ impl BrowserResources {
             },
             process_stopped = stopped.process_stopped,
             profile_temp_removed = cleanup.is_ok(),
-            "Проверены postconditions принадлежащих процессов и каталогов"
+            "Проверены постусловия принадлежащих процессов и каталогов"
         );
         let result = combine_browser_close_results(
             classify_browser_cleanup(stopped, cleanup),
@@ -1022,7 +1022,7 @@ pub struct RuntimeSnapshot {
     pub stale_javascript_exceptions: u32,
 }
 
-/// Возраст запроса CDP, а не длительность server-side обработки.
+/// Возраст запроса CDP, а не длительность обработки на стороне сервера.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRequestObservation {
     pub request_id: String,
@@ -1182,9 +1182,18 @@ struct RuntimeState {
     active_epoch: u64,
     next_epoch: u64,
     // Слушатели событий CDP разных типов работают независимо, поэтому терминальное
-    // событие ответа из кэша может быть обработано раньше его `requestWillBeSent`.
-    completed_requests: HashSet<String>,
+    // событие ответа из кэша может быть обработано раньше его `requestWillBeSent`,
+    // а `responseReceived` — позже `loadingFinished`. Завершённый запрос сохраняет
+    // эпоху и принадлежность главному кадру, чтобы поздние события не теряли их.
+    completed_requests: HashMap<String, CompletedRequest>,
     completed_order: VecDeque<String>,
+}
+
+/// Корреляция завершённого запроса, нужная его поздним событиям.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompletedRequest {
+    epoch: u64,
+    is_top_level: bool,
 }
 
 impl RuntimeState {
@@ -1229,7 +1238,8 @@ impl RuntimeState {
             outcome.url.get_or_insert_with(|| url.clone());
             outcome.is_top_level |= is_top_level;
         }
-        if self.completed_requests.contains(&request_id) {
+        if let Some(completed) = self.completed_requests.get_mut(&request_id) {
+            completed.is_top_level |= is_top_level;
             return;
         }
         if !self.relevant_requests.contains_key(&request_id)
@@ -1239,9 +1249,8 @@ impl RuntimeState {
             return;
         }
         let epoch = self
-            .relevant_requests
-            .get(&request_id)
-            .map_or(self.active_epoch, |request| request.epoch);
+            .observed_scope(&request_id)
+            .map_or(self.active_epoch, |scope| scope.epoch);
         self.request_observed_at
             .entry(request_id.clone())
             .or_insert_with(Instant::now);
@@ -1258,17 +1267,48 @@ impl RuntimeState {
     }
 
     fn record_finished(&mut self, request_id: &str) {
+        let scope = self.observed_scope(request_id);
         self.relevant_requests.remove(request_id);
         self.request_observed_at.remove(request_id);
-        self.remember_completed(request_id);
+        self.remember_completed(request_id, scope);
+    }
+
+    /// Эпоха и кадр запроса по самому раннему обработанному событию с этим ID.
+    /// Раньше всех обработанное событие ближе всего к моменту отправки запроса,
+    /// поэтому смена эпохи между слушателями не переносит запрос в новую эпоху.
+    fn observed_scope(&self, request_id: &str) -> Option<CompletedRequest> {
+        if let Some(request) = self.relevant_requests.get(request_id) {
+            return Some(CompletedRequest {
+                epoch: request.epoch,
+                is_top_level: request.is_top_level,
+            });
+        }
+        if let Some(completed) = self.completed_requests.get(request_id) {
+            return Some(*completed);
+        }
+        self.network_failures
+            .iter()
+            .chain(&self.http_errors)
+            .find(|outcome| outcome.request_id == request_id)
+            .map(|outcome| CompletedRequest {
+                epoch: outcome.epoch,
+                is_top_level: outcome.is_top_level,
+            })
     }
 
     /// Терминальное событие окончательно: поздний `requestWillBeSent` того же запроса
-    /// (в том числе шаг перенаправления) уже не делает его ожидающим.
-    fn remember_completed(&mut self, request_id: &str) {
-        if request_id.len() > MAX_RUNTIME_REQUEST_ID_BYTES
-            || self.completed_requests.contains(request_id)
-        {
+    /// (в том числе шаг перенаправления) уже не делает его ожидающим, а поздний
+    /// `responseReceived` получает эпоху и кадр завершённого запроса.
+    fn remember_completed(&mut self, request_id: &str, scope: Option<CompletedRequest>) {
+        if request_id.len() > MAX_RUNTIME_REQUEST_ID_BYTES {
+            return;
+        }
+        let scope = scope.unwrap_or(CompletedRequest {
+            epoch: self.active_epoch,
+            is_top_level: false,
+        });
+        if let Some(completed) = self.completed_requests.get_mut(request_id) {
+            completed.is_top_level |= scope.is_top_level;
             return;
         }
         if self.completed_order.len() >= MAX_COMPLETED_REQUESTS
@@ -1276,7 +1316,7 @@ impl RuntimeState {
         {
             self.completed_requests.remove(&oldest);
         }
-        self.completed_requests.insert(request_id.to_owned());
+        self.completed_requests.insert(request_id.to_owned(), scope);
         self.completed_order.push_back(request_id.to_owned());
     }
 
@@ -1286,9 +1326,10 @@ impl RuntimeState {
         event_resource_type: ResourceType,
         failure_reason: String,
     ) {
+        let scope = self.observed_scope(&request_id);
         let tracked = self.relevant_requests.remove(&request_id);
         self.request_observed_at.remove(&request_id);
-        self.remember_completed(&request_id);
+        self.remember_completed(&request_id, scope);
         if request_id.len() > MAX_RUNTIME_REQUEST_ID_BYTES
             || failure_reason.len() > MAX_RUNTIME_REASON_BYTES
         {
@@ -1307,14 +1348,12 @@ impl RuntimeState {
                 .as_ref()
                 .map(|request| request.resource_type.clone())
                 .unwrap_or(event_resource_type),
-            url: tracked.as_ref().map(|request| request.url.clone()),
+            url: tracked.map(|request| request.url),
             failure_reason: Some(failure_reason),
             request_id,
-            epoch: tracked
-                .as_ref()
-                .map_or(self.active_epoch, |request| request.epoch),
+            epoch: scope.map_or(self.active_epoch, |scope| scope.epoch),
             status_code: None,
-            is_top_level: tracked.is_some_and(|request| request.is_top_level),
+            is_top_level: scope.is_some_and(|scope| scope.is_top_level),
         });
     }
 
@@ -1324,6 +1363,7 @@ impl RuntimeState {
         resource_type: ResourceType,
         url: String,
         status_code: u16,
+        frame_id: Option<&str>,
     ) {
         if !is_relevant_resource_type(&resource_type) || status_code < 400 {
             return;
@@ -1336,15 +1376,19 @@ impl RuntimeState {
             self.monitor_failed = true;
             return;
         }
-        let tracked = self.relevant_requests.get(&request_id);
+        // `frameId` ответа сам указывает кадр, поэтому главный документ распознаётся
+        // и без `requestWillBeSent`; эпоху даёт ранее обработанное событие запроса.
+        let scope = self.observed_scope(&request_id);
+        let is_top_level = frame_id.is_some_and(|id| id == self.main_frame_id)
+            || scope.is_some_and(|scope| scope.is_top_level);
         self.http_errors.push(NetworkOutcome {
             resource_type,
             url: Some(url),
             failure_reason: None,
             request_id,
-            epoch: tracked.map_or(self.active_epoch, |request| request.epoch),
+            epoch: scope.map_or(self.active_epoch, |scope| scope.epoch),
             status_code: Some(status_code),
-            is_top_level: tracked.is_some_and(|request| request.is_top_level),
+            is_top_level,
         });
     }
 
@@ -1566,6 +1610,7 @@ impl CdpRuntimeMonitor {
                         event.r#type.clone(),
                         event.response.url.clone(),
                         event.response.status as u16,
+                        event.frame_id.as_ref().map(|id| id.as_ref()),
                     );
                 }
                 mark_monitor_failed(&state);
@@ -2504,6 +2549,7 @@ mod tests {
             ResourceType::Fetch,
             "https://example.test/pending".into(),
             503,
+            None,
         );
         state.record_javascript_exception();
 
@@ -2998,7 +3044,7 @@ mod tests {
 
     #[test]
     fn completion_handled_before_its_request_does_not_leave_pending_request() {
-        // Ответ из memory cache: `requestWillBeSent` и `loadingFinished` приходят почти
+        // Ответ из кэша памяти браузера: `requestWillBeSent` и `loadingFinished` приходят почти
         // одновременно, а их независимые слушатели могут обработать их в обратном порядке.
         let mut state = RuntimeState {
             main_frame_id: "main".into(),
@@ -3038,6 +3084,171 @@ mod tests {
     }
 
     #[test]
+    fn late_response_keeps_main_frame_and_epoch_of_completed_request() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let epoch = state.begin_epoch();
+        // Ответ обработан после `loadingFinished`; `frameId` ответа намеренно не передан,
+        // чтобы проверить сохранённую корреляцию, а не только поле события.
+        state.record_request(
+            "finished-first".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=a".into(),
+            Some("main"),
+        );
+        state.record_finished("finished-first");
+        state.record_http_error(
+            "finished-first".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=a".into(),
+            429,
+            None,
+        );
+        // Завершение обработано раньше запроса, ответ — последним.
+        state.record_finished("request-late");
+        state.record_request(
+            "request-late".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=b".into(),
+            Some("main"),
+        );
+        state.record_http_error(
+            "request-late".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=b".into(),
+            429,
+            None,
+        );
+        // Обычный порядок.
+        state.record_request(
+            "ordered".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=c".into(),
+            Some("main"),
+        );
+        state.record_http_error(
+            "ordered".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=c".into(),
+            503,
+            Some("main"),
+        );
+        state.record_finished("ordered");
+        // Ответ без предшествующих событий распознаётся по своему `frameId`.
+        state.record_http_error(
+            "response-only".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=d".into(),
+            429,
+            Some("main"),
+        );
+        let snapshot = state.snapshot(epoch);
+        let errors = snapshot
+            .http_errors
+            .iter()
+            .map(|error| (error.request_id.as_str(), error.is_top_level, error.epoch))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors,
+            [
+                ("finished-first", true, epoch),
+                ("request-late", true, epoch),
+                ("ordered", true, epoch),
+                ("response-only", true, epoch),
+            ]
+        );
+        assert_eq!(
+            snapshot.http_errors[0].url.as_deref(),
+            Some("https://jpdb.io/search?q=a")
+        );
+        assert!(snapshot.pending_requests.is_empty());
+        assert!(!snapshot.monitor_failed);
+    }
+
+    #[test]
+    fn late_response_after_epoch_change_stays_in_its_request_epoch() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let first = state.begin_epoch();
+        state.record_request(
+            "tracked".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=a".into(),
+            Some("main"),
+        );
+        state.record_finished("tracked");
+        state.record_finished("unseen-request");
+        let second = state.begin_epoch();
+        state.record_request(
+            "unseen-request".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=b".into(),
+            Some("main"),
+        );
+        for id in ["tracked", "unseen-request"] {
+            state.record_http_error(
+                id.into(),
+                ResourceType::Document,
+                format!("https://jpdb.io/search?q={id}"),
+                429,
+                None,
+            );
+        }
+        let current = state.snapshot(second);
+        assert!(current.http_errors.is_empty());
+        assert_eq!(current.stale_http_errors.len(), 2);
+        let previous = state.snapshot(first);
+        assert_eq!(previous.http_errors.len(), 2);
+        assert!(previous.http_errors.iter().all(|error| error.is_top_level));
+        assert!(current.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn late_subframe_document_response_is_not_promoted_to_main_frame() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let epoch = state.begin_epoch();
+        state.record_request(
+            "frame-ordered".into(),
+            ResourceType::Document,
+            "https://ads.example/a".into(),
+            Some("child"),
+        );
+        state.record_finished("frame-ordered");
+        state.record_http_error(
+            "frame-ordered".into(),
+            ResourceType::Document,
+            "https://ads.example/a".into(),
+            429,
+            Some("child"),
+        );
+        state.record_finished("frame-late");
+        state.record_request(
+            "frame-late".into(),
+            ResourceType::Document,
+            "https://ads.example/b".into(),
+            Some("child"),
+        );
+        state.record_http_error(
+            "frame-late".into(),
+            ResourceType::Document,
+            "https://ads.example/b".into(),
+            503,
+            None,
+        );
+        let snapshot = state.snapshot(epoch);
+        assert_eq!(snapshot.http_errors.len(), 2);
+        assert!(snapshot.http_errors.iter().all(|error| !error.is_top_level));
+        assert!(snapshot.pending_requests.is_empty());
+    }
+
+    #[test]
     fn repeated_cached_navigations_do_not_exhaust_request_tracking() {
         let mut state = RuntimeState {
             main_frame_id: "main".into(),
@@ -3063,9 +3274,9 @@ mod tests {
         assert!(!state.monitor_failed);
         assert_eq!(state.completed_order.len(), MAX_COMPLETED_REQUESTS);
         assert_eq!(state.completed_requests.len(), state.completed_order.len());
-        assert!(!state.completed_requests.contains("0.0"));
+        assert!(!state.completed_requests.contains_key("0.0"));
         let newest = format!("{}.7", MAX_TRACKED_REQUESTS - 1);
-        assert!(state.completed_requests.contains(&newest));
+        assert!(state.completed_requests.contains_key(&newest));
         assert_eq!(state.completed_order.back(), Some(&newest));
     }
 
@@ -3086,6 +3297,7 @@ mod tests {
             ResourceType::Document,
             "https://jpdb.io/search?q=x".into(),
             429,
+            None,
         );
         state.record_request(
             "document".into(),
@@ -3155,6 +3367,7 @@ mod tests {
             ResourceType::Document,
             "https://jpdb.io/search?q=x".into(),
             429,
+            None,
         );
         state.record_request(
             "throttled".into(),
@@ -3236,6 +3449,7 @@ mod tests {
                 ResourceType::Fetch,
                 "https://example.test/old-http".into(),
                 503,
+                None,
             );
             assert_eq!(state.snapshot(old_epoch).javascript_exceptions, 2);
             state.begin_epoch();
@@ -3265,7 +3479,7 @@ mod tests {
 
         // Завершение старого потока после создания нового монитора должно
         // пометить отказавшимся только прежнее состояние. Ждём задачу слушателя,
-        // поэтому проверка не зависит от scheduling или задержек по времени.
+        // поэтому проверка не зависит от планирования выполнения задач или задержек по времени.
         drop(old_requests);
         while !old.tasks[0].is_finished() {
             tokio::task::yield_now().await;
@@ -3345,6 +3559,7 @@ mod tests {
             ResourceType::Fetch,
             "https://example.test/old".into(),
             503,
+            None,
         );
         state.record_network_failure(
             "old".into(),
@@ -3366,6 +3581,7 @@ mod tests {
             ResourceType::Fetch,
             "https://example.test/current".into(),
             404,
+            None,
         );
         let snapshot = state.snapshot(epoch);
         assert!(snapshot.network_failures.is_empty());

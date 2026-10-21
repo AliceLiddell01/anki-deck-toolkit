@@ -281,7 +281,7 @@ pub struct PitchBatchItemToken {
     pub request_fingerprint: String,
 }
 
-/// Полный неизменяемый снимок владельца, полученный только после успешной проверки целостности store.
+/// Полный неизменяемый снимок владельца, полученный только после успешной проверки целостности хранилища.
 #[derive(Debug, Clone, Default)]
 pub struct PitchBatchOwnerSnapshot {
     records: BTreeMap<AssetIdentity, AssetRecord>,
@@ -707,7 +707,7 @@ impl PitchAccentBatch {
     }
 
     /// Сохраняет намерение публикации до побочного эффекта у владельца.
-    /// Не принимает `REJECTED`, `CORRUPT`, неполные или устаревшие свидетельства validator.
+    /// Не принимает `REJECTED`, `CORRUPT`, неполные или устаревшие свидетельства валидатора.
     pub fn begin_publication(
         &mut self,
         surface: &str,

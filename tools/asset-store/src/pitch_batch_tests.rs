@@ -828,7 +828,7 @@ fn publication_reconcile_recovers_crash_after_owner_publish_before_final_state_s
     recovered.reconcile_owner(&snapshot).unwrap();
     assert_eq!(
         recovered.revision, revision,
-        "повторный reconcile идемпотентен"
+        "повторное согласование идемпотентно"
     );
     reopened.save(&recovered).unwrap();
     drop(reopened);
@@ -898,7 +898,7 @@ fn same_sha_in_new_generation_publishes_metadata_from_exact_current_attempt() {
     assert_eq!(
         batch.item("幽霊").unwrap().status(),
         PitchBatchItemStatus::PublicationPending,
-        "старый metadata A с тем же SHA не должен завершить новую публикацию"
+        "старые метаданные A с тем же SHA не должен завершить новую публикацию"
     );
     let publication = batch.item("幽霊").unwrap().publication.as_ref().unwrap();
     let current = batch
