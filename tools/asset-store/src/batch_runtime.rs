@@ -360,7 +360,9 @@ impl SafeBatchRuntime {
             )
         })?;
         S::check_stored_compatibility(&raw)?;
-        let state: S = serde_json::from_value(raw).map_err(|error| {
+        // Типизированный разбор идёт по исходным байтам: `Value` молча схлопывает
+        // повторные ключи, а разбор структуры их отвергает.
+        let state: S = serde_json::from_slice(&bytes).map_err(|error| {
             AssetError::new(
                 ErrorCode::ManifestCorrupt,
                 format!("JSON runtime-пакета повреждён: {error}"),

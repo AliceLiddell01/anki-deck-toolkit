@@ -322,6 +322,28 @@ fn stored_state_with_damaged_version_fields_is_corrupt_rather_than_outdated() {
 }
 
 #[test]
+fn stored_state_with_repeated_top_level_key_is_corrupt() {
+    let temporary = temp_store();
+    let batch = batch("repeated-top-level-key", "幽霊", Some("ゆうれい"));
+    drop(PitchAccentBatchRuntime::create(temporary.path(), &batch).unwrap());
+    let state_path = temporary
+        .path()
+        .join(".runtime/batches/repeated-top-level-key/state.json");
+    let current = std::fs::read(&state_path).unwrap();
+    assert_eq!(current.first(), Some(&b'{'));
+
+    // Повтор `batch_id` с тем же значением: промежуточный `Value` его схлопнул бы.
+    let mut stored = br#"{"batch_id":"repeated-top-level-key","#.to_vec();
+    stored.extend_from_slice(&current[1..]);
+    std::fs::write(&state_path, &stored).unwrap();
+    let mut reopened =
+        PitchAccentBatchRuntime::open(temporary.path(), "repeated-top-level-key").unwrap();
+    let error = reopened.load().unwrap_err();
+    assert_eq!(error.code, crate::error::ErrorCode::ManifestCorrupt);
+    assert_eq!(std::fs::read(&state_path).unwrap(), stored);
+}
+
+#[test]
 fn transient_retry_is_targeted_and_page_contract_failure_is_not_retryable() {
     let temporary = temp_store();
     let root = temporary.path();
