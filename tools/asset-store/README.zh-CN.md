@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 0af19dd2fe1b8ca09c444f354be65aa67e2af052 -->
+<!-- i18n-source-git-blob: 6a14b1b2b8575923cd0570e2f1f2296fc4eded3d -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -163,7 +163,7 @@ kanji-assets --store .asset-store/kanji journal baseline
 
 只有已经核对真实词典详情结构且确定没有 `Pitch accent` 区域，才能报告 `no_pitch_accent_on_source`。无法识别/空的图形 DOM、网络或 JS 错误、深色主题未经证实、截图不合法，都必须作为技术错误。在认定没有重音图前，等待关键页面请求结束并再次检查结构；任意睡眠时间不算证据。`page.evaluate()` 执行/解码失败是带当前阶段的 `browser_evaluation`；互相矛盾的 DOM 是 `page_contract`；超时是 `timeout`。
 
-已明确解析的词条中的音高图是该词条内部的变体。`Pitch accent` 区域的每一行必须恰好包含一个图形，以及可选的音频按钮；行中任何其他元素（包括可能的变体信息）都会导致 `capture_contract` 技术失败，而不会被忽略。只有一个图形时直接截取它；有多个变体时**恰好**截取一个，不含相邻图形。
+已明确解析的词条中的音高图是该词条内部的变体。`Pitch accent` 区域的每一行必须恰好包含一个图形，以及可选的 `a.vocabulary-audio` 音频按钮（数量不限，不参与选择）；行中任何其他元素（包括可能的变体信息）都会导致 `capture_contract` 技术失败，而不会被忽略。只有一个图形时直接截取它；有多个变体时**恰好**截取一个，不含相邻图形。
 
 JPDB 不提供**单个**音高变体的常见程度或优先级：变体行的标记只包含音频按钮和图形本身，而 `Top N` 与词频属于整个单词。因此采用可复现的伪随机选择（`basis: seeded_hash_without_source_priority`）：为每个变体计算 `selection_score = SHA-256("anki-decks/jpdb-pitch-variant-selection/v1\0<词条 ID>\0<markup_sha256>")`，选择分数最小的变体。选择不取决于页面上图形的顺序、新的运行、并行或 `resume`，也不会退化为“总是第一个”。相同的标记给出相同的分数，此时选择较小的 DOM 索引。新增变体时，选择要么保持不变，要么转向新变体。标记或变体集合的变化会改变 `markup_sha256` 和分数，因此选择与证据保持一致：验证器根据保存的清单重新计算选择。选择图形从不选择词条：多个匹配的 ID 仍返回 `ambiguous_vocabulary`，直到用户明确选择。
 

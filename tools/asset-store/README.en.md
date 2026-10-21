@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 0af19dd2fe1b8ca09c444f354be65aa67e2af052 -->
+<!-- i18n-source-git-blob: 6a14b1b2b8575923cd0570e2f1f2296fc4eded3d -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -163,7 +163,7 @@ Matching requires a paired surface form and reading among observed dictionary fo
 
 On a verified dictionary page, `no_pitch_accent_on_source` is returned **only** if the expected page structure is recognized and lacks the `Pitch accent` section. Unknown/empty graph DOM, network or JS failures, unverified dark mode, and malformed screenshots remain technical errors. Before confirming absence, the provider waits for critical page requests to complete and rechecks structure; an arbitrary delay is not evidence. Execution or decoding errors from `page.evaluate()` are `browser_evaluation` with the active stage; contradictory DOM is `page_contract`, timeouts are `timeout`.
 
-The pitch graphs of an unambiguously resolved entry are variants within that entry. Every row of the `Pitch accent` section must contain exactly one graph and, optionally, an audio button; any other row element, including possible per-variant data, is a technical `capture_contract` failure rather than being ignored. A single graph is captured as is. With several variants, **exactly one** is captured, without neighboring graphs.
+The pitch graphs of an unambiguously resolved entry are variants within that entry. Every row of the `Pitch accent` section must contain exactly one graph and, optionally, `a.vocabulary-audio` audio buttons (any number of them, not counted in the selection); any other row element, including possible per-variant data, is a technical `capture_contract` failure rather than being ignored. A single graph is captured as is. With several variants, **exactly one** is captured, without neighboring graphs.
 
 JPDB does not provide the prevalence or priority of **individual** pitch variants: a variant row's markup contains only the audio button and the graph itself, while `Top N` and frequency belong to the word as a whole. Selection is therefore reproducible and pseudorandom (`basis: seeded_hash_without_source_priority`): each variant gets `selection_score = SHA-256("anki-decks/jpdb-pitch-variant-selection/v1\0<entry ID>\0<markup_sha256>")`, and the variant with the lowest score is chosen. The choice does not depend on graph order on the page, on a new run, on parallelism, or on `resume`, and it does not reduce to "always the first". Identical markup gives equal scores; then the lower DOM index wins. When a variant is added, the choice either stays or moves to the new variant. A change of markup or of the variant set changes `markup_sha256` and the scores, so the choice and the evidence stay consistent: the validator recomputes the choice from the stored inventory. Choosing a graph never chooses a dictionary entry: several matching IDs still yield `ambiguous_vocabulary` until the user selects one explicitly.
 
