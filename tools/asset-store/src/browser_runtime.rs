@@ -1211,10 +1211,19 @@ impl RuntimeState {
         let is_top_level = frame_id.is_some_and(|id| id == self.main_frame_id);
         // Исход, обработанный раньше запроса, получает его URL и принадлежность кадру:
         // без них критический сбой страницы не распознаётся как критический.
+        // Шаги перенаправления одного запроса приходят по порядку, поэтому сбой
+        // относится к последнему из них; URL ошибки HTTP взят из самого ответа.
         for outcome in self
             .network_failures
             .iter_mut()
-            .chain(self.http_errors.iter_mut())
+            .filter(|outcome| outcome.request_id == request_id)
+        {
+            outcome.url = Some(url.clone());
+            outcome.is_top_level |= is_top_level;
+        }
+        for outcome in self
+            .http_errors
+            .iter_mut()
             .filter(|outcome| outcome.request_id == request_id)
         {
             outcome.url.get_or_insert_with(|| url.clone());
@@ -3115,6 +3124,66 @@ mod tests {
             Some("child"),
         );
         assert!(!state.snapshot(epoch).network_failures[1].is_top_level);
+    }
+
+    #[test]
+    fn failure_handled_before_redirect_steps_gets_the_final_step_url() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let epoch = state.begin_epoch();
+        state.record_network_failure(
+            "document".into(),
+            ResourceType::Document,
+            "net::ERR_CERT_AUTHORITY_INVALID".into(),
+        );
+        for url in [
+            "http://yarxi.ru/",
+            "https://yarxi.ru/",
+            "https://www.yarxi.ru/",
+        ] {
+            state.record_request(
+                "document".into(),
+                ResourceType::Document,
+                url.into(),
+                Some("main"),
+            );
+        }
+        state.record_http_error(
+            "throttled".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=x".into(),
+            429,
+        );
+        state.record_request(
+            "throttled".into(),
+            ResourceType::Document,
+            "https://jpdb.io/redirect-step".into(),
+            Some("main"),
+        );
+        let snapshot = state.snapshot(epoch);
+        assert_eq!(
+            snapshot.network_failures[0].url.as_deref(),
+            Some("https://www.yarxi.ru/")
+        );
+        assert_eq!(
+            snapshot.http_errors[0].url.as_deref(),
+            Some("https://jpdb.io/search?q=x")
+        );
+
+        let monitor = CdpRuntimeMonitor::from_snapshot_for_test(snapshot);
+        assert!(!monitor.clear_exact_network_failure(
+            "document",
+            "http://yarxi.ru/",
+            "net::ERR_CERT_AUTHORITY_INVALID",
+        ));
+        assert!(monitor.clear_exact_network_failure(
+            "document",
+            "https://www.yarxi.ru/",
+            "net::ERR_CERT_AUTHORITY_INVALID",
+        ));
+        assert!(monitor.snapshot(epoch).network_failures.is_empty());
     }
 
     #[test]
