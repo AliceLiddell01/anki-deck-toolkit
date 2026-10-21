@@ -34,7 +34,7 @@ use crate::pitch_accent::{
 use crate::validation::SemanticValidator;
 
 /// Версия формата предметного состояния пакета.
-pub const PITCH_BATCH_SCHEMA_VERSION: u32 = 2;
+pub const PITCH_BATCH_SCHEMA_VERSION: u32 = 3;
 /// Версия внешней схемы нормализованного плана pitch.
 pub const PITCH_PLAN_SCHEMA_VERSION: u32 = 1;
 /// Максимальный размер причины точечного действия.
@@ -1580,6 +1580,35 @@ impl RuntimeBatchState for PitchAccentBatch {
 
     fn validate(&self) -> Result<(), AssetError> {
         PitchAccentBatch::validate(self)
+    }
+
+    /// Состояние прежней схемы хранит свидетельства прежнего валидатора; оно не
+    /// разбирается и не переносит доверие, а требует нового пакета. Отсутствующие
+    /// или нетиповые поля версии — повреждение, а не прежняя схема: они уходят в
+    /// типизированный разбор и дают `ManifestCorrupt`.
+    fn check_stored_compatibility(raw: &serde_json::Value) -> Result<(), AssetError> {
+        if let Some(version) = raw["schema_version"].as_u64()
+            && version != u64::from(PITCH_BATCH_SCHEMA_VERSION)
+        {
+            return Err(AssetError::new(
+                ErrorCode::UnsupportedSchemaVersion,
+                format!(
+                    "версия состояния пакета pitch-accent {version} не поддерживается (текущая {PITCH_BATCH_SCHEMA_VERSION}); создайте новый пакет"
+                ),
+            ));
+        }
+        let current = PitchAccentImageValidator::validator_identity();
+        if let (Some(id), Some(version)) = (
+            raw["validator"]["id"].as_str(),
+            raw["validator"]["version"].as_str(),
+        ) && (id != current.id || version != current.version)
+        {
+            return Err(AssetError::new(
+                ErrorCode::UnsupportedSchemaVersion,
+                "состояние пакета pitch-accent использует устаревший валидатор; автоматическое доверие не переносится, создайте новый пакет",
+            ));
+        }
+        Ok(())
     }
 
     fn referenced_blobs(&self) -> Vec<RuntimeBlobRef> {

@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 456ac92d1bcc66077437a533a6baf5ddbba10f05 -->
+<!-- i18n-source-git-blob: 6a14b1b2b8575923cd0570e2f1f2296fc4eded3d -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -48,11 +48,13 @@
 
 资源存储负责**规范**消费者文件名，但不重写已有笔记的引用。旧的 `<surface>.png` 音高重音引用由 `anki-repo migrate-media` 迁移（参见 [anki-repo 文档](../anki-repo/README.zh-CN.md)）；存储仍提供已验证字节，不会重命名自身文件。比较读音时将平假名与片假名视为等价，但必须确认准确的词形/读音组合是所选词条的一种形式；`evidence` 保留 JPDB 的原始读音。
 
-仅成功解码 PNG 不足以获得 `VERIFIED`。`PitchAccentImageValidator` 验证词形和读音、与指定 ID 对应的真实词条页面、至少一个音高图以及深色主题的证据。证据保存每个图在视口和文档坐标中的矩形、几何并集和 `capture_rect`。单个图的截图恰好覆盖 DOM 矩形；多个图覆盖并集，保留自然间隔，不增加边框。原生 CDP `clip` 的坐标舍入允许 PNG 尺寸误差最多 **3 像素**。
+仅成功解码 PNG 不足以获得 `VERIFIED`。`PitchAccentImageValidator` 验证词形和读音、与指定 ID 对应的真实词条页面、图形变体清单、恰好选中其中一个变体以及深色主题的证据。
 
-深色主题证据关联浏览器配色设置、文档类、计算得到的背景颜色与 PNG 像素。至少一个背景像素与观察到的颜色在**每个 RGB 通道**上相差不超过 **8**；至少八个图形像素在至少一个通道上相差**超过 16**。PNG **所有**像素必须 `alpha=255`，会检查整张图，无需人为添加深色边缘。必须有浏览器来源证据。验证器 v5 实现现行绘制/证据契约；v4 证据不会继承可信状态，不完整证据返回 `UNCERTAIN`。
+每个 PNG **恰好**包含一个音高图。`evidence.variant_selection` 按 DOM 顺序保存所选词条的全部图形变体（`detected_variant_count`、`variants`）、所选变体的索引（`selected_index`）和选择依据（`basis`）；`evidence.render` 保存始终为 `1` 的 `captured_graph_count`、所选变体的选择器、`padding_css_px` 以及最终的 `capture_rect`。每个变体记录图形文本、其标记的 SHA-256（`markup_sha256`）、选择分数（`selection_score`）以及矩形：节点在视口和文档坐标中的矩形，和 `paint_rect`——节点与其全部后代的并集。JPDB 图形中带 `margin-right: -2px` 偏移的片段会超出节点矩形，因此截图区域以 `paint_rect` 为基础。`capture_rect` 等于所选变体的 `paint_rect` 向四周各扩展 3 CSS px，再向外取整到整数 CSS 像素。在 DSF `3.0` 下，整数区域产生尺寸精确的 PNG：验证器要求 PNG 尺寸**严格等于** `capture_rect × 3`，不允许误差。该区域必须位于文档之内，且不得与其他变体的 `paint_rect` 相交。
 
-清单版本为 `5`。每条记录包括 SHA-256、字节大小、格式、状态、来源、语义判断及 `consumer_filename`；存储整体包括 `domain_id`。自动 `ValidationRecord` 与可选 `HumanAttestation` 绑定准确身份和 SHA。对于音高重音，人的 `Approve` 不能取代自动 `ValidationRecord` 记录：相同字节仍需要一条状态为 `VERIFIED`、且 `validator.id`/`validator.version` 符合 `PitchAccentImageValidator` v5 预期的记录。人工批准无法使旧版、不完整证据或 `REJECTED`、`CORRUPT` 变得可信；汉字领域原有人工批准规则不变。新 SHA 不继承旧字节的决定；替换记录必须按预期旧 SHA 做 compare-and-swap。
+深色主题证据关联浏览器配色设置、文档类、计算得到的背景颜色与 PNG 像素。至少一个背景像素与观察到的颜色在**每个 RGB 通道**上相差不超过 **8**；至少八个图形像素在至少一个通道上相差**超过 16**。PNG **所有**像素必须 `alpha=255`。此外，所选图形绘制区域之外的所有像素（允许其边缘有一个物理像素的抗锯齿）都必须在同样的容差 8 内与观察到的背景一致：由此实际字节证明边距干净、相邻变体和按钮未被截入、线条和字符不接触 PNG 边缘。边距是原生截图中页面的真实背景，而不是后期绘制的边框。必须有浏览器来源证据。验证器 v6 实现现行绘制/证据契约；早期版本的证据不会继承可信状态，不完整证据或早期形式的证据（例如带有版本 5 的 `graph_count` 和 `graph_union_rect`）返回 `UNCERTAIN`。
+
+清单版本为 `5`。每条记录包括 SHA-256、字节大小、格式、状态、来源、语义判断及 `consumer_filename`；存储整体包括 `domain_id`。自动 `ValidationRecord` 与可选 `HumanAttestation` 绑定准确身份和 SHA。对于音高重音，人的 `Approve` 不能取代自动 `ValidationRecord` 记录：相同字节仍需要一条状态为 `VERIFIED`、且 `validator.id`/`validator.version` 符合 `PitchAccentImageValidator` v6 预期的记录。人工批准无法使旧版、不完整证据或 `REJECTED`、`CORRUPT` 变得可信；汉字领域原有人工批准规则不变。新 SHA 不继承旧字节的决定；替换记录必须按预期旧 SHA 做 compare-and-swap。
 
 旧版 v3/v4 清单和原先平铺的汉字目录仍可读取。以写入模式打开时会在独占锁内执行版本迁移：通过硬链接保留旧字节、验证 SHA-256、原子更新清单，再删除旧平铺链接。`.tmp/` 中的事务标记允许中断后继续或回滚。未变化的 SHA、`ValidationRecord`、`HumanAttestation` 均保留，无需重新下载。完成后新旧规范路径不会同时存在。CLI JSON 报告 `store.layout_migrated_on_open`。
 
@@ -161,13 +163,17 @@ kanji-assets --store .asset-store/kanji journal baseline
 
 只有已经核对真实词典详情结构且确定没有 `Pitch accent` 区域，才能报告 `no_pitch_accent_on_source`。无法识别/空的图形 DOM、网络或 JS 错误、深色主题未经证实、截图不合法，都必须作为技术错误。在认定没有重音图前，等待关键页面请求结束并再次检查结构；任意睡眠时间不算证据。`page.evaluate()` 执行/解码失败是带当前阶段的 `browser_evaluation`；互相矛盾的 DOM 是 `page_contract`；超时是 `timeout`。
 
-对所选词条所有图形节点使用**一次** CDP 截图，页面缩放 `1.0`，设备比例 DSF `3.0`；截图后不缩放、不裁剪、不重新编码 PNG。保存节点在视口与文档中的坐标（包括 `scrollX`/`scrollY`）。单图截图等于其 DOM 矩形；多图覆盖矩形几何并集，只有 CDP `clip` 边界舍入误差。证据包含图形矩形、截图范围、视口/页面尺寸、比例、PNG 尺寸及背景信息。验证器允许尺寸舍入最多 **3 像素**，核对浏览器配色、`dark-mode` 类以及图形/背景像素。PNG 所有像素都必须 `alpha=255`；保留图形自然间隔，不添加外框。验证器不会自行理解重音图的语言含义。
+已明确解析的词条中的音高图是该词条内部的变体。`Pitch accent` 区域的每一行必须恰好包含一个图形，以及可选的 `a.vocabulary-audio` 音频按钮（数量不限，不参与选择）；行中任何其他元素（包括可能的变体信息）都会导致 `capture_contract` 技术失败，而不会被忽略。只有一个图形时直接截取它；有多个变体时**恰好**截取一个，不含相邻图形。
+
+JPDB 不提供**单个**音高变体的常见程度或优先级：变体行的标记只包含音频按钮和图形本身，而 `Top N` 与词频属于整个单词。因此采用可复现的伪随机选择（`basis: seeded_hash_without_source_priority`）：为每个变体计算 `selection_score = SHA-256("anki-decks/jpdb-pitch-variant-selection/v1\0<词条 ID>\0<markup_sha256>")`，选择分数最小的变体。选择不取决于页面上图形的顺序、新的运行、并行或 `resume`，也不会退化为“总是第一个”。相同的标记给出相同的分数，此时选择较小的 DOM 索引。新增变体时，选择要么保持不变，要么转向新变体。标记或变体集合的变化会改变 `markup_sha256` 和分数，因此选择与证据保持一致：验证器根据保存的清单重新计算选择。选择图形从不选择词条：多个匹配的 ID 仍返回 `ambiguous_vocabulary`，直到用户明确选择。
+
+所选变体通过 CDP 截取，页面缩放 `1.0`，设备比例 DSF `3.0`；截图后不缩放、不裁剪、不重新编码 PNG。坐标以视口与文档空间保存（包括 `scrollX`/`scrollY`）。截图前，提供者两次核对变体清单与几何，并检查：没有祖先元素通过 `overflow` 或 `clip-path` 裁剪图形的绘制区域；带边距的区域位于文档之内且不触及相邻变体；不透明的深色祖先背景覆盖整个区域。截图后再次检查相同条件、PNG 尺寸和边距像素。任何违反都会产生带诊断信息的有类型技术失败（`capture_contract` 或 `dark_theme_unverified`），而不是 PNG。验证器不会解读音高图本身，也不会通过像素验证语调是否正确。
 
 每次获取返回原始字节和可供 `PitchAccentImageValidator` 使用的 `PitchAccentDomainMetadata`。`JpdbPitchProvider::acquire_requests` 为请求集创建独立会话，`acquire_requests_in_session` 接收调用方会话。两者都顺序处理，每项重新搜索；普通单项错误不会终止整个批次。如果 CDP 观察者丢失数据、会话不再可信，只为**已经开始**的项目生成结果，并另报 `session_failure`；未启动的尾部不伪造结果，可在之后重试。
 
 人工验收使用外部 JSON 计划，每项必须声明准确的 `expected_outcome`：`acquired`、`no_pitch_accent_on_source`、`ambiguous_vocabulary` 或 `vocabulary_not_found`。可选限制：
 
-- `expected_vocabulary_id`、`min_graph_count` 仅适用于 `acquired`。
+- `expected_vocabulary_id`、`min_variant_count` 仅适用于 `acquired`。`min_variant_count` 指定词条中**检测到**的图形变体的最小数量；无论变体有多少，PNG 本身都必须恰好包含一个图形。
 - `expected_candidate_ids` 仅适用于 `ambiguous_vocabulary`，须与实际候选 ID **完整集合**一致，顺序无关。
 - `selection` 仅用于 `acquired`，必须包含 `vocabulary_id`、`detail_url`，ID 与 `expected_vocabulary_id` 一致，链接符合上述 JPDB 路径。
 
@@ -183,7 +189,7 @@ kanji-assets --store .asset-store/kanji journal baseline
       "reading": "ごうせいご",
       "expected_outcome": "acquired",
       "expected_vocabulary_id": 42,
-      "min_graph_count": 1
+      "min_variant_count": 1
     },
     { "surface": "別の語", "expected_outcome": "no_pitch_accent_on_source" },
     {
@@ -214,7 +220,7 @@ cargo run --locked -p asset-store --bin jpdb_pitch_acceptance -- \
 
 每次运行将报告和证据封装为**一个经过验证的 ZIP**，不留下解压目录。默认路径为 `<std::env::temp_dir()>/anki-decks-evidence/jpdb_pitch_acceptance-run-<32 lowercase hexadecimal digits>.zip`。`--output <ZIP>` 指定**新建的** `.zip` 文件，相对路径以当前目录为基准；父目录须存在，目标文件不得存在，路径须位于工作副本与临时树之外。解压后查看 `reports/index.html`、`reports/evidence.json` 和 `reports/images/`。发布结束的 stdout 含 `LIVE EVIDENCE ZIP`，列出绝对 `Path`、`SHA-256` 和以字节计的 `Size`。即使计划验收失败，ZIP 仍可能包含已有的部分证据，并记录最终状态与可用结果。
 
-各项目报告包括预期/实际结果、匹配情况、候选、实际词条 ID/链接、词形/读音、深色主题证明、图形/截图几何、DSF、PNG 尺寸、SHA-256 和核心验证器决定。`acquired` 只有在验证器为 `VERIFIED` 且满足全部计划条件时才算成功。符合预期的歧义、词条不存在、没有重音图也可算成功；未预期的词条缺失则验收失败。提供者结果缺失或本地处理错误同样算不匹配。单项失败不会抹掉其他证据。已获取的原始字节不变；签名错误或无法解码的 PNG 以 `.bin` 保存，不作为图片展示。此工具不修改规范存储、用户媒体或 `decks/**`；ZIP 仅是本地产物。
+各项目报告包括预期/实际结果、匹配情况、候选、实际词条 ID/链接、词形/读音、检测到的图形变体数量、所选变体、选择依据、PNG 中的图形数量、带选择分数的变体清单、深色主题证明、截图几何、DSF、PNG 尺寸、SHA-256 和核心验证器决定。`acquired` 只有在验证器为 `VERIFIED` 且满足全部计划条件时才算成功。符合预期的歧义、词条不存在、没有重音图也可算成功；未预期的词条缺失则验收失败。提供者结果缺失或本地处理错误同样算不匹配。单项失败不会抹掉其他证据。已获取的原始字节不变；签名错误或无法解码的 PNG 以 `.bin` 保存，不作为图片展示。此工具不修改规范存储、用户媒体或 `decks/**`；ZIP 仅是本地产物。
 
 ## `pitch-assets`：规范资源库与批处理
 
@@ -265,7 +271,7 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch reject \
   --sha256 "$CANDIDATE_SHA256" --reason 'визуально отклонён'
 ```
 
-外部 `PitchPlan` JSON 要求 `schema_version: 1`，拒绝未知字段或版本。持久批次状态则独立使用**版本 2**；旧版状态版本 1 会被拒绝，CLI 不会凭历史猜测当前候选尝试或原始计划。每项包含准确的 `surface`、可选 `reading`、可选带 `vocabulary_id` 和 `detail_url` 的 `selection`。完全相同的请求合并，具有相同 `surface` 但不兼容的请求在浏览器启动前触发 `identity_conflict`。
+外部 `PitchPlan` JSON 要求 `schema_version: 1`，拒绝未知字段或版本。持久批次状态则独立使用**版本 3**；早期版本或使用早期验证器的状态（包括使用验证器 v5 的版本 2）会在解析前以代码 `unsupported_schema_version` 被拒绝，CLI 不会凭历史猜测当前候选尝试或原始计划，也不会沿用早期证据的可信状态；请创建新批次。每项包含准确的 `surface`、可选 `reading`、可选带 `vocabulary_id` 和 `detail_url` 的 `selection`。完全相同的请求合并，具有相同 `surface` 但不兼容的请求在浏览器启动前触发 `identity_conflict`。
 
 创建批次时，CLI 将请求规范化后保存为不可变的 `original_plan` 及其 SHA-256。选择、重试、重新获取只修改当前活动请求，不改变原始计划。重复使用 `batch_id` 必须满足相同原始计划与摘要。为 `ambiguous_vocabulary` 指定选择时，应使用审阅报告中候选的准确 ID 和 `detail_url`；下次 `batch run` 会重新搜索并验证词条。
 
@@ -312,15 +318,21 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch reject \
 
 收到 `Ctrl+C` 后，协调器停止新派发并通知正在运行的请求。与信号同时完成、已经被 worker 接收到的结果仍须通过 CAS 并可靠保存。所有会话关闭，等待 worker 清理临时目录后退出。未保存检查点和未分配项继续为 `pending`，不增加虚假尝试。之后的 `batch resume` 对账保存状态，继续当前 `pending`，保留原检查点。
 
-发布只读取**指定当前尝试**的元数据和 `evidence`，要求 `PitchAccentImageValidator` v5 给出当前 `VERIFIED`。写入前 `AssetStore::ingest_verified` 再次验证字节，通过 compare-and-swap 核对上一记录的预期 SHA。规范路径为 `assets/png/<surface>.png`，消费者名为 `<surface>.pitch.png`。如果最新存储对账证明已有规范记录符合现行验证器，可不联网而复用。
+发布只读取**指定当前尝试**的元数据和 `evidence`，要求 `PitchAccentImageValidator` v6 给出当前 `VERIFIED`。写入前 `AssetStore::ingest_verified` 再次验证字节，通过 compare-and-swap 核对上一记录的预期 SHA。规范路径为 `assets/png/<surface>.png`，消费者名为 `<surface>.pitch.png`。如果最新存储对账证明已有规范记录符合现行验证器，可不联网而复用。
 
-显式 `reacquire` 开始新世代，并记录资源所有者当前 SHA 作为 CAS 基线。如果此后所有者 SHA 变化，`batch status` 会显示 `refresh_owner_drift`，阻止发布过期候选。`batch reacquire` 必须配合 `--reason`，将冲突的发布意图归档，采用当前所有者 SHA 作为新 CAS 基线、开启下一世代，并解除对旧尝试的引用，使其无法发布。重新获取即使产生相同 SHA，也只有通过 v5 再验证且 CAS 与存储 SHA 一致时，才更新元数据/证据；发布总采用准确的当前尝试。视觉拒绝绑定具体 SHA，其他字节不会继承。
+显式 `reacquire` 开始新世代，并记录资源所有者当前 SHA 作为 CAS 基线。如果此后所有者 SHA 变化，`batch status` 会显示 `refresh_owner_drift`，阻止发布过期候选。`batch reacquire` 必须配合 `--reason`，将冲突的发布意图归档，采用当前所有者 SHA 作为新 CAS 基线、开启下一世代，并解除对旧尝试的引用，使其无法发布。重新获取即使产生相同 SHA，也只有通过 v6 再验证且 CAS 与存储 SHA 一致时，才更新元数据/证据；发布总采用准确的当前尝试。视觉拒绝绑定具体 SHA，其他字节不会继承。
 
 定向 `retry` 只处理可重试技术失败，不影响相邻已完成项目。对账后可能出现存储为 `ExistingVerified`、而批次最后一次结果仍是可恢复技术错误；此时仍允许 `retry`，清除 `ExistingVerified`、开始新世代，并记录当前所有者 SHA 作为 CAS 基线。
 
 `batch retry-technical` 必须配合 `--reason`，对全批次按**相同条件**选择可重试技术失败，并为其开始新世代。不可重试错误、已发布项、未完成发布意图、歧义、无重音、找不到词条、冲突项、`pending` 均不变。该操作要么全部应用，要么全部不应用；成功后重复执行不会再选中项目。若所有者对账没有造成其他保存变化，返回 `changed: false`，否则 `changed` 包含该变化。JSON 中 `retried_identities` 按原计划顺序列出选中身份；空集则不提供此字段。`no_pitch_accent_on_source` 只结束**当前批次**，不会创建空记录或永久负缓存；`vocabulary_not_found` 保持独立未解决结果。
 
-`batch review` 将 `review.html` 保存到被 Git 忽略的批次 `.runtime` 中。页面显示获取及规范 PNG、词形/读音、JPDB 链接、图形数量、SHA-256、大小、验证状态及来源/渲染证据。歧义列出全部候选；无重音图、词条不存在、技术故障以有类型结果显示，绝不伪造图片。文字经过转义；HTML 不修改批次状态，也不是权威来源。决策使用明确的 `select`、`reject`、`retry` 和 `reacquire`；没有绕过现行自动验证而手动发布字节的办法。
+`batch review` 将 `review.html` 保存到被 Git 忽略的批次 `.runtime` 中。页面显示获取及规范 PNG、词形/读音、JPDB 链接、检测到的图形变体数量、所选变体及选择依据、PNG 中的图形数量、SHA-256、大小、验证状态及来源/渲染证据。歧义列出全部候选；无重音图、词条不存在、技术故障以有类型结果显示，绝不伪造图片。文字经过转义；HTML 不修改批次状态，也不是权威来源。决策使用明确的 `select`、`reject`、`retry` 和 `reacquire`；没有绕过现行自动验证而手动发布字节的办法。
+
+### 从验证器 v5 迁移
+
+使用 `PitchAccentImageValidator` v5 发布的记录包含词条全部图形的并集，且没有边距。验证器 v6 不把它们视为当前记录：规范记录、其字节、尝试历史和人工决定都保留原处，但不被信任，也不被复用。`pitch-corpus-gate` 和 `corpus check` 报告证据已过时，`read_verified_with_policy` 拒绝读取，批次对账将该项标记为 `owner_not_current_verified` 冲突，因此 `ensure` 或 `batch run` 以代码 `3` 结束，既不联网获取，也不覆盖。人工 `Approve` 不会改变这一点。
+
+更新只能显式进行：`ensure --refresh` 或带必需 `--reason` 的 `batch reacquire` 记录当前记录的 SHA 作为 `compare-and-swap` 基线，获取新 PNG，并且仅当验证器 v6 返回 `VERIFIED` 且所有者 SHA 未变化时才发布。有歧义的词条仍需要 `batch select`。迁移前创建的批次不会继续：其状态以代码 `unsupported_schema_version` 被拒绝，因此请为更新创建新批次。
 
 ### 清理已经完成的批次
 

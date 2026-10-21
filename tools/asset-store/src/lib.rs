@@ -60,10 +60,12 @@ pub use model::{
     ValidatorIdentity,
 };
 pub use pitch_accent::{
-    PitchAccentCaptureRect, PitchAccentCoordinateSpace, PitchAccentDarkThemeProof,
-    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentEvidence,
-    PitchAccentGraphEvidence, PitchAccentImageValidator, PitchAccentProvider,
-    PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm,
+    PITCH_ACCENT_CAPTURE_PADDING_CSS_PX, PitchAccentCaptureRect, PitchAccentCoordinateSpace,
+    PitchAccentDarkThemeProof, PitchAccentDomainMetadata, PitchAccentDomainPolicy,
+    PitchAccentEvidence, PitchAccentImageValidator, PitchAccentProvider, PitchAccentRenderEvidence,
+    PitchAccentRenderKind, PitchAccentResolvedForm, PitchAccentVariantEvidence,
+    PitchAccentVariantSelection, PitchAccentVariantSelectionBasis,
+    pitch_accent_variant_selection_score, select_pitch_accent_variant,
 };
 pub use selection::{SelectionMode, select_assets};
 pub use store::{

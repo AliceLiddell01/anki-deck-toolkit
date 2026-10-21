@@ -7,10 +7,11 @@ use asset_store::{
     AssetIdentity, AssetStore, BrowserExecutableSource, BrowserRuntimeProvenance, DetectedFormat,
     ErrorCode, IngestRequest, LifecycleState, PitchAccentCaptureRect, PitchAccentCoordinateSpace,
     PitchAccentDarkThemeProof, PitchAccentDomainMetadata, PitchAccentDomainPolicy,
-    PitchAccentEvidence, PitchAccentGraphEvidence, PitchAccentImageValidator, PitchAccentProvider,
-    PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm, Provenance,
-    SelectionMode, SemanticDecision, SemanticStatus, SemanticValidator, StoreOptions,
-    ValidationEvidence, ValidatorFailure, ValidatorIdentity, VerifiedIngestRequest,
+    PitchAccentEvidence, PitchAccentImageValidator, PitchAccentProvider, PitchAccentRenderEvidence,
+    PitchAccentRenderKind, PitchAccentResolvedForm, PitchAccentVariantEvidence,
+    PitchAccentVariantSelection, PitchAccentVariantSelectionBasis, Provenance, SelectionMode,
+    SemanticDecision, SemanticStatus, SemanticValidator, StoreOptions, ValidationEvidence,
+    ValidatorFailure, ValidatorIdentity, VerifiedIngestRequest,
 };
 
 fn publishable_validator() -> ValidatorIdentity {
@@ -906,6 +907,13 @@ fn second_pitch_accent_domain_publishes_its_own_verified_png_contract() {
     let store = AssetStore::open_with_policy(StoreOptions::new(&root), policy).unwrap();
     let identity = AssetIdentity::new("pitch_accent", "幽霊").unwrap();
     let bytes = pitch_accent_contract_png();
+    let markup_sha256 = asset_store::hashing::sha256_hex("<div>ゆうれい</div>".as_bytes());
+    let graph_rect = PitchAccentCaptureRect {
+        x: 100.0,
+        y: 200.0,
+        width: 20.0,
+        height: 10.0,
+    };
     let metadata = PitchAccentDomainMetadata {
         surface: "幽霊".into(),
         reading: "ゆうれい".into(),
@@ -917,26 +925,33 @@ fn second_pitch_accent_domain_publishes_its_own_verified_png_contract() {
                 surface: "幽霊".into(),
                 reading: "ゆうれい".into(),
             }],
-            graph_count: 1,
-            render: PitchAccentRenderEvidence {
-                kind: PitchAccentRenderKind::BrowserRegionScreenshot,
-                selector: ".pitch-accent-graph".into(),
-                graphs: vec![PitchAccentGraphEvidence {
+            variant_selection: PitchAccentVariantSelection {
+                basis: PitchAccentVariantSelectionBasis::SeededHashWithoutSourcePriority,
+                detected_variant_count: 1,
+                selected_index: 0,
+                variants: vec![PitchAccentVariantEvidence {
                     index: 0,
                     selector: ".pitch-accent-graph".into(),
+                    text: "ゆうれい".into(),
+                    markup_sha256: markup_sha256.clone(),
+                    selection_score: asset_store::pitch_accent_variant_selection_score(
+                        123,
+                        &markup_sha256,
+                    ),
                     viewport_rect: PitchAccentCaptureRect {
                         x: 100.0,
                         y: 100.0,
                         width: 20.0,
                         height: 10.0,
                     },
-                    document_rect: PitchAccentCaptureRect {
-                        x: 100.0,
-                        y: 200.0,
-                        width: 20.0,
-                        height: 10.0,
-                    },
+                    document_rect: graph_rect,
+                    paint_rect: graph_rect,
                 }],
+            },
+            render: PitchAccentRenderEvidence {
+                kind: PitchAccentRenderKind::BrowserRegionScreenshot,
+                selector: ".pitch-accent-graph".into(),
+                captured_graph_count: 1,
                 coordinate_space: PitchAccentCoordinateSpace::Document,
                 viewport_width: 1280,
                 viewport_height: 900,
@@ -944,8 +959,8 @@ fn second_pitch_accent_domain_publishes_its_own_verified_png_contract() {
                 document_height: 1800,
                 scroll_x: 0.0,
                 scroll_y: 100.0,
-                pixel_width: 60,
-                pixel_height: 30,
+                pixel_width: 78,
+                pixel_height: 48,
                 device_scale_factor: 3.0,
                 page_scale_factor: 1.0,
                 dark_theme: PitchAccentDarkThemeProof {
@@ -955,17 +970,13 @@ fn second_pitch_accent_domain_publishes_its_own_verified_png_contract() {
                     background_selector: ".subsection-pitch-accent".into(),
                     background_rgb: [24, 36, 48],
                 },
-                graph_union_rect: PitchAccentCaptureRect {
-                    x: 100.0,
-                    y: 200.0,
-                    width: 20.0,
-                    height: 10.0,
-                },
+                padding_css_px: asset_store::PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+                // Отрисовка 20×10 CSS px с полем 3 CSS px с каждой стороны.
                 capture_rect: PitchAccentCaptureRect {
-                    x: 100.0,
-                    y: 200.0,
-                    width: 20.0,
-                    height: 10.0,
+                    x: 97.0,
+                    y: 197.0,
+                    width: 26.0,
+                    height: 16.0,
                 },
             },
             browser: BrowserRuntimeProvenance {
@@ -1118,9 +1129,9 @@ fn wrong_domain_schema_v5_open_does_not_create_runtime_or_poison_owner() {
 }
 
 fn pitch_accent_contract_png() -> Vec<u8> {
-    let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
-    for x in 10..50 {
-        image.put_pixel(x, 15, image::Rgba([235, 235, 235, 255]));
+    let mut image = image::RgbaImage::from_pixel(78, 48, image::Rgba([24, 36, 48, 255]));
+    for x in 12..60 {
+        image.put_pixel(x, 24, image::Rgba([235, 235, 235, 255]));
     }
     let mut output = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image)

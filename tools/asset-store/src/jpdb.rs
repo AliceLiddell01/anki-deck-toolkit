@@ -32,14 +32,19 @@ use crate::browser_runtime::{
     BrowserRuntimeConfig, BrowserSession, CdpRuntimeMonitor, DeviceMetrics, RuntimeSnapshot,
     is_relevant_resource_type,
 };
+use crate::hashing::sha256_hex;
 use crate::pitch_accent::{
-    PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX, PitchAccentCaptureRect,
-    PitchAccentCoordinateSpace, PitchAccentDarkThemeProof, PitchAccentDomainMetadata,
-    PitchAccentEvidence, PitchAccentGraphEvidence, PitchAccentProvider, PitchAccentRenderEvidence,
-    PitchAccentRenderKind, PitchAccentResolvedForm, jpdb_readings_equivalent,
-    parse_jpdb_vocabulary_route, relative_luminance as pitch_accent_relative_luminance,
+    PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX, PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+    PITCH_ACCENT_MAX_VARIANT_COUNT, PitchAccentCaptureRect, PitchAccentCoordinateSpace,
+    PitchAccentDarkThemeProof, PitchAccentDomainMetadata, PitchAccentEvidence, PitchAccentProvider,
+    PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm,
+    PitchAccentVariantEvidence, PitchAccentVariantSelection, PitchAccentVariantSelectionBasis,
+    jpdb_readings_equivalent, parse_jpdb_vocabulary_route, pitch_accent_capture_rect_for,
+    pitch_accent_variant_selection_score, relative_luminance as pitch_accent_relative_luminance,
+    select_pitch_accent_variant,
     validate_capture_background as validate_evidence_capture_background,
     validate_capture_geometry as validate_evidence_capture_geometry,
+    validate_capture_margins as validate_evidence_capture_margins,
 };
 
 const JPDB_ORIGIN: &str = "https://jpdb.io";
@@ -52,7 +57,6 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(20);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GRAPH_STABILITY_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_SEARCH_RESULTS: usize = 128;
-const MAX_GRAPH_COUNT: usize = 32;
 
 /// Единые настройки браузера для получения графиков JPDB.
 pub fn pitch_browser_runtime_config() -> BrowserRuntimeConfig {
@@ -2322,7 +2326,7 @@ async fn inspect_and_capture(
             });
         }
     }
-    if detail.graph_count > MAX_GRAPH_COUNT {
+    if detail.graph_count > PITCH_ACCENT_MAX_VARIANT_COUNT {
         return Err(JpdbPitchFailure::PageContract {
             stage: diagnostics.stage,
             message: "число графиков акцентуации превышает ограничение провайдера на снимок".into(),
@@ -2330,21 +2334,35 @@ async fn inspect_and_capture(
     }
 
     diagnostics.transition(JpdbPitchStage::Capture);
-    activate_dark_mode(page, diagnostics.stage).await?;
-    let first = capture_snapshot(page, diagnostics.stage).await?;
+    let inventory = read_variant_page(page, diagnostics.stage).await?;
+    if inventory.variants.len() != detail.graph_count {
+        return Err(JpdbPitchFailure::PageContract {
+            stage: diagnostics.stage,
+            message: "число распознанных вариантов графика не совпадает с числом графиков словарной записи".into(),
+        });
+    }
+    let inventory_markup = inventory.markup_sha256();
+    let selected_index =
+        select_pitch_accent_variant(vocabulary_id, inventory_markup.iter().map(String::as_str))
+            .ok_or_else(|| JpdbPitchFailure::CaptureContract {
+                stage: diagnostics.stage,
+                message: "у словарной записи нет вариантов графика для выбора".into(),
+            })?;
+    activate_dark_mode(page, diagnostics.stage, selected_index).await?;
+    let first = capture_snapshot(page, diagnostics.stage, selected_index).await?;
     sleep(GRAPH_STABILITY_INTERVAL).await;
-    let second = capture_snapshot(page, diagnostics.stage).await?;
-    if first != second {
+    let second = capture_snapshot(page, diagnostics.stage, selected_index).await?;
+    if first != second || second.page.markup_sha256() != inventory_markup {
         return Err(JpdbPitchFailure::CaptureContract {
             stage: diagnostics.stage,
             message:
-                "DOM графиков, их геометрия или фактически отрисованная тема изменились до снимка"
+                "набор вариантов, DOM графиков, их геометрия или фактически отрисованная тема изменились до снимка"
                     .into(),
         });
     }
     detail = read_detail_snapshot(page, vocabulary_id, JpdbPitchStage::Capture).await?;
     if !detail_matches_query(&detail, query)
-        || detail.graph_count != second.graphs.len()
+        || detail.graph_count != second.page.variants.len()
         || detail.pitch_label.as_deref() != Some("Pitch accent")
     {
         return Err(JpdbPitchFailure::DetailIdentityMismatch {
@@ -2404,7 +2422,7 @@ async fn inspect_and_capture(
         });
     }
     diagnostics.transition(JpdbPitchStage::PostCaptureVerification);
-    let post_capture = capture_snapshot(page, diagnostics.stage).await?;
+    let post_capture = capture_snapshot(page, diagnostics.stage, selected_index).await?;
     if post_capture != second {
         return Err(JpdbPitchFailure::DarkThemeUnverified {
             stage: diagnostics.stage,
@@ -2443,17 +2461,46 @@ async fn inspect_and_capture(
             reading: form.reading.clone(),
         })
         .collect();
-    let graphs = second
-        .graphs
+    let variants = second
+        .page
+        .variants
         .iter()
+        .zip(&inventory_markup)
         .enumerate()
-        .map(|(index, graph)| PitchAccentGraphEvidence {
-            index: index as u32,
-            selector: graph.selector.clone(),
-            viewport_rect: graph.viewport_rect,
-            document_rect: graph.document_rect,
-        })
+        .map(
+            |(index, (variant, markup_sha256))| PitchAccentVariantEvidence {
+                index: index as u32,
+                selector: variant.selector.clone(),
+                text: variant.text.clone(),
+                markup_sha256: markup_sha256.clone(),
+                selection_score: pitch_accent_variant_selection_score(vocabulary_id, markup_sha256),
+                viewport_rect: variant.viewport_rect,
+                document_rect: variant.document_rect,
+                paint_rect: variant.paint_rect,
+            },
+        )
         .collect::<Vec<_>>();
+    let selected = &variants[selected_index];
+    let selected_paint_rect = selected.paint_rect;
+    let render = PitchAccentRenderEvidence {
+        kind: PitchAccentRenderKind::BrowserRegionScreenshot,
+        selector: selected.selector.clone(),
+        captured_graph_count: 1,
+        coordinate_space: PitchAccentCoordinateSpace::Document,
+        viewport_width: second.page.viewport_width,
+        viewport_height: second.page.viewport_height,
+        document_width: second.page.document_width,
+        document_height: second.page.document_height,
+        scroll_x: second.page.scroll_x,
+        scroll_y: second.page.scroll_y,
+        pixel_width,
+        pixel_height,
+        device_scale_factor: CAPTURE_DEVICE_SCALE_FACTOR,
+        page_scale_factor: second.page.page_scale_factor,
+        dark_theme: second.dark_theme,
+        padding_css_px: PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+        capture_rect: second.capture_rect,
+    };
     let metadata = PitchAccentDomainMetadata {
         surface: query.surface.trim().to_owned(),
         reading: resolved_reading,
@@ -2462,37 +2509,31 @@ async fn inspect_and_capture(
             provider: PitchAccentProvider::Jpdb,
             source_url: detail.url,
             resolved_forms,
-            graph_count: graphs.len() as u32,
-            render: PitchAccentRenderEvidence {
-                kind: PitchAccentRenderKind::BrowserRegionScreenshot,
-                selector: ".subsection-pitch-accent .subsection > div > div > div[style*=\"word-break: keep-all\"]".into(),
-                graphs,
-                coordinate_space: PitchAccentCoordinateSpace::Document,
-                viewport_width: second.viewport_width,
-                viewport_height: second.viewport_height,
-                document_width: second.document_width,
-                document_height: second.document_height,
-                scroll_x: second.scroll_x,
-                scroll_y: second.scroll_y,
-                pixel_width,
-                pixel_height,
-                device_scale_factor: CAPTURE_DEVICE_SCALE_FACTOR,
-                page_scale_factor: second.page_scale_factor,
-                dark_theme: second.dark_theme,
-                graph_union_rect: second.graph_union_rect,
-                capture_rect: second.capture_rect,
+            variant_selection: PitchAccentVariantSelection {
+                basis: PitchAccentVariantSelectionBasis::SeededHashWithoutSourcePriority,
+                detected_variant_count: variants.len() as u32,
+                selected_index: selected_index as u32,
+                variants,
             },
+            render,
             browser: browser.clone(),
         },
     };
-    validate_evidence_capture_geometry(&metadata.evidence.render).map_err(|failure| {
-        JpdbPitchFailure::CaptureContract {
+    let evidence = &metadata.evidence;
+    validate_evidence_capture_geometry(&evidence.render, &evidence.variant_selection).map_err(
+        |failure| JpdbPitchFailure::CaptureContract {
             stage: diagnostics.stage,
             message: failure.into_message(),
-        }
-    })?;
-    validate_evidence_capture_background(&metadata.evidence.render.dark_theme, &image).map_err(
+        },
+    )?;
+    validate_evidence_capture_background(&evidence.render.dark_theme, &image).map_err(
         |failure| JpdbPitchFailure::DarkThemeUnverified {
+            stage: diagnostics.stage,
+            message: failure.into_message(),
+        },
+    )?;
+    validate_evidence_capture_margins(&evidence.render, selected_paint_rect, &image).map_err(
+        |failure| JpdbPitchFailure::CaptureContract {
             stage: diagnostics.stage,
             message: failure.into_message(),
         },
@@ -2502,7 +2543,11 @@ async fn inspect_and_capture(
     })
 }
 
-async fn activate_dark_mode(page: &Page, stage: JpdbPitchStage) -> Result<(), JpdbPitchFailure> {
+async fn activate_dark_mode(
+    page: &Page,
+    stage: JpdbPitchStage,
+    selected_index: usize,
+) -> Result<(), JpdbPitchFailure> {
     page.evaluate("() => { document.documentElement.classList.add('dark-mode'); return true; }")
         .await
         .map_err(|error| {
@@ -2516,7 +2561,7 @@ async fn activate_dark_mode(page: &Page, stage: JpdbPitchStage) -> Result<(), Jp
                 error,
             )
         })?;
-    let state = capture_snapshot(page, stage).await?;
+    let state = capture_snapshot(page, stage, selected_index).await?;
     if !state
         .dark_theme
         .document_element_classes
@@ -2539,18 +2584,20 @@ async fn activate_dark_mode(page: &Page, stage: JpdbPitchStage) -> Result<(), Jp
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CaptureGraph {
+struct CaptureVariant {
     selector: String,
+    text: String,
+    markup: String,
     viewport_rect: PitchAccentCaptureRect,
     document_rect: PitchAccentCaptureRect,
+    paint_rect: PitchAccentCaptureRect,
 }
 
+/// Варианты графика и метрики страницы, наблюдённые одним вызовом скрипта.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CaptureSnapshot {
-    graphs: Vec<CaptureGraph>,
-    graph_union_rect: PitchAccentCaptureRect,
-    capture_rect: PitchAccentCaptureRect,
+struct VariantPage {
+    variants: Vec<CaptureVariant>,
     viewport_width: u32,
     viewport_height: u32,
     document_width: u32,
@@ -2559,15 +2606,38 @@ struct CaptureSnapshot {
     scroll_y: f64,
     page_scale_factor: f64,
     device_pixel_ratio: f64,
+}
+
+impl VariantPage {
+    fn markup_sha256(&self) -> Vec<String> {
+        self.variants
+            .iter()
+            .map(|variant| sha256_hex(variant.markup.as_bytes()))
+            .collect()
+    }
+}
+
+/// Страница и подготовленная к нативному снимку область выбранного варианта.
+#[derive(Debug, Clone, PartialEq)]
+struct CaptureSnapshot {
+    page: VariantPage,
+    selected_index: usize,
+    capture_rect: PitchAccentCaptureRect,
     dark_theme: PitchAccentDarkThemeProof,
 }
 
-async fn capture_snapshot(
+fn capture_script_call(selected_index: Option<usize>) -> String {
+    let index = selected_index.map_or_else(|| "null".to_owned(), |index| index.to_string());
+    format!("() => ({CAPTURE_SNAPSHOT_SCRIPT})({index}, {PITCH_ACCENT_CAPTURE_PADDING_CSS_PX:?})")
+}
+
+async fn evaluate_capture_script(
     page: &Page,
     stage: JpdbPitchStage,
-) -> Result<CaptureSnapshot, JpdbPitchFailure> {
+    selected_index: Option<usize>,
+) -> Result<Value, JpdbPitchFailure> {
     let raw: Value = page
-        .evaluate(CAPTURE_SNAPSHOT_SCRIPT)
+        .evaluate(capture_script_call(selected_index))
         .await
         .map_err(|error| browser_evaluation_failure(stage, "получении геометрии графиков", error))?
         .into_value()
@@ -2586,15 +2656,63 @@ async fn capture_snapshot(
             message: message.to_owned(),
         });
     }
-    let dark_theme: PitchAccentDarkThemeProof = serde_json::from_value(raw["dark_theme"].clone())
-        .map_err(|error| {
-        JpdbPitchFailure::DarkThemeUnverified {
+    Ok(raw)
+}
+
+fn decode_variant_page(raw: Value, stage: JpdbPitchStage) -> Result<VariantPage, JpdbPitchFailure> {
+    let page: VariantPage =
+        serde_json::from_value(raw).map_err(|error| JpdbPitchFailure::CaptureContract {
             stage,
-            message: format!(
-                "JPDB не предоставил проверяемые данные об отрисованном фоне: {error}"
-            ),
-        }
-    })?;
+            message: format!("снимок DOM вернул неполные геометрические данные: {error}"),
+        })?;
+    tracing::debug!(
+        stage = ?stage,
+        variant_count = page.variants.len(),
+        viewport_width = page.viewport_width,
+        viewport_height = page.viewport_height,
+        document_width = page.document_width,
+        document_height = page.document_height,
+        page_scale_factor = page.page_scale_factor,
+        device_pixel_ratio = page.device_pixel_ratio,
+        "Проверка вариантов графика JPDB"
+    );
+    validate_variant_page(&page, stage)?;
+    Ok(page)
+}
+
+/// Читает все варианты графика выбранной словарной записи без подготовки снимка.
+async fn read_variant_page(
+    page: &Page,
+    stage: JpdbPitchStage,
+) -> Result<VariantPage, JpdbPitchFailure> {
+    let raw = evaluate_capture_script(page, stage, None).await?;
+    decode_variant_page(raw, stage)
+}
+
+async fn capture_snapshot(
+    page: &Page,
+    stage: JpdbPitchStage,
+    selected_index: usize,
+) -> Result<CaptureSnapshot, JpdbPitchFailure> {
+    let mut raw = evaluate_capture_script(page, stage, Some(selected_index)).await?;
+    let Some(object) = raw.as_object_mut() else {
+        return Err(JpdbPitchFailure::CaptureContract {
+            stage,
+            message: "снимок DOM вернул не объект".into(),
+        });
+    };
+    let observed_index = object.remove("selected_index");
+    let capture_rect = object.remove("capture_rect");
+    let dark_theme = object.remove("dark_theme");
+    let dark_theme: PitchAccentDarkThemeProof =
+        serde_json::from_value(dark_theme.unwrap_or(Value::Null)).map_err(|error| {
+            JpdbPitchFailure::DarkThemeUnverified {
+                stage,
+                message: format!(
+                    "JPDB не предоставил проверяемые данные об отрисованном фоне: {error}"
+                ),
+            }
+        })?;
     if dark_theme.background_selector.trim().is_empty()
         || pitch_accent_relative_luminance(dark_theme.background_rgb) > 0.20
     {
@@ -2606,154 +2724,164 @@ async fn capture_snapshot(
             ),
         });
     }
-    let mut normalized_raw = raw;
-    normalized_raw["dark_theme"] = serde_json::to_value(&dark_theme).map_err(|error| {
-        JpdbPitchFailure::DarkThemeUnverified {
+    let capture_rect: PitchAccentCaptureRect =
+        serde_json::from_value(capture_rect.unwrap_or(Value::Null)).map_err(|error| {
+            JpdbPitchFailure::CaptureContract {
+                stage,
+                message: format!("снимок DOM не вернул область захвата: {error}"),
+            }
+        })?;
+    if observed_index.and_then(|value| value.as_u64()) != Some(selected_index as u64) {
+        return Err(JpdbPitchFailure::CaptureContract {
             stage,
-            message: format!("не удалось сохранить подтверждение фактического фона: {error}"),
-        }
-    })?;
-    let snapshot: CaptureSnapshot = serde_json::from_value(normalized_raw).map_err(|error| {
-        JpdbPitchFailure::CaptureContract {
-            stage,
-            message: format!("снимок DOM вернул неполные геометрические данные: {error}"),
-        }
-    })?;
-    tracing::debug!(
-        stage = ?stage,
-        graph_count = snapshot.graphs.len(),
-        viewport_width = snapshot.viewport_width,
-        viewport_height = snapshot.viewport_height,
-        document_width = snapshot.document_width,
-        document_height = snapshot.document_height,
-        page_scale_factor = snapshot.page_scale_factor,
-        device_pixel_ratio = snapshot.device_pixel_ratio,
-        "Проверка снимка геометрии графиков JPDB"
-    );
-    validate_capture_geometry(&snapshot, stage)?;
+            message: "снимок DOM подготовлен не для выбранного варианта графика".into(),
+        });
+    }
+    let snapshot = CaptureSnapshot {
+        page: decode_variant_page(raw, stage)?,
+        selected_index,
+        capture_rect,
+        dark_theme,
+    };
+    validate_capture_region(&snapshot, stage)?;
     Ok(snapshot)
 }
 
-fn validate_capture_geometry(
-    snapshot: &CaptureSnapshot,
+fn validate_variant_page(
+    page: &VariantPage,
     stage: JpdbPitchStage,
 ) -> Result<(), JpdbPitchFailure> {
-    let document_width = f64::from(snapshot.document_width);
-    let document_height = f64::from(snapshot.document_height);
-    if snapshot.viewport_width == 0
-        || snapshot.viewport_height == 0
-        || snapshot.document_width == 0
-        || snapshot.document_height == 0
-        || snapshot.document_width < snapshot.viewport_width
-        || snapshot.document_height < snapshot.viewport_height
-        || !snapshot.scroll_x.is_finite()
-        || !snapshot.scroll_y.is_finite()
-        || snapshot.scroll_x < 0.0
-        || snapshot.scroll_y < 0.0
-        || snapshot.graphs.is_empty()
-        || snapshot.graphs.len() > MAX_GRAPH_COUNT
+    let document_width = f64::from(page.document_width);
+    let document_height = f64::from(page.document_height);
+    if page.viewport_width == 0
+        || page.viewport_height == 0
+        || page.document_width == 0
+        || page.document_height == 0
+        || page.document_width < page.viewport_width
+        || page.document_height < page.viewport_height
+        || !page.scroll_x.is_finite()
+        || !page.scroll_y.is_finite()
+        || page.scroll_x < 0.0
+        || page.scroll_y < 0.0
+        || page.variants.is_empty()
+        || page.variants.len() > PITCH_ACCENT_MAX_VARIANT_COUNT
     {
         return Err(JpdbPitchFailure::CaptureContract {
             stage,
             message:
-                "размеры документа, области просмотра, прокрутки или число графиков недопустимы"
+                "размеры документа, области просмотра, прокрутки или число вариантов графика недопустимы"
                     .into(),
         });
     }
-    if (snapshot.page_scale_factor - 1.0).abs() > f64::EPSILON {
+    if (page.page_scale_factor - 1.0).abs() > f64::EPSILON {
         return Err(JpdbPitchFailure::CaptureContract {
             stage,
             message: format!(
                 "масштаб страницы равен {}, ожидалось значение 1.0",
-                snapshot.page_scale_factor
+                page.page_scale_factor
             ),
         });
     }
-    if (snapshot.device_pixel_ratio - CAPTURE_DEVICE_SCALE_FACTOR).abs() > 0.001 {
+    if (page.device_pixel_ratio - CAPTURE_DEVICE_SCALE_FACTOR).abs() > 0.001 {
         return Err(JpdbPitchFailure::CaptureContract {
             stage,
             message: format!(
                 "window.devicePixelRatio равен {}, ожидалось {}",
-                snapshot.device_pixel_ratio, CAPTURE_DEVICE_SCALE_FACTOR
+                page.device_pixel_ratio, CAPTURE_DEVICE_SCALE_FACTOR
             ),
         });
     }
-
-    let mut union_left = f64::INFINITY;
-    let mut union_top = f64::INFINITY;
-    let mut union_right = f64::NEG_INFINITY;
-    let mut union_bottom = f64::NEG_INFINITY;
-    for graph in &snapshot.graphs {
-        let viewport = graph.viewport_rect;
-        let document = graph.document_rect;
-        if graph.selector.trim().is_empty()
+    let tolerance = PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX;
+    for variant in &page.variants {
+        let viewport = variant.viewport_rect;
+        let document = variant.document_rect;
+        let paint = variant.paint_rect;
+        if variant.selector.trim().is_empty()
+            || variant.text.trim().is_empty()
+            || variant.markup.trim().is_empty()
             || !valid_rect(viewport, false)
-            || viewport.x < -PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
-            || viewport.y < -PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
-            || viewport.x + viewport.width
-                > f64::from(snapshot.viewport_width)
-                    + PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
-            || viewport.y + viewport.height
-                > f64::from(snapshot.viewport_height)
-                    + PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+            || viewport.x < -tolerance
+            || viewport.y < -tolerance
+            || viewport.x + viewport.width > f64::from(page.viewport_width) + tolerance
+            || viewport.y + viewport.height > f64::from(page.viewport_height) + tolerance
             || !valid_rect(document, true)
-            || document.x + document.width
-                > document_width + PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
-            || document.y + document.height
-                > document_height + PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
-            || (document.x - (viewport.x + snapshot.scroll_x)).abs()
-                > PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
-            || (document.y - (viewport.y + snapshot.scroll_y)).abs()
-                > PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
-            || (document.width - viewport.width).abs()
-                > PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
-            || (document.height - viewport.height).abs()
-                > PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX
+            || document.x + document.width > document_width + tolerance
+            || document.y + document.height > document_height + tolerance
+            || (document.x - (viewport.x + page.scroll_x)).abs() > tolerance
+            || (document.y - (viewport.y + page.scroll_y)).abs() > tolerance
+            || (document.width - viewport.width).abs() > tolerance
+            || (document.height - viewport.height).abs() > tolerance
+            || !valid_rect(paint, false)
+            || paint.x > document.x + tolerance
+            || paint.y > document.y + tolerance
+            || paint.x + paint.width < document.x + document.width - tolerance
+            || paint.y + paint.height < document.y + document.height - tolerance
         {
             return Err(JpdbPitchFailure::CaptureContract {
                 stage,
-            message: "прямоугольники графика не согласованы между областью просмотра и координатами документа".into(),
+                message: "прямоугольники варианта графика не согласованы между областью просмотра, координатами документа и областью отрисовки".into(),
             });
         }
-        union_left = union_left.min(document.x);
-        union_top = union_top.min(document.y);
-        union_right = union_right.max(document.x + document.width);
-        union_bottom = union_bottom.max(document.y + document.height);
     }
-    let expected_union = PitchAccentCaptureRect {
-        x: union_left,
-        y: union_top,
-        width: union_right - union_left,
-        height: union_bottom - union_top,
-    };
-    if !rect_matches(
-        snapshot.graph_union_rect,
-        expected_union,
-        PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX,
-    ) {
+    Ok(())
+}
+
+/// Проверяет подготовленную область до нативного снимка: она обязана совпасть с
+/// отрисовкой выбранного варианта, расширенной на поле, остаться внутри документа
+/// и не задеть отрисовку соседних вариантов.
+fn validate_capture_region(
+    snapshot: &CaptureSnapshot,
+    stage: JpdbPitchStage,
+) -> Result<(), JpdbPitchFailure> {
+    let Some(selected) = snapshot.page.variants.get(snapshot.selected_index) else {
         return Err(JpdbPitchFailure::CaptureContract {
             stage,
-            message: "объединение графиков не совпадает с прямоугольниками графиков в координатах документа".into(),
+            message: "выбранный вариант графика отсутствует в снимке DOM".into(),
         });
-    }
-    let expected_capture = expected_union;
-    if !valid_rect(snapshot.capture_rect, true)
-        || snapshot.capture_rect.x + snapshot.capture_rect.width > document_width
-        || snapshot.capture_rect.y + snapshot.capture_rect.height > document_height
-        || !rect_matches(
-            snapshot.capture_rect,
-            expected_capture,
-            PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX,
-        )
-    {
+    };
+    let expected =
+        pitch_accent_capture_rect_for(selected.paint_rect, PITCH_ACCENT_CAPTURE_PADDING_CSS_PX);
+    let capture = snapshot.capture_rect;
+    if capture != expected {
         return Err(JpdbPitchFailure::CaptureContract {
             stage,
             message:
-                "область захвата не совпадает с объединением фактических прямоугольников графиков"
+                "область захвата не совпадает с отрисовкой выбранного графика, расширенной на поле"
                     .into(),
         });
     }
+    if !valid_rect(capture, true)
+        || capture.x + capture.width > f64::from(snapshot.page.document_width)
+        || capture.y + capture.height > f64::from(snapshot.page.document_height)
+    {
+        return Err(JpdbPitchFailure::CaptureContract {
+            stage,
+            message: "область захвата с полями выходит за пределы документа".into(),
+        });
+    }
+    if snapshot
+        .page
+        .variants
+        .iter()
+        .enumerate()
+        .any(|(index, variant)| {
+            index != snapshot.selected_index && rects_overlap(capture, variant.paint_rect)
+        })
+    {
+        return Err(JpdbPitchFailure::CaptureContract {
+            stage,
+            message: "область захвата с полями задевает отрисовку соседнего варианта графика"
+                .into(),
+        });
+    }
     Ok(())
+}
+
+fn rects_overlap(left: PitchAccentCaptureRect, right: PitchAccentCaptureRect) -> bool {
+    left.x < right.x + right.width
+        && right.x < left.x + left.width
+        && left.y < right.y + right.height
+        && right.y < left.y + left.height
 }
 
 fn valid_rect(rect: PitchAccentCaptureRect, require_nonnegative: bool) -> bool {
@@ -2763,17 +2891,6 @@ fn valid_rect(rect: PitchAccentCaptureRect, require_nonnegative: bool) -> bool {
         && (!require_nonnegative || (rect.x >= 0.0 && rect.y >= 0.0))
         && rect.width > 0.0
         && rect.height > 0.0
-}
-
-fn rect_matches(
-    actual: PitchAccentCaptureRect,
-    expected: PitchAccentCaptureRect,
-    tolerance: f64,
-) -> bool {
-    (actual.x - expected.x).abs() <= tolerance
-        && (actual.y - expected.y).abs() <= tolerance
-        && (actual.width - expected.width).abs() <= tolerance
-        && (actual.height - expected.height).abs() <= tolerance
 }
 
 fn build_search_url(surface: &str) -> Result<String, String> {
@@ -3056,7 +3173,7 @@ const DETAIL_SNAPSHOT_SCRIPT: &str = r#"() => {
     graph_count: graphCount,
   };
 }"#;
-const CAPTURE_SNAPSHOT_SCRIPT: &str = r#"() => {
+const CAPTURE_SNAPSHOT_SCRIPT: &str = r#"(selectedIndex, padding) => {
   const section = document.querySelector('.subsection-pitch-accent');
   const subsection = section?.querySelector('.subsection');
   const column = subsection?.firstElementChild;
@@ -3065,36 +3182,90 @@ const CAPTURE_SNAPSHOT_SCRIPT: &str = r#"() => {
   section.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
   const scrollX = window.scrollX;
   const scrollY = window.scrollY;
-  const graphs = [];
-  [...column.children].forEach((row, rowIndex) => {
-    [...row.children].forEach((node, nodeIndex) => {
-      if (!(node instanceof HTMLElement) || !node.matches('div[style*="word-break: keep-all"]')) return;
+  const nodes = [];
+  const variants = [];
+  for (const [rowIndex, row] of [...column.children].entries()) {
+    let rowGraphs = 0;
+    for (const [nodeIndex, node] of [...row.children].entries()) {
+      if (node instanceof HTMLAnchorElement && node.matches('a.vocabulary-audio')) continue;
+      if (!(node instanceof HTMLElement) || !node.matches('div[style*="word-break: keep-all"]')) {
+        return { error: `Строка ${rowIndex + 1} секции графиков содержит нераспознанный элемент; сведения о варианте ударения не проверены` };
+      }
       const pitchPieces = [...node.querySelectorAll(':scope > div')].filter(piece => (piece.getAttribute('style') || '').includes('--pitch-'));
-      if (!pitchPieces.length) return;
+      if (!pitchPieces.length) return { error: `Узел графика в строке ${rowIndex + 1} не содержит сегментов ударения` };
+      rowGraphs += 1;
       const rect = node.getBoundingClientRect();
-      const selector = `.subsection-pitch-accent .subsection > div > div:nth-child(${rowIndex + 1}) > div:nth-child(${nodeIndex + 1})[style*="word-break: keep-all"]`;
-      graphs.push({
-        selector,
+      let left = rect.left;
+      let top = rect.top;
+      let right = rect.right;
+      let bottom = rect.bottom;
+      for (const child of node.querySelectorAll('*')) {
+        const childRect = child.getBoundingClientRect();
+        if (childRect.width <= 0 && childRect.height <= 0) continue;
+        left = Math.min(left, childRect.left);
+        top = Math.min(top, childRect.top);
+        right = Math.max(right, childRect.right);
+        bottom = Math.max(bottom, childRect.bottom);
+      }
+      nodes.push(node);
+      variants.push({
+        selector: `.subsection-pitch-accent .subsection > div > div:nth-child(${rowIndex + 1}) > div:nth-child(${nodeIndex + 1})[style*="word-break: keep-all"]`,
+        text: (node.textContent || '').replace(/\s+/gu, ''),
+        markup: node.outerHTML,
         viewport_rect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
         document_rect: { x: rect.left + scrollX, y: rect.top + scrollY, width: rect.width, height: rect.height },
+        paint_rect: { x: left + scrollX, y: top + scrollY, width: right - left, height: bottom - top },
       });
-    });
-  });
-  if (!graphs.length) return { error: 'В секции графиков акцентуации не распознаны узлы графиков' };
-  const left = Math.min(...graphs.map(graph => graph.document_rect.x));
-  const top = Math.min(...graphs.map(graph => graph.document_rect.y));
-  const right = Math.max(...graphs.map(graph => graph.document_rect.x + graph.document_rect.width));
-  const bottom = Math.max(...graphs.map(graph => graph.document_rect.y + graph.document_rect.height));
-  const graphUnion = { x: left, y: top, width: right - left, height: bottom - top };
+    }
+    if (rowGraphs !== 1) return { error: `Строка ${rowIndex + 1} секции графиков должна содержать ровно один график, найдено ${rowGraphs}` };
+  }
+  if (!variants.length) return { error: 'В секции графиков акцентуации не распознаны узлы графиков' };
   const documentWidth = Math.max(document.documentElement.scrollWidth, document.documentElement.clientWidth, document.body?.scrollWidth || 0);
   const documentHeight = Math.max(document.documentElement.scrollHeight, document.documentElement.clientHeight, document.body?.scrollHeight || 0);
-  const captureRect = { ...graphUnion };
+  const pageState = {
+    variants,
+    viewport_width: window.innerWidth,
+    viewport_height: window.innerHeight,
+    document_width: documentWidth,
+    document_height: documentHeight,
+    scroll_x: scrollX,
+    scroll_y: scrollY,
+    page_scale_factor: window.visualViewport?.scale ?? NaN,
+    device_pixel_ratio: window.devicePixelRatio,
+  };
+  if (selectedIndex === null) return pageState;
+  const selected = variants[selectedIndex];
+  const selectedNode = nodes[selectedIndex];
+  if (!selected || !selectedNode) return { error: 'Выбранный вариант графика отсутствует на странице' };
+  const paint = selected.paint_rect;
+  const captureLeft = Math.floor(paint.x - padding);
+  const captureTop = Math.floor(paint.y - padding);
+  const captureRect = {
+    x: captureLeft,
+    y: captureTop,
+    width: Math.ceil(paint.x + paint.width + padding) - captureLeft,
+    height: Math.ceil(paint.y + paint.height + padding) - captureTop,
+  };
   const clipViewport = {
     left: captureRect.x - scrollX,
     top: captureRect.y - scrollY,
     right: captureRect.x + captureRect.width - scrollX,
     bottom: captureRect.y + captureRect.height - scrollY,
   };
+  const paintViewport = {
+    left: paint.x - scrollX,
+    top: paint.y - scrollY,
+    right: paint.x + paint.width - scrollX,
+    bottom: paint.y + paint.height - scrollY,
+  };
+  for (let node = selectedNode.parentElement; node instanceof HTMLElement; node = node.parentElement) {
+    const style = getComputedStyle(node);
+    if (style.overflowX === 'visible' && style.overflowY === 'visible' && style.clipPath === 'none') continue;
+    const rect = node.getBoundingClientRect();
+    if (rect.left > paintViewport.left || rect.top > paintViewport.top || rect.right < paintViewport.right || rect.bottom < paintViewport.bottom) {
+      return { error: 'Предок графика обрезает его отрисовку свойствами overflow или clip-path' };
+    }
+  }
   const opaqueRgb = value => {
     const match = value.match(/^rgba?\(([^)]+)\)$/u);
     if (!match) return null;
@@ -3124,21 +3295,13 @@ const CAPTURE_SNAPSHOT_SCRIPT: &str = r#"() => {
       break;
     }
   }
-  if (!background) return { error: 'dark-theme: Не найден непрозрачный фон предка, покрывающий всю область снимка' };
+  if (!background) return { error: 'dark-theme: Не найден непрозрачный фон предка, покрывающий всю область снимка с полями' };
   const root = document.documentElement;
   const rootStyle = getComputedStyle(root);
   return {
-    graphs,
-    graph_union_rect: graphUnion,
+    ...pageState,
+    selected_index: selectedIndex,
     capture_rect: captureRect,
-    viewport_width: window.innerWidth,
-    viewport_height: window.innerHeight,
-    document_width: documentWidth,
-    document_height: documentHeight,
-    scroll_x: scrollX,
-    scroll_y: scrollY,
-    page_scale_factor: window.visualViewport?.scale ?? NaN,
-    device_pixel_ratio: window.devicePixelRatio,
     dark_theme: {
       document_element_classes: [...root.classList],
       prefers_color_scheme: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
@@ -3774,50 +3937,44 @@ mod tests {
         }
     }
 
-    fn capture_snapshot_for_test() -> CaptureSnapshot {
-        let graphs = vec![
-            CaptureGraph {
-                selector: ".graph-a".into(),
-                viewport_rect: PitchAccentCaptureRect {
-                    x: 100.0,
-                    y: 350.0,
-                    width: 80.0,
-                    height: 40.0,
-                },
-                document_rect: PitchAccentCaptureRect {
-                    x: 100.0,
-                    y: 1450.0,
-                    width: 80.0,
-                    height: 40.0,
-                },
-            },
-            CaptureGraph {
-                selector: ".graph-b".into(),
-                viewport_rect: PitchAccentCaptureRect {
-                    x: 200.0,
-                    y: 500.0,
-                    width: 80.0,
-                    height: 40.0,
-                },
-                document_rect: PitchAccentCaptureRect {
-                    x: 200.0,
-                    y: 1600.0,
-                    width: 80.0,
-                    height: 40.0,
-                },
-            },
-        ];
-        let graph_union_rect = PitchAccentCaptureRect {
-            x: 100.0,
-            y: 1450.0,
-            width: 180.0,
-            height: 190.0,
+    fn capture_variant(
+        row: usize,
+        markup: &str,
+        document_y: f64,
+        paint_width: f64,
+    ) -> CaptureVariant {
+        let document_rect = PitchAccentCaptureRect {
+            x: 100.25,
+            y: document_y,
+            width: 74.0,
+            height: 27.25,
         };
-        let capture_rect = graph_union_rect;
-        CaptureSnapshot {
-            graphs,
-            graph_union_rect,
-            capture_rect,
+        CaptureVariant {
+            selector: format!(
+                ".subsection-pitch-accent .subsection > div > div:nth-child({row}) > div:nth-child(2)[style*=\"word-break: keep-all\"]"
+            ),
+            text: "たのしみ".into(),
+            markup: markup.into(),
+            viewport_rect: PitchAccentCaptureRect {
+                y: document_y - 1100.0,
+                ..document_rect
+            },
+            document_rect,
+            paint_rect: PitchAccentCaptureRect {
+                width: paint_width,
+                ..document_rect
+            },
+        }
+    }
+
+    /// Два варианта в отдельных строках на прокрученной странице; у первого
+    /// отрисовка выходит на 2 CSS px правее узла, как у сегментов JPDB.
+    fn capture_snapshot_for_test() -> CaptureSnapshot {
+        let page = VariantPage {
+            variants: vec![
+                capture_variant(1, "<div>a</div>", 1450.5, 76.0),
+                capture_variant(2, "<div>b</div>", 1500.5, 74.0),
+            ],
             viewport_width: 1280,
             viewport_height: 1200,
             document_width: 1280,
@@ -3826,6 +3983,19 @@ mod tests {
             scroll_y: 1100.0,
             page_scale_factor: 1.0,
             device_pixel_ratio: 3.0,
+        };
+        snapshot_selecting(page, 0)
+    }
+
+    fn snapshot_selecting(page: VariantPage, selected_index: usize) -> CaptureSnapshot {
+        let capture_rect = pitch_accent_capture_rect_for(
+            page.variants[selected_index].paint_rect,
+            PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+        );
+        CaptureSnapshot {
+            page,
+            selected_index,
+            capture_rect,
             dark_theme: PitchAccentDarkThemeProof {
                 document_element_classes: vec!["dark-mode".into()],
                 prefers_color_scheme: "dark".into(),
@@ -4395,56 +4565,82 @@ mod tests {
     }
 
     #[test]
-    fn capture_geometry_uses_exact_document_union_and_page_bounds() {
+    fn capture_region_is_the_padded_paint_of_one_variant_inside_the_document() {
         let snapshot = capture_snapshot_for_test();
-        assert!(snapshot.scroll_y > 0.0);
-        assert!(validate_capture_geometry(&snapshot, JpdbPitchStage::Capture).is_ok());
+        assert!(snapshot.page.scroll_y > 0.0);
+        assert!(validate_variant_page(&snapshot.page, JpdbPitchStage::Capture).is_ok());
+        assert!(validate_capture_region(&snapshot, JpdbPitchStage::Capture).is_ok());
         assert_eq!(
             snapshot.capture_rect,
             PitchAccentCaptureRect {
-                x: 100.0,
-                y: 1450.0,
-                width: 180.0,
-                height: 190.0,
-            }
+                x: 97.0,
+                y: 1447.0,
+                width: 83.0,
+                height: 34.0,
+            },
+            "субпиксельная отрисовка с выступом расширяется на 3 CSS px и до целых CSS px"
         );
 
         let mut wrong_offset = snapshot.clone();
-        wrong_offset.graphs[1].document_rect.y += 5.0;
-        assert!(validate_capture_geometry(&wrong_offset, JpdbPitchStage::Capture).is_err());
-        let mut padded_capture = snapshot.clone();
-        padded_capture.capture_rect.y -= 1.0;
-        padded_capture.capture_rect.height += 1.0;
-        assert!(validate_capture_geometry(&padded_capture, JpdbPitchStage::Capture).is_err());
-        let mut viewport_mismatch = snapshot;
-        viewport_mismatch.graphs[0].viewport_rect.y += 1.0;
-        assert!(validate_capture_geometry(&viewport_mismatch, JpdbPitchStage::Capture).is_err());
+        wrong_offset.page.variants[1].document_rect.y += 5.0;
+        assert!(validate_variant_page(&wrong_offset.page, JpdbPitchStage::Capture).is_err());
+        let mut viewport_mismatch = snapshot.clone();
+        viewport_mismatch.page.variants[0].viewport_rect.y += 1.0;
+        assert!(validate_variant_page(&viewport_mismatch.page, JpdbPitchStage::Capture).is_err());
+        let mut paint_inside_node = snapshot.clone();
+        paint_inside_node.page.variants[0].paint_rect.width = 50.0;
+        assert!(validate_variant_page(&paint_inside_node.page, JpdbPitchStage::Capture).is_err());
+
+        let mut unpadded = snapshot.clone();
+        unpadded.capture_rect = unpadded.page.variants[0].paint_rect;
+        assert!(validate_capture_region(&unpadded, JpdbPitchStage::Capture).is_err());
+        let mut node_only = snapshot.clone();
+        node_only.capture_rect = pitch_accent_capture_rect_for(
+            node_only.page.variants[0].document_rect,
+            PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+        );
+        assert!(
+            validate_capture_region(&node_only, JpdbPitchStage::Capture).is_err(),
+            "область от узла без выступающих сегментов обрезала бы рисунок"
+        );
+
+        let mut close_neighbour = snapshot.page.clone();
+        close_neighbour.variants[1].document_rect.y = 1479.0;
+        close_neighbour.variants[1].viewport_rect.y = 379.0;
+        close_neighbour.variants[1].paint_rect.y = 1479.0;
+        let close_neighbour = snapshot_selecting(close_neighbour, 0);
+        assert!(validate_variant_page(&close_neighbour.page, JpdbPitchStage::Capture).is_ok());
+        assert!(
+            validate_capture_region(&close_neighbour, JpdbPitchStage::Capture).is_err(),
+            "поле не должно задевать соседний вариант"
+        );
+
+        let mut at_edge = snapshot.page.clone();
+        for variant in &mut at_edge.variants {
+            variant.document_rect.x = 1.0;
+            variant.viewport_rect.x = 1.0;
+            variant.paint_rect.x = 1.0;
+        }
+        let at_edge = snapshot_selecting(at_edge, 0);
+        assert!(validate_variant_page(&at_edge.page, JpdbPitchStage::Capture).is_ok());
+        assert!(
+            validate_capture_region(&at_edge, JpdbPitchStage::Capture).is_err(),
+            "поле за пределами документа не публикуется"
+        );
     }
 
     #[test]
-    fn graph_selector_indexes_the_node_within_its_row() {
+    fn capture_script_marks_variant_rows_and_receives_selection_and_padding() {
         assert!(CAPTURE_SNAPSHOT_SCRIPT.contains("nodeIndex + 1"));
         assert!(CAPTURE_SNAPSHOT_SCRIPT.contains("rowIndex + 1"));
-    }
-
-    #[test]
-    fn capture_region_has_no_outer_padding() {
-        let union = PitchAccentCaptureRect {
-            x: 4.0,
-            y: 3.0,
-            width: 20.0,
-            height: 10.0,
-        };
+        assert!(CAPTURE_SNAPSHOT_SCRIPT.contains("rowGraphs !== 1"));
+        assert!(CAPTURE_SNAPSHOT_SCRIPT.contains("Math.floor(paint.x - padding)"));
+        assert!(!CAPTURE_SNAPSHOT_SCRIPT.contains("graphUnion"));
         assert_eq!(
-            union,
-            PitchAccentCaptureRect {
-                x: 4.0,
-                y: 3.0,
-                width: 20.0,
-                height: 10.0
-            }
+            capture_script_call(None),
+            format!("() => ({CAPTURE_SNAPSHOT_SCRIPT})(null, 3.0)")
         );
-        assert!(CAPTURE_SNAPSHOT_SCRIPT.contains("const captureRect = { ...graphUnion }"));
+        assert!(capture_script_call(Some(2)).ends_with(")(2, 3.0)"));
     }
 
     #[test]
@@ -4475,9 +4671,27 @@ mod tests {
         assert_ne!(value["code"], "page_contract");
     }
 
-    #[tokio::test]
-    #[ignore = "требует установленного Chromium; запустить: cargo test -p asset-store jpdb::tests::browser_capture_preserves_scrolled_two_graph_region -- --ignored"]
-    async fn browser_capture_preserves_scrolled_two_graph_region() {
+    /// Строка варианта в разметке JPDB: кнопка аудио и график из сегментов. Второй
+    /// сегмент с `margin-right: -2px` выходит за прямоугольник узла графика.
+    const AUDIO_BUTTON: &str = r##"<a class="icon-link vocabulary-audio" href="#" style="display:inline-block;width:28px;height:42px;background:#2a3a4a"></a>"##;
+
+    fn jpdb_like_row(color: &str, extra: &str) -> String {
+        format!(
+            r##"<div style="display:flex;column-gap:1rem;align-items:center">{AUDIO_BUTTON}<div style="word-break: keep-all; display: flex;{extra}"><div style="display:flex;--pitch-low:1;padding-bottom:2px;margin-top:2px;margin-right:-2px;padding-right:2px;background:{color}"><div style="width:20.3px;height:24.4px;overflow:hidden;background:#182430">た</div></div><div style="display:flex;--pitch-high:1;padding-top:2px;margin-bottom:2px;margin-right:-2px;padding-left:2px;padding-right:2px;background:{color}"><div style="width:40.6px;height:24.4px;overflow:hidden;background:#182430">のしみ</div></div></div></div>"##
+        )
+    }
+
+    fn jpdb_like_page(rows: &[String], gap: &str, section_style: &str) -> String {
+        format!(
+            r#"<!doctype html><html class="dark-mode"><body style="margin:0;background:#182430;color:white"><select id="search-bar-lang"><option value="english" selected>English</option></select><div style="height:1800.4px"></div><div class="subsection-pitch-accent" style="padding:20.5px 0 0 7.3px;width:300px;{section_style}"><h6 class="subsection-label">Pitch accent</h6><div class="subsection"><div style="display:flex;flex-direction:column;gap:{gap}">{}</div></div></div><div style="height:1200px"></div></body></html>"#,
+            rows.concat()
+        )
+    }
+
+    /// Браузерные регрессии захвата запускают Chromium по очереди.
+    static BROWSER_CAPTURE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn browser_session_with(content: &str) -> BrowserSession {
         let runtime = BrowserRuntimeConfig {
             device_metrics: Some(DeviceMetrics::new(1280, 1200, 3.0).unwrap()),
             prefers_color_scheme: Some("dark".into()),
@@ -4485,14 +4699,52 @@ mod tests {
         };
         let session = BrowserSession::launch(runtime).await.unwrap();
         configure_page(session.page()).await.unwrap();
-        session.page().set_content(r#"<!doctype html><html class="dark-mode"><body style="margin:0;background:#182430;color:white"><select id="search-bar-lang"><option value="english" selected>English</option></select><div style="height:1800px"></div><section class="subsection-pitch-accent" style="background:#182430;padding:20px;width:280px"><div class="subsection"><div><div class="graph-row"><div class="graph-a" style="word-break: keep-all;width:100px;height:44px;background:#d02020"><div style="--pitch-test:1"></div></div><div class="graph-b" style="word-break: keep-all;width:100px;height:44px;background:#20b050"><div style="--pitch-test:1"></div></div></div></div></div></section></body></html>"#).await.unwrap();
+        session.page().set_content(content).await.unwrap();
+        session
+    }
 
-        let snapshot = capture_snapshot(session.page(), JpdbPitchStage::Capture)
+    /// Закрытием сессии владеет `browser_runtime` со своими проверками; здесь
+    /// предмет проверки — захват, поэтому сбой закрытия только сообщается.
+    async fn close_capture_session(session: BrowserSession) {
+        if let Err(error) = session.close().await {
+            eprintln!("сессия браузера закрыта с ошибкой: {error}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "требует установленного Chromium; запустить: cargo test -p asset-store jpdb::tests::browser_capture -- --ignored"]
+    async fn browser_capture_takes_one_padded_variant_with_overflowing_paint() {
+        let _serial = BROWSER_CAPTURE_TESTS.lock().await;
+        let colors = ["#d02020", "#20b050", "#3060e0"];
+        let rows: Vec<String> = colors
+            .iter()
+            .map(|color| jpdb_like_row(color, ""))
+            .collect();
+        let session = browser_session_with(&jpdb_like_page(&rows, "0.5rem", "")).await;
+        let page = session.page();
+
+        let inventory = read_variant_page(page, JpdbPitchStage::Capture)
             .await
             .unwrap();
-        assert!(snapshot.scroll_y > 0.0);
-        assert_eq!(snapshot.graphs.len(), 2);
-        assert_ne!(snapshot.graphs[0].selector, snapshot.graphs[1].selector);
+        assert_eq!(inventory.variants.len(), 3);
+        assert!(inventory.scroll_y > 0.0);
+        for variant in &inventory.variants {
+            assert!(
+                variant.paint_rect.x + variant.paint_rect.width
+                    > variant.document_rect.x + variant.document_rect.width + 1.0,
+                "сегмент с отрицательным полем должен выходить за узел: {variant:?}"
+            );
+        }
+        let markup = inventory.markup_sha256();
+        // Разметка вариантов различается только цветом, поэтому выбор не обязан быть первым.
+        let selected = select_pitch_accent_variant(1, markup.iter().map(String::as_str)).unwrap();
+        let snapshot = capture_snapshot(page, JpdbPitchStage::Capture, selected)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.page.markup_sha256(), markup);
+        assert_eq!(snapshot.capture_rect.x.fract(), 0.0);
+        assert_eq!(snapshot.capture_rect.y.fract(), 0.0);
+
         let clip = Viewport::builder()
             .x(snapshot.capture_rect.x)
             .y(snapshot.capture_rect.y)
@@ -4501,8 +4753,7 @@ mod tests {
             .scale(1.0)
             .build()
             .unwrap();
-        let bytes = session
-            .page()
+        let bytes = page
             .screenshot(
                 CaptureScreenshotParams::builder()
                     .format(CaptureScreenshotFormat::Png)
@@ -4513,24 +4764,148 @@ mod tests {
             .await
             .unwrap();
         let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).unwrap();
-        let centers = snapshot
-            .graphs
+        assert_eq!(
+            (image.width(), image.height()),
+            (
+                (snapshot.capture_rect.width * 3.0) as u32,
+                (snapshot.capture_rect.height * 3.0) as u32
+            ),
+            "целочисленный clip при DSF 3 даёт PNG точного размера"
+        );
+
+        let selected_paint = snapshot.page.variants[selected].paint_rect;
+        let render = PitchAccentRenderEvidence {
+            kind: PitchAccentRenderKind::BrowserRegionScreenshot,
+            selector: snapshot.page.variants[selected].selector.clone(),
+            captured_graph_count: 1,
+            coordinate_space: PitchAccentCoordinateSpace::Document,
+            viewport_width: snapshot.page.viewport_width,
+            viewport_height: snapshot.page.viewport_height,
+            document_width: snapshot.page.document_width,
+            document_height: snapshot.page.document_height,
+            scroll_x: snapshot.page.scroll_x,
+            scroll_y: snapshot.page.scroll_y,
+            pixel_width: image.width(),
+            pixel_height: image.height(),
+            device_scale_factor: 3.0,
+            page_scale_factor: 1.0,
+            dark_theme: snapshot.dark_theme.clone(),
+            padding_css_px: PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+            capture_rect: snapshot.capture_rect,
+        };
+        assert!(
+            validate_evidence_capture_margins(&render, selected_paint, &image).is_ok(),
+            "все поля фактического PNG — подлинный фон"
+        );
+        let to_rgb = |hex: &str| {
+            let value = u32::from_str_radix(&hex[1..], 16).unwrap();
+            [(value >> 16) as u8, (value >> 8) as u8, value as u8]
+        };
+        let present: Vec<bool> = colors
             .iter()
-            .map(|graph| {
-                let x = ((graph.document_rect.x + graph.document_rect.width / 2.0
-                    - snapshot.capture_rect.x)
-                    * 3.0)
-                    .round() as u32;
-                let y = ((graph.document_rect.y + graph.document_rect.height / 2.0
-                    - snapshot.capture_rect.y)
-                    * 3.0)
-                    .round() as u32;
-                image.get_pixel(x, y).0
+            .map(|color| {
+                let rgb = to_rgb(color);
+                image.pixels().any(|(_, _, pixel)| pixel.0[..3] == rgb)
             })
-            .collect::<Vec<_>>();
-        assert_eq!(&centers[0][..3], &[208, 32, 32]);
-        assert_eq!(&centers[1][..3], &[32, 176, 80]);
-        session.close().await.unwrap();
+            .collect();
+        assert_eq!(
+            present,
+            (0..3).map(|index| index == selected).collect::<Vec<_>>(),
+            "в PNG только выбранный вариант"
+        );
+        let overflow_x = ((selected_paint.x + selected_paint.width - 1.0 - snapshot.capture_rect.x)
+            * 3.0) as u32;
+        let overflow_y = ((selected_paint.y + selected_paint.height / 2.0
+            - snapshot.capture_rect.y)
+            * 3.0) as u32;
+        assert_eq!(
+            image.get_pixel(overflow_x, overflow_y).0[..3],
+            to_rgb(colors[selected]),
+            "выступающий за узел сегмент присутствует в PNG"
+        );
+        close_capture_session(session).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "требует установленного Chromium; запустить: cargo test -p asset-store jpdb::tests::browser_capture -- --ignored"]
+    async fn browser_capture_refuses_unsafe_regions_with_typed_failures() {
+        let _serial = BROWSER_CAPTURE_TESTS.lock().await;
+        let two = |gap: &str, section_style: &str, extra: &str| {
+            jpdb_like_page(
+                &[
+                    jpdb_like_row("#d02020", extra),
+                    jpdb_like_row("#20b050", extra),
+                ],
+                gap,
+                section_style,
+            )
+        };
+        let cases = [
+            (
+                two("1px", "", "").replace("height:42px", "height:10px"),
+                "соседнего варианта",
+            ),
+            (
+                two("0.5rem", "overflow:hidden;max-width:70px;", ""),
+                "обрезает",
+            ),
+            (
+                // За левой границей документа нет предка с подтверждаемым фоном:
+                // скрипт отказывает раньше проверки границ на стороне Rust.
+                two("0.5rem", "position:absolute;left:-6.3px;top:1800px;", "")
+                    .replace(AUDIO_BUTTON, ""),
+                "покрывающий всю область снимка с полями",
+            ),
+        ];
+        for (content, expected) in cases {
+            let session = browser_session_with(&content).await;
+            let error = async {
+                let inventory = read_variant_page(session.page(), JpdbPitchStage::Capture).await?;
+                for index in 0..inventory.variants.len() {
+                    capture_snapshot(session.page(), JpdbPitchStage::Capture, index).await?;
+                }
+                Ok::<_, JpdbPitchFailure>(())
+            }
+            .await
+            .expect_err(expected);
+            let message = match &error {
+                JpdbPitchFailure::CaptureContract { message, .. }
+                | JpdbPitchFailure::DarkThemeUnverified { message, .. } => message.clone(),
+                other => panic!("ожидался типизированный отказ «{expected}», получено {other:?}"),
+            };
+            assert!(message.contains(expected), "{expected}: {message}");
+            close_capture_session(session).await;
+        }
+
+        let unknown = jpdb_like_page(
+            &[jpdb_like_row("#d02020", "")
+                .replace("</a>", "</a><span class=\"pitch-frequency\">72%</span>")],
+            "0.5rem",
+            "",
+        );
+        let session = browser_session_with(&unknown).await;
+        let error = read_variant_page(session.page(), JpdbPitchStage::Capture)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, JpdbPitchFailure::CaptureContract { message, .. } if message.contains("нераспознанный элемент")),
+            "неизвестные сведения о варианте не игнорируются: {error:?}"
+        );
+        close_capture_session(session).await;
+
+        let translucent = two("0.5rem", "", "").replace(
+            "<body style=\"margin:0;background:#182430;",
+            "<body style=\"margin:0;background:rgba(24,36,48,0.5);",
+        );
+        let session = browser_session_with(&translucent).await;
+        let error = capture_snapshot(session.page(), JpdbPitchStage::Capture, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, JpdbPitchFailure::DarkThemeUnverified { .. }),
+            "без непрозрачного фона снимок не готовится: {error:?}"
+        );
+        close_capture_session(session).await;
     }
 }
 

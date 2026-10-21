@@ -245,7 +245,7 @@ fn render_candidate(
     let semantic_status = candidate.validation.status;
     write!(
         html,
-        "<h4>{}кандидат · SHA-256 <code>{}</code></h4><p>Форма: {}; чтение: {}; ID словарной записи JPDB: {}; ссылка на страницу: <code>{}</code></p><p>Фактический размер файла: {} байт; размер PNG: {} × {}; число графиков: {}; статус проверки: <strong><code>{}</code></strong>; проверяющий модуль: <code>{}@{}</code>; публикация: {}</p>",
+        "<h4>{}кандидат · SHA-256 <code>{}</code></h4><p>Форма: {}; чтение: {}; ID словарной записи JPDB: {}; ссылка на страницу: <code>{}</code></p><p>Фактический размер файла: {} байт; размер PNG: {} × {}; {}; статус проверки: <strong><code>{}</code></strong>; проверяющий модуль: <code>{}@{}</code>; публикация: {}</p>",
         if is_current { "Текущий " } else { "" },
         escape_html(&candidate.sha256),
         escape_html(&candidate.metadata.surface),
@@ -255,7 +255,7 @@ fn render_candidate(
         candidate.byte_length,
         image.width.map_or_else(|| "неизвестно".into(), |v| v.to_string()),
         image.height.map_or_else(|| "неизвестно".into(), |v| v.to_string()),
-        evidence.graph_count,
+        escape_html(&variant_summary(evidence)),
         semantic_status.as_str(),
         escape_html(&candidate.validation.validator.id),
         escape_html(&candidate.validation.validator.version),
@@ -387,7 +387,8 @@ fn matching_owner_record<'a>(
         })?;
     if metadata.surface != item.identity.key
         || metadata.jpdb_vocabulary_id == 0
-        || metadata.evidence.graph_count == 0
+        || metadata.evidence.variant_selection.detected_variant_count == 0
+        || metadata.evidence.render.captured_graph_count != 1
         || metadata.evidence.source_url.is_empty()
     {
         return Ok(None);
@@ -472,12 +473,12 @@ fn render_canonical(
     let relative_path = format!("../../../{}", percent_encode_path(&record.storage_path));
     write!(
         html,
-        "<section class=\"candidate\"><h3>Канонический PNG</h3><p>Форма: {}; чтение: {}; ID словарной записи JPDB: {}; ссылка на страницу: <code>{}</code></p><p>Число графиков: {}; SHA-256: <code>{}</code>; размер: {} байт; размер PNG: {} × {}; статус проверки: <strong><code>{}</code></strong>; проверяющий модуль: <code>{}@{}</code>; публикация: подтверждена</p><figure><img alt=\"Канонический pitch-accent для {}\" src=\"{}\"><figcaption>Канонический путь в хранилище: <code>{}</code>; имя файла для потребителя: <code>{}</code></figcaption></figure>",
+        "<section class=\"candidate\"><h3>Канонический PNG</h3><p>Форма: {}; чтение: {}; ID словарной записи JPDB: {}; ссылка на страницу: <code>{}</code></p><p>{}; SHA-256: <code>{}</code>; размер: {} байт; размер PNG: {} × {}; статус проверки: <strong><code>{}</code></strong>; проверяющий модуль: <code>{}@{}</code>; публикация: подтверждена</p><figure><img alt=\"Канонический pitch-accent для {}\" src=\"{}\"><figcaption>Канонический путь в хранилище: <code>{}</code>; имя файла для потребителя: <code>{}</code></figcaption></figure>",
         escape_html(&metadata.surface),
         escape_html(&metadata.reading),
         metadata.jpdb_vocabulary_id,
         escape_html(&metadata.evidence.source_url),
-        metadata.evidence.graph_count,
+        escape_html(&variant_summary(&metadata.evidence)),
         escape_html(&record.sha256),
         record.byte_length,
         metadata.evidence.render.pixel_width,
@@ -516,6 +517,27 @@ fn render_canonical(
     )?;
     html.push_str("</section>");
     Ok(())
+}
+
+/// Различает число вариантов на странице источника и число графиков в самом PNG.
+fn variant_summary(evidence: &crate::pitch_accent::PitchAccentEvidence) -> String {
+    let selection = &evidence.variant_selection;
+    let selected = selection
+        .variants
+        .get(selection.selected_index as usize)
+        .map_or_else(
+            || "отсутствует в свидетельствах".to_owned(),
+            |variant| format!("№{} «{}»", variant.index + 1, variant.text),
+        );
+    let basis = match selection.basis {
+        crate::pitch_accent::PitchAccentVariantSelectionBasis::SeededHashWithoutSourcePriority => {
+            "воспроизводимый хеш; JPDB не сообщает распространённость вариантов"
+        }
+    };
+    format!(
+        "вариантов графика у записи: {}; выбран вариант {selected}; основание выбора: {basis}; графиков в PNG: {}",
+        selection.detected_variant_count, evidence.render.captured_graph_count
+    )
 }
 
 fn validate_candidate_reference(

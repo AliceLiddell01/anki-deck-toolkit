@@ -49,6 +49,12 @@ pub trait RuntimeBatchState: Serialize + DeserializeOwned {
     fn validate(&self) -> Result<(), AssetError>;
     fn referenced_blobs(&self) -> Vec<RuntimeBlobRef>;
 
+    /// Отклоняет сохранённое состояние несовместимой версии до типизированного
+    /// разбора, чтобы старая схема получила явный отказ, а не сообщение о повреждении.
+    fn check_stored_compatibility(_raw: &serde_json::Value) -> Result<(), AssetError> {
+        Ok(())
+    }
+
     /// Доменные состояния могут сохранить более строгий лимит, чем общий runtime.
     fn maximum_blob_bytes(&self) -> u64 {
         MAX_RUNTIME_BLOB_BYTES
@@ -347,6 +353,15 @@ impl SafeBatchRuntime {
             }
             Err(error) => return Err(error),
         };
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                format!("JSON runtime-пакета повреждён: {error}"),
+            )
+        })?;
+        S::check_stored_compatibility(&raw)?;
+        // Типизированный разбор идёт по исходным байтам: `Value` молча схлопывает
+        // повторные ключи, а разбор структуры их отвергает.
         let state: S = serde_json::from_slice(&bytes).map_err(|error| {
             AssetError::new(
                 ErrorCode::ManifestCorrupt,
