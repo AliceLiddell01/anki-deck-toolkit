@@ -3349,6 +3349,28 @@ mod tests {
     }
 
     #[test]
+    fn main_document_http_error_is_critical_and_subframe_document_is_not() {
+        use chromiumoxide::cdp::browser_protocol::network::ResourceType;
+
+        let snapshot = |is_top_level| RuntimeSnapshot {
+            epoch: 3,
+            http_errors: vec![crate::browser_runtime::NetworkOutcome {
+                resource_type: ResourceType::Document,
+                url: Some("https://jpdb.io/search?q=x".into()),
+                failure_reason: None,
+                request_id: "document".into(),
+                epoch: 3,
+                status_code: Some(429),
+                is_top_level,
+            }],
+            ..RuntimeSnapshot::default()
+        };
+        let failure = critical_telemetry_failure(&snapshot(true)).expect("главный документ");
+        assert!(failure.contains("HTTP 429"));
+        assert_eq!(critical_telemetry_failure(&snapshot(false)), None);
+    }
+
+    #[test]
     fn provider_only_request_timer_uses_unknown_generation() {
         let events = diagnostic_events(|| {
             request_diagnostic_timer(&JpdbPitchRequest::new(JpdbPitchQuery::new("雨", None)))

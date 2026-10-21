@@ -828,7 +828,7 @@ fn publication_reconcile_recovers_crash_after_owner_publish_before_final_state_s
     recovered.reconcile_owner(&snapshot).unwrap();
     assert_eq!(
         recovered.revision, revision,
-        "повторный reconcile идемпотентен"
+        "повторное согласование идемпотентно"
     );
     reopened.save(&recovered).unwrap();
     drop(reopened);
@@ -898,7 +898,7 @@ fn same_sha_in_new_generation_publishes_metadata_from_exact_current_attempt() {
     assert_eq!(
         batch.item("幽霊").unwrap().status(),
         PitchBatchItemStatus::PublicationPending,
-        "старый metadata A с тем же SHA не должен завершить новую публикацию"
+        "старые метаданные A с тем же SHA не должен завершить новую публикацию"
     );
     let publication = batch.item("幽霊").unwrap().publication.as_ref().unwrap();
     let current = batch
@@ -1456,6 +1456,67 @@ fn batch_wide_retry_rolls_back_after_first_item_changes_and_second_overflows() {
     assert_eq!(error.message, "превышен номер изменения элемента");
     assert_eq!(serde_json::to_vec(&batch).unwrap(), before);
     assert_eq!(runtime.load().unwrap().unwrap(), batch);
+}
+
+#[test]
+fn cached_validator_decision_does_not_cover_forged_context_or_changed_bytes() {
+    let temporary = temp_store();
+    let root = temporary.path();
+    let mut batch = batch("validator-memo", "幽霊", Some("ゆうれい"));
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+    let sha = record_provider_outcome(&mut runtime, &mut batch, "幽霊", acquired("幽霊", false));
+    drop(runtime);
+
+    // Повторные загрузки подтверждённого кандидата остаются успешными.
+    let mut reopened = PitchAccentBatchRuntime::open(root, "validator-memo").unwrap();
+    let loaded = reopened.load().unwrap().unwrap();
+    assert!(reopened.load().unwrap().is_some());
+    let candidate = loaded
+        .item("幽霊")
+        .unwrap()
+        .candidate(&sha)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        reopened.read_candidate(&loaded, &candidate).unwrap(),
+        png(false)
+    );
+    assert!(crate::pitch_batch::candidate_context_is_verified(
+        &candidate,
+        &PitchAccentImageValidator::validator_identity()
+    ));
+
+    // Подделка решения с согласованно пересчитанным контекстом — новый контекст:
+    // она снова проходит через PitchAccentImageValidator и отвергается.
+    let mut forged = candidate.clone();
+    forged.validation.evidence[0].summary = "подделанное свидетельство".into();
+    let forged = crate::pitch_batch::with_validation_context(forged).unwrap();
+    assert_ne!(
+        forged.validation_context_sha256,
+        candidate.validation_context_sha256
+    );
+    let mut forged_batch = loaded.clone();
+    let attempt = forged_batch
+        .item_mut("幽霊")
+        .unwrap()
+        .attempts
+        .last_mut()
+        .unwrap();
+    attempt.outcome = crate::pitch_batch::PitchBatchOutcome::Acquired {
+        candidate: Box::new(forged.clone()),
+    };
+    let error = reopened.read_candidate(&forged_batch, &forged).unwrap_err();
+    assert_eq!(error.code, crate::error::ErrorCode::IntegrityMismatch);
+
+    // Изменённые байты того же контекста отвергает проверка SHA до кэша.
+    let blob = root
+        .join(".runtime/batches/validator-memo")
+        .join(&candidate.blob.storage_path);
+    std::fs::write(&blob, png(true)).unwrap();
+    let error = reopened.read_candidate(&loaded, &candidate).unwrap_err();
+    assert_eq!(error.code, crate::error::ErrorCode::IntegrityMismatch);
+    assert!(reopened.load().is_err());
 }
 
 #[test]
