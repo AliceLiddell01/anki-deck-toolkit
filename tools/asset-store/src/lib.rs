@@ -11,6 +11,7 @@ compile_error!("asset-store пока поддерживает только Linux
 pub mod batch;
 pub mod batch_runtime;
 pub mod browser_diagnostics;
+mod browser_process;
 pub mod browser_runtime;
 pub mod cli;
 pub mod diagnostics;

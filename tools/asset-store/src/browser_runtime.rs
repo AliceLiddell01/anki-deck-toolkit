@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chromiumoxide::{
-    Browser, BrowserConfig, Page,
+    Browser, Page,
     cdp::browser_protocol::{
         emulation::{MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams},
         network::{
@@ -21,12 +21,14 @@ use chromiumoxide::{
         page::{EnableParams, GetFrameTreeParams},
     },
     cdp::js_protocol::runtime::{EnableParams as RuntimeEnableParams, EventExceptionThrown},
+    handler::{HandlerConfig, viewport::Viewport},
 };
 use futures::{FutureExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use url::Url;
 
+use crate::browser_process::{BrowserLaunchSpec, OwnedBrowserProcess, ProcessLaunchFailure};
 use crate::temp_workspace::TempWorkspace;
 
 const MAX_TRACKED_REQUESTS: usize = 256;
@@ -385,11 +387,11 @@ fn set_private_directory(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-fn build_browser_config(
+fn build_launch_spec(
     profile: &BrowserProfile,
     config: &BrowserRuntimeConfig,
     executable: Option<BrowserExecutableSelection>,
-) -> Result<BrowserConfig, String> {
+) -> Result<BrowserLaunchSpec, String> {
     let configured_temp_root =
         std::env::var_os(crate::temp_workspace::CONFIGURED_TEMP_ROOT_ENV).map(PathBuf::from);
     let current_directory = std::env::current_dir().ok();
@@ -401,19 +403,54 @@ fn build_browser_config(
     let temp_directory = temp_directory
         .to_str()
         .ok_or("browser_tmpdir_invalid: путь TMPDIR должен быть UTF-8")?;
-    let mut builder = BrowserConfig::builder()
-        .user_data_dir(&profile.path)
-        .env("TMPDIR", temp_directory)
-        .incognito()
-        .respect_https_errors()
-        .launch_timeout(config.launch_timeout)
-        .request_timeout(config.request_timeout);
-    if let Some(executable) = executable {
-        builder = builder.chrome_executable(executable.path);
+    let executable = match executable {
+        Some(executable) => executable.path,
+        None => chromiumoxide::detection::default_executable(
+            chromiumoxide::detection::DetectionOptions::default(),
+        )
+        .map_err(|error| format!("настройка браузера: {error}"))?,
+    };
+    Ok(BrowserLaunchSpec {
+        executable,
+        user_data_dir: profile.path.clone(),
+        tmpdir: temp_directory.to_owned(),
+        launch_timeout: config.launch_timeout,
+    })
+}
+
+/// Настройки обработчика CDP совпадают с прежним `Browser::launch`: ошибки HTTPS
+/// не игнорируются, а область просмотра по умолчанию остаётся 800×600.
+fn handler_config(config: &BrowserRuntimeConfig) -> HandlerConfig {
+    HandlerConfig {
+        ignore_https_errors: false,
+        ignore_invalid_messages: true,
+        viewport: Some(Viewport::default()),
+        context_ids: Vec::new(),
+        request_timeout: config.request_timeout,
+        request_intercept: false,
+        cache_enabled: true,
     }
-    builder
-        .build()
-        .map_err(|error| format!("настройка браузера: {error}"))
+}
+
+/// Запуск процесса и подключение CDP; при отказе подключения процесс уже остановлен.
+async fn launch_owned_browser(
+    spec: &BrowserLaunchSpec,
+    config: &BrowserRuntimeConfig,
+) -> Result<(OwnedBrowserProcess, Browser, chromiumoxide::Handler), ProcessLaunchFailure> {
+    let (mut process, address) = OwnedBrowserProcess::spawn(spec).await?;
+    match Browser::connect_with_config(address, handler_config(config)).await {
+        Ok((browser, handler)) => Ok((process, browser, handler)),
+        Err(error) => {
+            let stop = process.stop(Duration::from_secs(2)).await;
+            Err(ProcessLaunchFailure {
+                message: format!(
+                    "запуск браузера: подключение CDP: {}",
+                    crate::diagnostics::safe_message(&error.to_string())
+                ),
+                stop,
+            })
+        }
+    }
 }
 
 fn browser_tmpdir_value(
@@ -467,6 +504,7 @@ impl Drop for BrowserProfile {
 struct BrowserResources {
     diagnostic_session_id: u64,
     browser: Option<Browser>,
+    process: Option<OwnedBrowserProcess>,
     handler_task: Option<tokio::task::JoinHandle<()>>,
     profile: Option<BrowserProfile>,
 }
@@ -562,7 +600,11 @@ fn transport_stop_result(
     }
 }
 
-async fn stop_browser(browser: &mut Browser, browser_session: u64) -> BrowserStopObservation {
+async fn stop_browser(
+    browser: &mut Browser,
+    process: Option<&mut OwnedBrowserProcess>,
+    browser_session: u64,
+) -> BrowserStopObservation {
     let started = Instant::now();
     let transport = match timeout(Duration::from_secs(2), browser.close()).await {
         Ok(result) => transport_stop_result(result.map(|_| ())),
@@ -587,44 +629,43 @@ async fn stop_browser(browser: &mut Browser, browser_session: u64) -> BrowserSto
         code = transport_code,
         browser_session,
         outcome = transport_outcome,
+        failure = match &transport {
+            BrowserTransportStop::Failed(error) => Some(crate::diagnostics::safe_message(error)),
+            _ => None,
+        },
         stage_duration_ms = duration_millis(started.elapsed()),
         "Завершено наблюдение остановки транспорта CDP"
     );
     let started = Instant::now();
-    let wait = timeout(Duration::from_secs(2), browser.wait()).await;
-    let (process_stopped, process_failure, process_outcome) = if matches!(wait, Ok(Ok(_))) {
-        (true, None, "exited")
-    } else {
-        match timeout(Duration::from_secs(2), browser.kill()).await {
-            Ok(Some(Ok(()))) => {
-                let failure = if transport == BrowserTransportStop::Detached {
-                    None
-                } else {
-                    Some("browser_close_failed: потребовалось принудительное завершение".into())
-                };
-                (true, failure, "killed")
-            }
-            Ok(Some(Err(error))) => (
-                false,
-                Some(format!(
-                    "browser_kill_failed: {}",
-                    crate::diagnostics::safe_message(&error.to_string())
-                )),
-                "stop_failed",
-            ),
-            Ok(None) => (
-                false,
-                Some("browser_process_stop_unproven".into()),
-                "unproven",
-            ),
-            Err(_) => (false, Some("browser_kill_timeout".into()), "stop_failed"),
-        }
+    let process_group = process.as_ref().map(|process| process.pid());
+    let (process_stopped, process_failure, process_outcome) = match process {
+        None => (
+            false,
+            Some("browser_process_stop_unproven".to_owned()),
+            "unproven",
+        ),
+        Some(process) => match process.wait_exit(Duration::from_secs(2)).await {
+            Ok(Some(_)) => (true, None, "exited"),
+            Err(error) => (false, Some(error), "stop_failed"),
+            Ok(None) => match process.kill(Duration::from_secs(2)).await {
+                Ok(()) => {
+                    let failure = if transport == BrowserTransportStop::Detached {
+                        None
+                    } else {
+                        Some("browser_close_failed: потребовалось принудительное завершение".into())
+                    };
+                    (true, failure, "killed")
+                }
+                Err(error) => (false, Some(error), "stop_failed"),
+            },
+        },
     };
-    let process_code = match process_outcome {
-        "exited" => "browser_process_exited",
-        "killed" => "browser_process_killed",
-        "unproven" => "browser_process_stop_unproven",
-        _ if process_failure.as_deref() == Some("browser_kill_timeout") => "browser_kill_timeout",
+    let process_code = match (process_outcome, process_failure.as_deref()) {
+        ("exited", _) => "browser_process_exited",
+        ("killed", _) => "browser_process_killed",
+        ("unproven", _) => "browser_process_stop_unproven",
+        (_, Some("browser_kill_timeout")) => "browser_kill_timeout",
+        (_, Some("browser_process_group_stop_unproven")) => "browser_process_group_stop_unproven",
         _ => "browser_kill_failed",
     };
     tracing::info!(
@@ -632,10 +673,11 @@ async fn stop_browser(browser: &mut Browser, browser_session: u64) -> BrowserSto
         stage = "browser_process_stop",
         code = process_code,
         browser_session,
+        process_group,
         outcome = process_outcome,
         process_stopped,
         stage_duration_ms = duration_millis(started.elapsed()),
-        "Завершена проверка остановки принадлежащего браузера"
+        "Завершена проверка остановки принадлежащего браузера и его группы процессов"
     );
     BrowserStopObservation {
         transport,
@@ -686,7 +728,9 @@ impl BrowserResources {
 
     async fn close(mut self) -> Result<(), String> {
         let stopped = match self.browser.as_mut() {
-            Some(browser) => stop_browser(browser, self.diagnostic_session_id).await,
+            Some(browser) => {
+                stop_browser(browser, self.process.as_mut(), self.diagnostic_session_id).await
+            }
             None => BrowserStopObservation {
                 transport: BrowserTransportStop::Closed,
                 process_stopped: true,
@@ -716,6 +760,7 @@ impl BrowserResources {
             "Завершена остановка обработчика CDP"
         );
         drop(self.browser.take());
+        drop(self.process.take());
         let started = Instant::now();
         let cleanup = match self.profile.take() {
             Some(profile) => profile.close_after_browser_stop().await.map_err(|error| {
@@ -778,9 +823,10 @@ fn combine_browser_close_results(
 impl Drop for BrowserResources {
     fn drop(&mut self) {
         let browser = self.browser.take();
+        let process = self.process.take();
         let handler = self.handler_task.take();
         let profile = self.profile.take();
-        if browser.is_none() && handler.is_none() && profile.is_none() {
+        if browser.is_none() && process.is_none() && handler.is_none() && profile.is_none() {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -789,6 +835,7 @@ impl Drop for BrowserResources {
                 let resources = BrowserResources {
                     diagnostic_session_id,
                     browser,
+                    process,
                     handler_task: handler,
                     profile,
                 };
@@ -799,6 +846,7 @@ impl Drop for BrowserResources {
                 handler.abort();
             }
             drop(browser);
+            drop(process);
             drop(profile);
         }
     }
@@ -839,29 +887,36 @@ impl BrowserSession {
             .as_ref()
             .map(|selection| selection.source)
             .unwrap_or(BrowserExecutableSource::ChromiumoxideDefault);
-        let browser_config = match build_browser_config(&profile, &config, executable) {
-            Ok(config) => config,
+        let spec = match build_launch_spec(&profile, &config, executable) {
+            Ok(spec) => spec,
             Err(message) => {
                 return Err(profile_setup_failure(profile, message));
             }
         };
-        // Если разворачивание стека прервёт получение Browser, дочерний процесс
-        // chromiumoxide применит `kill_on_drop`. `catch_browser_setup` полностью
-        // уничтожит `Future` запуска; затем ждём, пока процессы перестанут
-        // использовать временное дерево, и только после этого удаляем профиль.
-        // Это не требует обращаться к скрытому дочернему процессу через `waitpid`.
+        // Процесс принадлежит `OwnedBrowserProcess` в собственной группе: при
+        // разворачивании стека его `Drop` завершает только эту группу. Затем ждём,
+        // пока процессы перестанут использовать временное дерево, и только после
+        // этого удаляем профиль.
         let launched = catch_browser_setup(async {
-            Browser::launch(browser_config)
-                .await
-                .map_err(|error| format!("запуск браузера: {error}"))
+            Ok::<_, String>(launch_owned_browser(&spec, &config).await)
         })
         .await;
-        let (browser, mut handler) = match launched {
-            Ok(launched) => launched,
+        let (process, browser, mut handler) = match launched {
+            Ok(Ok(launched)) => launched,
+            Ok(Err(failure)) => {
+                let stop = failure.stop.map(|_| ());
+                return Err(profile_launch_failure(
+                    profile,
+                    BrowserSetupFailure::Error(failure.message),
+                )
+                .await
+                .with_cleanup(stop));
+            }
             Err(failure) => {
                 return Err(profile_launch_failure(profile, failure).await);
             }
         };
+        let process_group = process.pid();
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
                 if event.is_err() {
@@ -873,9 +928,18 @@ impl BrowserSession {
         let mut resources = BrowserResources {
             diagnostic_session_id: NEXT_BROWSER_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             browser: Some(browser),
+            process: Some(process),
             handler_task: Some(handler_task),
             profile: Some(profile),
         };
+        tracing::info!(
+            event = "browser_lifecycle",
+            stage = "browser_process_started",
+            code = "browser_process_group_owned",
+            browser_session = resources.diagnostic_session_id,
+            process_group,
+            "Браузер запущен в собственной группе процессов"
+        );
         // Перехватываем панику, пока `resources` принадлежит запуску: `Drop`
         // запускает только фоновую резервную очистку и не гарантирует её завершение.
         let setup = catch_browser_setup(async {
@@ -2078,21 +2142,10 @@ mod tests {
             path: PathBuf::from("/bin/true"),
             source: BrowserExecutableSource::PathLookup,
         };
-        let config =
-            build_browser_config(&profile, &BrowserRuntimeConfig::default(), Some(executable))
-                .unwrap();
-        assert_eq!(
-            config.user_data_dir.as_deref(),
-            Some(profile.path.as_path())
-        );
-        assert_eq!(
-            config
-                .process_envs
-                .as_ref()
-                .and_then(|environment| environment.get("TMPDIR"))
-                .map(String::as_str),
-            profile.temp_path.to_str()
-        );
+        let spec = build_launch_spec(&profile, &BrowserRuntimeConfig::default(), Some(executable))
+            .unwrap();
+        assert_eq!(spec.user_data_dir, profile.path);
+        assert_eq!(Some(spec.tmpdir.as_str()), profile.temp_path.to_str());
         assert!(profile.temp_path.starts_with(parent.path()));
         assert_eq!(std::env::var_os("TMPDIR"), before);
         assert!(profile.temp_path.as_os_str().as_bytes().len() < 108);
@@ -2115,13 +2168,10 @@ mod tests {
                 source: BrowserExecutableSource::PathLookup,
             };
             let result =
-                build_browser_config(&profile, &BrowserRuntimeConfig::default(), Some(executable));
+                build_launch_spec(&profile, &BrowserRuntimeConfig::default(), Some(executable));
             if let Some(expected) = temp_path.to_str() {
-                let config = result.unwrap();
-                assert_eq!(
-                    config.process_envs.unwrap().get("TMPDIR").unwrap(),
-                    expected
-                );
+                let spec = result.unwrap();
+                assert_eq!(spec.tmpdir, expected);
                 profile.close().unwrap();
             } else {
                 let message = result.unwrap_err();
@@ -2300,6 +2350,7 @@ mod tests {
                     let resources = BrowserResources {
                         diagnostic_session_id: 0,
                         browser: None,
+                        process: None,
                         handler_task: None,
                         profile: Some(profile),
                     };
@@ -2377,6 +2428,7 @@ mod tests {
         let resources = BrowserResources {
             diagnostic_session_id: 0,
             browser: None,
+            process: None,
             handler_task: Some(handler),
             profile: Some(profile),
         };
@@ -2417,6 +2469,7 @@ mod tests {
         let resources = BrowserResources {
             diagnostic_session_id: 0,
             browser: None,
+            process: None,
             handler_task: None,
             profile: Some(profile),
         };
