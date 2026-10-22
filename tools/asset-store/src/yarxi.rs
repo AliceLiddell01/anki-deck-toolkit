@@ -5,6 +5,10 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::acquisition_pool::{
+    AssignmentError, AssignmentLedger, CancellationListener, CancellationReason, PoolCancellation,
+    RecoveryBudget,
+};
 use crate::browser_diagnostics::{BrowserItemContext, BrowserItemTimer, runtime_snapshot_json};
 #[cfg(test)]
 use crate::browser_runtime::TrackedRequest;
@@ -28,7 +32,7 @@ use image::{GenericImageView, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::panic::AssertUnwindSafe;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep, timeout_at};
 use url::Url;
 
@@ -63,24 +67,9 @@ const YARXI_DARK_THEME_STYLE_ID: &str = "asset-store-yarxi-dark-theme";
 const YARXI_DARK_THEME_STYLE: &str = ":root { color-scheme: dark !important; } #app { color: rgb(var(--w-base-color-rgb)) !important; }";
 type CtrlCListener = tokio::task::JoinHandle<std::io::Result<()>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParallelCancellationReason {
-    CtrlC,
-    CoordinatorFailure,
-}
-
-impl ParallelCancellationReason {
-    fn label(self) -> &'static str {
-        match self {
-            Self::CtrlC => "ctrl_c",
-            Self::CoordinatorFailure => "coordinator_failure",
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 #[error("parallel coordinator cancellation: {0:?}")]
-struct ParallelCancellation(ParallelCancellationReason);
+struct ParallelCancellation(CancellationReason);
 const PARALLEL_COORDINATOR_CANCELLED: &str = "browser_worker_cancelled: coordinator_failure";
 
 fn is_parallel_coordinator_cancellation(error: &AcquisitionStreamError) -> bool {
@@ -1081,7 +1070,7 @@ impl ParallelDriver for ParallelBrowserDriver {
     }
 }
 
-const PARALLEL_RECOVERY_BUDGET: u8 = MAX_SESSION_SETUP_RECREATIONS + 1;
+const PARALLEL_RECOVERY_BUDGET: u32 = MAX_SESSION_SETUP_RECREATIONS as u32 + 1;
 
 fn parallel_recoverable(error: &AcquisitionStreamError) -> bool {
     matches!(error, AcquisitionStreamError::Provider(message) if message.starts_with(SESSION_SETUP_RUNTIME_FAILURE_PREFIX))
@@ -1101,13 +1090,13 @@ async fn run_parallel_worker(
     worker_id: usize,
     mut commands: mpsc::UnboundedReceiver<ParallelJob>,
     sender: mpsc::UnboundedSender<ParallelMessage>,
-    mut cancellation: watch::Receiver<Option<ParallelCancellationReason>>,
+    mut cancellation: CancellationListener,
 ) -> (usize, Result<(), AcquisitionStreamError>) {
     let mut context = ParallelWorkerContext {
         worker_id,
         ..ParallelWorkerContext::default()
     };
-    let mut consecutive_failures = 0u8;
+    let mut recovery = RecoveryBudget::new(PARALLEL_RECOVERY_BUDGET);
     let mut session_processed = 0usize;
     // Последующий здоровый checkpoint доказывает восстановление. Без него
     // завершение очереди должно сохранить отказ последнего монитора.
@@ -1119,7 +1108,7 @@ async fn run_parallel_worker(
                 .map_err(|_| parallel_protocol_error("канал координатора закрыт"))?;
             let job = tokio::select! {
                 biased;
-                _ = cancellation.changed() => break,
+                _ = cancellation.cancelled() => break,
                 job = commands.recv() => match job {
                     Some(job) => job,
                     None => {
@@ -1130,7 +1119,7 @@ async fn run_parallel_worker(
                     },
                 },
             };
-            if cancellation.borrow().is_some() {
+            if cancellation.reason().is_some() {
                 break;
             }
             context.job = Some(job.clone());
@@ -1165,7 +1154,7 @@ async fn run_parallel_worker(
                         };
                         stop = health_stop.or(stop);
                         if successful || !stop.as_ref().is_some_and(parallel_session_fault) {
-                            consecutive_failures = 0;
+                            recovery.record_success();
                         }
                     } else {
                         if let Some(diagnostics) = acquired.diagnostics.take() {
@@ -1182,7 +1171,7 @@ async fn run_parallel_worker(
                         .await?;
                     }
                     if stop.as_ref().is_some_and(parallel_session_fault) {
-                        consecutive_failures += 1;
+                        recovery.record_failure();
                     }
                 }
                 Err(AcquisitionStreamError::Interrupted) => {
@@ -1201,16 +1190,14 @@ async fn run_parallel_worker(
                         &sender,
                         &context,
                         AcquisitionWorkerEventKind::Deferred {
-                            reason: ParallelCancellationReason::CoordinatorFailure
-                                .label()
-                                .into(),
+                            reason: CancellationReason::CoordinatorFailure.label().into(),
                         },
                     )
                     .await?;
                     break;
                 }
                 Err(error) if parallel_recoverable(&error) => {
-                    consecutive_failures += 1;
+                    recovery.record_failure();
                     acknowledge_parallel_event(
                         &sender,
                         &context,
@@ -1238,12 +1225,13 @@ async fn run_parallel_worker(
                 )?;
                 session_processed = 0;
                 context.browser_session = None;
-                if consecutive_failures >= PARALLEL_RECOVERY_BUDGET {
+                if recovery.exhausted() {
                     send_parallel_event(
                         &sender,
                         &context,
                         AcquisitionWorkerEventKind::WorkerRetired {
-                            consecutive_failures,
+                            consecutive_failures: u8::try_from(recovery.consecutive_failures())
+                                .unwrap_or(u8::MAX),
                             reason: reason.summary(),
                         },
                     )?;
@@ -1284,10 +1272,10 @@ async fn run_parallel_worker(
             ))
         });
     if cleanup.is_ok() && context.browser_session.is_some() {
-        let cancellation_reason = *cancellation.borrow();
-        let stop_reason = (cancellation_reason == Some(ParallelCancellationReason::CtrlC))
+        let cancellation_reason = cancellation.reason();
+        let stop_reason = (cancellation_reason == Some(CancellationReason::Interrupted))
             .then_some(SessionStopReason::Interrupted);
-        if cancellation_reason == Some(ParallelCancellationReason::CoordinatorFailure) {
+        if cancellation_reason == Some(CancellationReason::CoordinatorFailure) {
             tracing::warn!(
                 worker = context.worker_id,
                 session = context.session,
@@ -1347,56 +1335,31 @@ async fn run_parallel_worker(
     (worker_id, result)
 }
 
-struct ParallelAssignments {
-    pending: VecDeque<ParallelJob>,
-    active: Vec<Option<ParallelJob>>,
-    ready: Vec<bool>,
-    retired: Vec<bool>,
+type ParallelAssignments = AssignmentLedger<ParallelJob>;
+
+fn parallel_assignment_error(error: AssignmentError) -> AcquisitionStreamError {
+    parallel_protocol_error(match error {
+        AssignmentError::UnknownWorker => "неизвестный обработчик",
+        AssignmentError::NoAssignment => "результат без назначения",
+        AssignmentError::Mismatch => {
+            "identity/generation/attempt результата не совпали с назначением"
+        }
+        AssignmentError::WorkerUnavailable => "обработчик не принимает назначение",
+    })
 }
 
-impl ParallelAssignments {
-    fn accept(
-        &mut self,
-        event: &AcquisitionWorkerEvent,
-    ) -> Result<ParallelJob, AcquisitionStreamError> {
-        let slot = event
-            .worker_id
-            .checked_sub(1)
-            .filter(|slot| *slot < self.active.len())
-            .ok_or_else(|| parallel_protocol_error("неизвестный обработчик"))?;
-        let expected = self.active[slot]
-            .as_ref()
-            .ok_or_else(|| parallel_protocol_error("результат без назначения"))?;
-        if event.index != Some(expected.index)
-            || event.generation != Some(expected.generation)
-            || event.owner_attempt != Some(expected.owner_attempt)
-        {
-            return Err(parallel_protocol_error(
-                "identity/generation/attempt результата не совпали с назначением",
-            ));
-        }
-        Ok(self.active[slot].take().expect("assignment checked"))
-    }
-
-    fn dispatch(
-        &mut self,
-        commands: &[mpsc::UnboundedSender<ParallelJob>],
-    ) -> Result<(), AcquisitionStreamError> {
-        for (slot, command) in commands.iter().enumerate() {
-            if self.retired[slot] || !self.ready[slot] || self.active[slot].is_some() {
-                continue;
-            }
-            let Some(job) = self.pending.pop_front() else {
-                break;
-            };
-            command
-                .send(job.clone())
-                .map_err(|_| parallel_protocol_error("обработчик не принимает назначение"))?;
-            self.active[slot] = Some(job);
-            self.ready[slot] = false;
-        }
-        Ok(())
-    }
+/// Результат принимается только с точными индексом, поколением и попыткой назначения.
+fn accept_parallel_result(
+    state: &mut ParallelAssignments,
+    event: &AcquisitionWorkerEvent,
+) -> Result<ParallelJob, AcquisitionStreamError> {
+    state
+        .accept(event.worker_id, |expected| {
+            event.index == Some(expected.index)
+                && event.generation == Some(expected.generation)
+                && event.owner_attempt == Some(expected.owner_attempt)
+        })
+        .map_err(parallel_assignment_error)
 }
 
 fn stopped_parallel_failure(event: &AcquisitionWorkerEvent) -> Option<AcquisitionStreamError> {
@@ -1406,20 +1369,6 @@ fn stopped_parallel_failure(event: &AcquisitionWorkerEvent) -> Option<Acquisitio
         ),
         _ => None,
     }
-}
-
-fn request_parallel_cancellation(
-    cancellation: &watch::Sender<Option<ParallelCancellationReason>>,
-    reason: ParallelCancellationReason,
-) {
-    let _ = cancellation.send_if_modified(|current| {
-        if current.is_some() {
-            false
-        } else {
-            *current = Some(reason);
-            true
-        }
-    });
 }
 
 fn deliver_parallel_event(
@@ -1435,16 +1384,10 @@ async fn coordinate_parallel<D: ParallelDriver>(
     drivers: Vec<D>,
     jobs: VecDeque<ParallelJob>,
     interrupt: impl Future<Output = AcquisitionStreamError>,
-    cancellation: watch::Sender<Option<ParallelCancellationReason>>,
+    cancellation: PoolCancellation,
     on_event: &mut impl FnMut(AcquisitionWorkerEvent) -> Result<(), AssetError>,
 ) -> Result<AcquisitionSummary, AcquisitionStreamError> {
     let count = drivers.len();
-    let mut state = ParallelAssignments {
-        pending: jobs,
-        active: vec![None; count],
-        ready: vec![false; count],
-        retired: vec![false; count],
-    };
     let (sender, mut messages) = mpsc::unbounded_channel();
     let mut futures = FuturesUnordered::new();
     let mut commands = Vec::new();
@@ -1460,6 +1403,7 @@ async fn coordinate_parallel<D: ParallelDriver>(
         ));
     }
     drop(sender);
+    let mut state = ParallelAssignments::new(jobs, commands);
     tokio::pin!(interrupt);
     let mut error = None;
     let mut interrupted = false;
@@ -1483,7 +1427,7 @@ async fn coordinate_parallel<D: ParallelDriver>(
                 let handled = (|| -> Result<(), AcquisitionStreamError> {
                     match message {
                         ParallelMessage::Ready(worker) => {
-                            state.ready[worker - 1] = true;
+                            state.mark_ready(worker).map_err(parallel_assignment_error)?;
                         },
                         ParallelMessage::Event(event, ack) => {
                             let worker = event.worker_id;
@@ -1492,17 +1436,17 @@ async fn coordinate_parallel<D: ParallelDriver>(
                             contexts[slot] = ParallelWorkerContext {
                                 worker_id: worker, session: event.session,
                                 browser_session: event.browser_session, attempt: event.attempt,
-                                job: state.active[slot].clone(),
+                                job: state.active(worker).cloned(),
                             };
                             let terminal = matches!(event.event, AcquisitionWorkerEventKind::Provider(AcquisitionEvent::ItemCompleted { .. }));
                             let deferred = matches!(event.event, AcquisitionWorkerEventKind::Deferred { .. });
                             if terminal || deferred {
-                                let job = state.accept(&event)?;
-                                if deferred { state.pending.push_back(job); }
+                                let job = accept_parallel_result(&mut state, &event)?;
+                                if deferred { state.requeue(job); }
                                 else { processed += 1; }
                             }
                             if matches!(event.event, AcquisitionWorkerEventKind::Provider(AcquisitionEvent::SessionStarted { .. })) { sessions += 1; }
-                            if matches!(event.event, AcquisitionWorkerEventKind::WorkerRetired { .. } | AcquisitionWorkerEventKind::WorkerStopped { .. }) { state.retired[worker - 1] = true; }
+                            if matches!(event.event, AcquisitionWorkerEventKind::WorkerRetired { .. } | AcquisitionWorkerEventKind::WorkerStopped { .. }) { state.retire(worker).map_err(parallel_assignment_error)?; }
                             // После отказа потребителя принятые результаты соседей продолжают сохраняться.
                             // Не ждём ошибки завершения задачи: сосед уже может прислать Ready.
                             // Неисправимое завершение прекращает назначения при обработке этого же сообщения.
@@ -1528,59 +1472,63 @@ async fn coordinate_parallel<D: ParallelDriver>(
                 })();
                 if let Err(next) = handled {
                     if error.is_none() { error = Some(next); }
-                    request_parallel_cancellation(&cancellation, ParallelCancellationReason::CoordinatorFailure);
+                    cancellation.request(CancellationReason::CoordinatorFailure);
                 }
                 // Сигнал, полученный при записи контрольной точки, проверяется до нового назначения.
                 if !interrupted && let Some(signal) = interrupt.as_mut().now_or_never() {
                     interrupted = true;
                     let cancellation_reason = if matches!(&signal, AcquisitionStreamError::Interrupted) {
-                        ParallelCancellationReason::CtrlC
+                        CancellationReason::Interrupted
                     } else {
-                        ParallelCancellationReason::CoordinatorFailure
+                        CancellationReason::CoordinatorFailure
                     };
                     if error.is_none() { error = Some(signal); }
-                    request_parallel_cancellation(&cancellation, cancellation_reason);
-                    commands.clear();
+                    cancellation.request(cancellation_reason);
+                    state.stop_dispatch();
                 }
                 if error.is_none()
                     && !interrupted
-                    && let Err(next) = state.dispatch(&commands)
+                    && let Err(next) = state.dispatch().map_err(parallel_assignment_error)
                 {
                     error = Some(next);
-                    request_parallel_cancellation(&cancellation, ParallelCancellationReason::CoordinatorFailure);
+                    cancellation.request(CancellationReason::CoordinatorFailure);
                 }
-                if state.pending.is_empty() && state.active.iter().all(Option::is_none) { commands.clear(); }
+                state.close_if_drained();
             },
             signal = &mut interrupt, if !interrupted => {
                 interrupted = true;
                 let cancellation_reason = if matches!(&signal, AcquisitionStreamError::Interrupted) {
-                    ParallelCancellationReason::CtrlC
+                    CancellationReason::Interrupted
                 } else {
-                    ParallelCancellationReason::CoordinatorFailure
+                    CancellationReason::CoordinatorFailure
                 };
                 if error.is_none() { error = Some(signal); }
-                request_parallel_cancellation(&cancellation, cancellation_reason);
-                commands.clear();
+                cancellation.request(cancellation_reason);
+                state.stop_dispatch();
             },
             _ = heartbeat.tick() => {
-                for (slot, active) in state.active.iter().enumerate() {
-                    if let Some(job) = active && contexts[slot].job.as_ref() == Some(job) {
-                        let context = &contexts[slot];
+                let mut heartbeat_failed = false;
+                for (worker, job) in state.active_jobs() {
+                    let context = &contexts[worker - 1];
+                    if context.job.as_ref() == Some(job) {
                         let event = context.event(AcquisitionWorkerEventKind::Provider(AcquisitionEvent::Heartbeat {
                             index: job.index, attempt: context.attempt,
                         }));
                         if let Err(next) = deliver_parallel_event(on_event, event) {
                             if error.is_none() { error = Some(next); }
-                            request_parallel_cancellation(&cancellation, ParallelCancellationReason::CoordinatorFailure);
-                            commands.clear();
+                            heartbeat_failed = true;
                             break;
                         }
                     }
                 }
+                if heartbeat_failed {
+                    cancellation.request(CancellationReason::CoordinatorFailure);
+                    state.stop_dispatch();
+                }
             },
             worker = futures.next(), if !futures.is_empty() => {
                 if let Some((worker, result)) = worker {
-                    state.retired[worker - 1] = true;
+                    let _ = state.retire(worker);
                     if let Err(next) = result {
                         if is_parallel_coordinator_cancellation(&next) {
                             continue;
@@ -1597,8 +1545,8 @@ async fn coordinate_parallel<D: ParallelDriver>(
                             Some(original) => AcquisitionStreamError::Provider(format!("{}; {}", original.into_message(), next.into_message())),
                             None => next,
                         });
-                        request_parallel_cancellation(&cancellation, ParallelCancellationReason::CoordinatorFailure);
-                        commands.clear();
+                        cancellation.request(CancellationReason::CoordinatorFailure);
+                        state.stop_dispatch();
                     }
                 }
             },
@@ -1607,12 +1555,7 @@ async fn coordinate_parallel<D: ParallelDriver>(
     if let Some(error) = error {
         return Err(error);
     }
-    let mut pending_indices = state
-        .pending
-        .iter()
-        .map(|job| job.index)
-        .collect::<Vec<_>>();
-    pending_indices.extend(state.active.iter().flatten().map(|job| job.index));
+    let mut pending_indices = state.unfinished().map(|job| job.index).collect::<Vec<_>>();
     pending_indices.sort_unstable();
     if !pending_indices.is_empty() {
         return Err(AcquisitionStreamError::WorkersExhausted { pending_indices });
@@ -1669,24 +1612,14 @@ impl AcquisitionRun {
             if self.interrupt.is_finished() {
                 return Err(signal_error((&mut self.interrupt).await));
             }
-            let (cancel, receiver) = watch::channel(None);
+            let cancel = PoolCancellation::default();
             let drivers = (0..workers)
                 .map(|_| {
-                    let mut receiver = receiver.clone();
+                    let mut listener = cancel.subscribe();
                     let interrupt = tokio::spawn(async move {
-                        let reason = loop {
-                            if let Some(reason) = *receiver.borrow() {
-                                break reason;
-                            }
-                            if receiver.changed().await.is_err() {
-                                return Err(std::io::Error::other(ParallelCancellation(
-                                    ParallelCancellationReason::CoordinatorFailure,
-                                )));
-                            }
-                        };
-                        match reason {
-                            ParallelCancellationReason::CtrlC => Ok(()),
-                            ParallelCancellationReason::CoordinatorFailure => {
+                        match listener.cancelled().await {
+                            CancellationReason::Interrupted => Ok(()),
+                            reason @ CancellationReason::CoordinatorFailure => {
                                 Err(std::io::Error::other(ParallelCancellation(reason)))
                             }
                         }
@@ -1882,10 +1815,10 @@ fn accepted_ctrl_c() -> AcquisitionStreamError {
     AcquisitionStreamError::Interrupted
 }
 
-fn parallel_cancellation_error(reason: ParallelCancellationReason) -> AcquisitionStreamError {
+fn parallel_cancellation_error(reason: CancellationReason) -> AcquisitionStreamError {
     match reason {
-        ParallelCancellationReason::CtrlC => accepted_ctrl_c(),
-        ParallelCancellationReason::CoordinatorFailure => {
+        CancellationReason::Interrupted => accepted_ctrl_c(),
+        CancellationReason::CoordinatorFailure => {
             AcquisitionStreamError::Provider(PARALLEL_COORDINATOR_CANCELLED.into())
         }
     }
@@ -1964,6 +1897,8 @@ fn finish_acquisition_run(
 pub struct AcquisitionRun {
     runtime: tokio::runtime::Runtime,
     interrupt: CtrlCListener,
+    /// Пока запуск жив, сигналы завершения передаются его координатору.
+    _termination: crate::acquisition_pool::TerminationScope,
     stopped: bool,
     workspace: PathBuf,
     owned_workspace: Option<TempWorkspace>,
@@ -2016,10 +1951,12 @@ impl AcquisitionRun {
             .map_err(|error| {
                 AcquisitionStreamError::Provider(format!("среда браузера: {error}"))
             })?;
-        let interrupt = runtime.spawn(tokio::signal::ctrl_c());
+        let (termination, signal) = crate::acquisition_pool::TerminationScope::enter();
+        let interrupt = runtime.spawn(signal);
         Ok(Self {
             runtime,
             interrupt,
+            _termination: termination,
             stopped: false,
             workspace,
             owned_workspace,
@@ -6113,7 +6050,7 @@ mod parallel_pool_tests {
 
     struct SyntheticDriver {
         mode: SyntheticMode,
-        cancellation: watch::Receiver<Option<ParallelCancellationReason>>,
+        cancellation: CancellationListener,
         gate: Option<Arc<Notify>>,
         wait_index: Option<usize>,
         cleanup: Arc<Mutex<Vec<&'static str>>>,
@@ -6148,9 +6085,7 @@ mod parallel_pool_tests {
                 tokio::select! {
                     biased;
                     _ = gate.notified() => {},
-                    _ = self.cancellation.changed() => {
-                        let reason = (*self.cancellation.borrow())
-                            .unwrap_or(ParallelCancellationReason::CoordinatorFailure);
+                    reason = self.cancellation.cancelled() => {
                         return Err(parallel_cancellation_error(reason));
                     },
                 }
@@ -6226,7 +6161,7 @@ mod parallel_pool_tests {
     }
     fn driver(
         mode: SyntheticMode,
-        cancellation: &watch::Sender<Option<ParallelCancellationReason>>,
+        cancellation: &PoolCancellation,
         cleanup: &Arc<Mutex<Vec<&'static str>>>,
     ) -> SyntheticDriver {
         SyntheticDriver {
@@ -6333,12 +6268,10 @@ mod parallel_pool_tests {
     #[test]
     fn assignment_rejects_wrong_token_and_duplicate_completion() {
         let job = jobs(1).pop_front().unwrap();
-        let mut assignments = ParallelAssignments {
-            pending: VecDeque::new(),
-            active: vec![Some(job.clone())],
-            ready: vec![false],
-            retired: vec![false],
-        };
+        let (command, _received) = mpsc::unbounded_channel();
+        let mut assignments = ParallelAssignments::new([job.clone()], vec![command]);
+        assignments.mark_ready(1).unwrap();
+        assignments.dispatch().unwrap();
         let context = ParallelWorkerContext {
             worker_id: 1,
             job: Some(job),
@@ -6360,12 +6293,15 @@ mod parallel_pool_tests {
                 "outside-worker" => stale.worker_id = 2,
                 _ => unreachable!(),
             }
-            assert!(assignments.accept(&stale).is_err(), "{invalid}");
-            assert!(assignments.active[0].is_some());
+            assert!(
+                accept_parallel_result(&mut assignments, &stale).is_err(),
+                "{invalid}"
+            );
+            assert!(assignments.active(1).is_some());
         }
         let current = context.event(AcquisitionWorkerEventKind::Assigned);
-        assert!(assignments.accept(&current).is_ok());
-        assert!(assignments.accept(&current).is_err());
+        assert!(accept_parallel_result(&mut assignments, &current).is_ok());
+        assert!(accept_parallel_result(&mut assignments, &current).is_err());
     }
 
     #[tokio::test]
@@ -6378,7 +6314,7 @@ mod parallel_pool_tests {
             (SyntheticMode::Terminal, 1),
             (SyntheticMode::PostCheckpointInterrupt, 1),
         ] {
-            let (cancel, _) = watch::channel(None);
+            let cancel = PoolCancellation::default();
             let cleanup = Arc::new(Mutex::new(Vec::new()));
             let mut completed = Vec::new();
             let mut ended = Vec::new();
@@ -6472,7 +6408,7 @@ mod parallel_pool_tests {
 
     #[tokio::test]
     async fn pool_checkpoints_out_of_order_before_slow_assignment_finishes() {
-        let (cancel, _) = watch::channel(None);
+        let cancel = PoolCancellation::default();
         let cleanup = Arc::new(Mutex::new(Vec::new()));
         let gate = Arc::new(Notify::new());
         let drivers = (0..2)
@@ -6518,7 +6454,7 @@ mod parallel_pool_tests {
 
     #[tokio::test]
     async fn rotated_sessions_keep_worker_local_browser_context() {
-        let (cancel, _) = watch::channel(None);
+        let cancel = PoolCancellation::default();
         let cleanup = Arc::new(Mutex::new(Vec::new()));
         let drivers = vec![
             driver(SyntheticMode::TerminalSessionFault, &cancel, &cleanup),
@@ -6580,7 +6516,7 @@ mod parallel_pool_tests {
 
     #[tokio::test]
     async fn sick_worker_requeues_without_terminal_attempt_and_healthy_neighbor_finishes() {
-        let (cancel, _) = watch::channel(None);
+        let cancel = PoolCancellation::default();
         let cleanup = Arc::new(Mutex::new(Vec::new()));
         let drivers = vec![
             driver(SyntheticMode::Fault, &cancel, &cleanup),
@@ -6621,7 +6557,7 @@ mod parallel_pool_tests {
             "browser_worker_session_fault: постоянный отказ запуска",
             "browser_worker_cleanup_failed: ошибка очистки",
         ] {
-            let (cancel, _) = watch::channel(None);
+            let cancel = PoolCancellation::default();
             let cleanup = Arc::new(Mutex::new(Vec::new()));
             let mut assigned = 0;
             let mut deferred = 0;
@@ -6676,7 +6612,7 @@ mod parallel_pool_tests {
 
     #[tokio::test]
     async fn exhaustion_returns_exact_frontier_without_synthetic_outcomes() {
-        let (cancel, _) = watch::channel(None);
+        let cancel = PoolCancellation::default();
         let cleanup = Arc::new(Mutex::new(Vec::new()));
         let drivers = vec![
             driver(SyntheticMode::Fault, &cancel, &cleanup),
@@ -6722,7 +6658,7 @@ mod parallel_pool_tests {
 
     #[tokio::test]
     async fn healthy_terminal_progress_resets_recovery_budget() {
-        let (cancel, _) = watch::channel(None);
+        let cancel = PoolCancellation::default();
         let cleanup = Arc::new(Mutex::new(Vec::new()));
         let drivers = vec![
             driver(SyntheticMode::AlternatingHealthy, &cancel, &cleanup),
@@ -6752,7 +6688,7 @@ mod parallel_pool_tests {
 
     #[tokio::test]
     async fn cancellation_after_checkpoint_preserves_completed_and_defers_running_job() {
-        let (cancel, _) = watch::channel(None);
+        let cancel = PoolCancellation::default();
         let cleanup = Arc::new(Mutex::new(Vec::new()));
         let gate = Arc::new(Notify::new());
         let drivers = (0..2)
@@ -6807,7 +6743,7 @@ mod parallel_pool_tests {
     #[tokio::test]
     async fn callback_error_and_worker_panic_both_wait_for_all_cleanup() {
         for mode in [SyntheticMode::Terminal, SyntheticMode::Panic] {
-            let (cancel, _) = watch::channel(None);
+            let cancel = PoolCancellation::default();
             let cleanup = Arc::new(Mutex::new(Vec::new()));
             let drivers = vec![
                 driver(mode, &cancel, &cleanup),
@@ -6855,7 +6791,7 @@ mod parallel_pool_tests {
 
     #[tokio::test]
     async fn coordinator_failure_cancellation_is_deferred_with_its_real_reason() {
-        let (cancel, _) = watch::channel(None);
+        let cancel = PoolCancellation::default();
         let cleanup = Arc::new(Mutex::new(Vec::new()));
         let gate = Arc::new(Notify::new());
         let mut waiting = driver(SyntheticMode::Terminal, &cancel, &cleanup);
@@ -6891,16 +6827,16 @@ mod parallel_pool_tests {
         assert!(deferred.contains(&(0, "coordinator_failure".into())));
         assert!(!deferred.iter().any(|(_, reason)| reason == "interrupted"));
         assert!(matches!(
-            parallel_cancellation_error(ParallelCancellationReason::CoordinatorFailure),
+            parallel_cancellation_error(CancellationReason::CoordinatorFailure),
             AcquisitionStreamError::Provider(message) if message == PARALLEL_COORDINATOR_CANCELLED
         ));
         assert!(matches!(
-            parallel_cancellation_error(ParallelCancellationReason::CtrlC),
+            parallel_cancellation_error(CancellationReason::Interrupted),
             AcquisitionStreamError::Interrupted
         ));
         assert!(matches!(
             signal_error(Ok(Err(std::io::Error::other(ParallelCancellation(
-                ParallelCancellationReason::CoordinatorFailure,
+                CancellationReason::CoordinatorFailure,
             ))))),
             AcquisitionStreamError::Provider(message) if message == PARALLEL_COORDINATOR_CANCELLED
         ));
@@ -6921,7 +6857,7 @@ mod parallel_pool_tests {
 
     #[tokio::test]
     async fn cleanup_failure_is_fatal_after_accepted_terminal_outcome() {
-        let (cancel, _) = watch::channel(None);
+        let cancel = PoolCancellation::default();
         let cleanup = Arc::new(Mutex::new(Vec::new()));
         let drivers = vec![
             driver(SyntheticMode::CleanupFailure, &cancel, &cleanup),
@@ -6949,7 +6885,7 @@ mod parallel_pool_tests {
     }
     #[tokio::test]
     async fn repeated_terminal_timeouts_retire_workers_after_durable_results() {
-        let (cancel, _) = watch::channel(None);
+        let cancel = PoolCancellation::default();
         let cleanup = Arc::new(Mutex::new(Vec::new()));
         let drivers = vec![
             driver(SyntheticMode::TerminalSessionFault, &cancel, &cleanup),
@@ -6978,8 +6914,8 @@ mod parallel_pool_tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(completed.len(), usize::from(PARALLEL_RECOVERY_BUDGET) * 2);
-        assert_eq!(retired, vec![PARALLEL_RECOVERY_BUDGET; 2]);
+        assert_eq!(completed.len(), PARALLEL_RECOVERY_BUDGET as usize * 2);
+        assert_eq!(retired, vec![PARALLEL_RECOVERY_BUDGET as u8; 2]);
         let AcquisitionStreamError::WorkersExhausted { pending_indices } = error else {
             panic!("expected pool exhaustion")
         };
@@ -7006,7 +6942,7 @@ mod parallel_pool_tests {
 
     #[tokio::test]
     async fn failed_stop_prevents_refill_while_healthy_ready_and_join_can_race() {
-        let (cancel, _) = watch::channel(None);
+        let cancel = PoolCancellation::default();
         let cleanup = Arc::new(Mutex::new(Vec::new()));
         let drivers = vec![
             driver(SyntheticMode::FaultCleanupFailure, &cancel, &cleanup),

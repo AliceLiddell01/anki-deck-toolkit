@@ -39,9 +39,9 @@ use crate::pitch_accent::{
     PitchAccentDarkThemeProof, PitchAccentDomainMetadata, PitchAccentEvidence, PitchAccentProvider,
     PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm,
     PitchAccentVariantEvidence, PitchAccentVariantSelection, PitchAccentVariantSelectionBasis,
-    jpdb_readings_equivalent, parse_jpdb_vocabulary_route, pitch_accent_capture_rect_for,
-    pitch_accent_variant_selection_score, relative_luminance as pitch_accent_relative_luminance,
-    select_pitch_accent_variant,
+    jpdb_readings_equivalent, parse_jpdb_used_in_route, parse_jpdb_vocabulary_route,
+    pitch_accent_capture_rect_for, pitch_accent_variant_selection_score,
+    relative_luminance as pitch_accent_relative_luminance, select_pitch_accent_variant,
     validate_capture_background as validate_evidence_capture_background,
     validate_capture_geometry as validate_evidence_capture_geometry,
     validate_capture_margins as validate_evidence_capture_margins,
@@ -1157,22 +1157,10 @@ async fn acquire_one_in_session(
             Ok(snapshot) => snapshot,
             Err(error) => return failed(error),
         };
-        if !same_route_identity(&parse_detail_route(&snapshot.url), &candidate_route)
-            || snapshot.vocabulary_id != candidate.vocabulary_id
-            || !route_matches_forms(&candidate_route, &unique_forms(&snapshot.forms))
-            || !detail_matches_query(&snapshot, query)
+        if let Err(error) =
+            validate_navigated_detail_identity(&candidate, &candidate_route, &snapshot, query)
         {
-            return failed(JpdbPitchFailure::DetailIdentityMismatch {
-                stage: JpdbPitchStage::DetailVerification,
-                expected_surface: query.surface.clone(),
-                expected_reading: query.reading.clone(),
-                vocabulary_id: Some(candidate.vocabulary_id),
-                observed_surface_forms: unique_forms(&snapshot.forms)
-                    .into_iter()
-                    .map(|form| form.surface)
-                    .collect(),
-                observed_readings: unique_readings(&snapshot.forms),
-            });
+            return failed(error);
         }
         (snapshot, detail_epoch)
     } else if let Some(redirected_route) = parse_detail_route(&page_url) {
@@ -1494,6 +1482,9 @@ struct RawVocabularyCandidate {
     forms: Vec<JpdbVocabularyForm>,
     part_of_speech: Vec<String>,
     meanings: Vec<String>,
+    /// Ссылки `Used in` строки: свидетельство ID и написания, но не маршрут карточки.
+    #[serde(default)]
+    used_in_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1504,6 +1495,12 @@ struct RawSearchSnapshot {
     result_count: usize,
     truncated: bool,
     candidates: Vec<RawVocabularyCandidate>,
+    /// Все `link[rel=canonical]` документа поиска в порядке DOM.
+    #[serde(default)]
+    canonical_urls: Vec<String>,
+    /// JPDB показал единственную запись в режиме подробностей (`.results.details`).
+    #[serde(default)]
+    details_view: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1760,7 +1757,83 @@ fn decode_search_snapshot(raw: Value) -> Result<RawSearchSnapshot, JpdbPitchFail
         });
     }
     validate_search_inventory(&snapshot)?;
+    let mut snapshot = snapshot;
+    resolve_single_entry_canonical_route(&mut snapshot);
     Ok(snapshot)
+}
+
+/// Подставляет canonical-маршрут страницы в единственную строку без ссылки на карточку.
+///
+/// Одиночная запись JPDB без альтернативных написаний содержит в строке только
+/// ссылку `Used in`, а маршрут самой карточки есть лишь в `link[rel=canonical]`.
+/// Canonical принимается, только если все свидетельства одного снимка DOM
+/// указывают на одну запись: режим подробностей с ровно одной строкой и одним
+/// результатом, ровно один допустимый canonical-маршрут, каждая ссылка `Used in`
+/// строки с тем же ID и написанием и наблюдённая в заголовке строки пара
+/// написания и чтения маршрута. Иначе строка остаётся без маршрута, и
+/// `select_candidates` отказывает, как прежде.
+fn resolve_single_entry_canonical_route(snapshot: &mut RawSearchSnapshot) {
+    let Some(route) = single_entry_canonical_route(snapshot) else {
+        return;
+    };
+    tracing::debug!(
+        stage = ?JpdbPitchStage::SearchResolution,
+        route_source = "canonical",
+        vocabulary_id = route.0,
+        "Маршрут одиночной записи JPDB подтверждён canonical-ссылкой страницы"
+    );
+    snapshot.candidates[0].detail_url = Some(route.1);
+}
+
+/// Непустой текст только из хираганы и катаканы, включая `ー` и метки дакутэна;
+/// те же диапазоны, что у `isKana` в скриптах страниц JPDB.
+fn is_kana_text(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|character| matches!(character, '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}'))
+}
+
+fn single_entry_canonical_route(snapshot: &RawSearchSnapshot) -> Option<(u64, String)> {
+    let [row] = snapshot.candidates.as_slice() else {
+        return None;
+    };
+    if !snapshot.details_view
+        || snapshot.result_count != 1
+        || snapshot.no_results_found
+        || snapshot.truncated
+        || row.detail_url.is_some()
+    {
+        return None;
+    }
+    let [canonical_url] = snapshot.canonical_urls.as_slice() else {
+        return None;
+    };
+    let route = parse_detail_route(canonical_url)?;
+    if row.used_in_urls.is_empty()
+        || !row.used_in_urls.iter().all(|url| {
+            parse_jpdb_used_in_route(url).is_ok_and(|used_in| {
+                used_in.vocabulary_id == route.vocabulary_id && used_in.surface == route.surface
+            })
+        })
+    {
+        return None;
+    }
+    // Чтение маршрута должно быть наблюдено в строке, а не перенесено из canonical.
+    // Маршрут без чтения JPDB даёт записи, написанной каной: тогда чтение — само написание.
+    let expected_reading = match route.reading.as_deref() {
+        Some(reading) => reading,
+        None if is_kana_text(&route.surface) => route.surface.as_str(),
+        None => return None,
+    };
+    if !row
+        .forms
+        .iter()
+        .any(|form| form.surface == route.surface && form.reading == expected_reading)
+    {
+        return None;
+    }
+    Some((route.vocabulary_id, canonical_url.clone()))
 }
 
 async fn wait_for_search_candidates(
@@ -2043,6 +2116,43 @@ fn detail_matches_query(detail: &DetailSnapshot, query: &JpdbPitchQuery) -> bool
         && forms_match_query(&detail.forms, query)
 }
 
+/// Сверяет открытую карточку с кандидатом поиска, по маршруту которого был переход.
+fn validate_navigated_detail_identity(
+    candidate: &JpdbVocabularyCandidate,
+    candidate_route: &crate::pitch_accent::JpdbVocabularyRoute,
+    detail: &DetailSnapshot,
+    query: &JpdbPitchQuery,
+) -> Result<(), JpdbPitchFailure> {
+    validate_detail_matches_route(candidate_route, candidate.vocabulary_id, detail, query)
+}
+
+/// Общая сверка открытой карточки с маршрутом и ожидаемым ID для обоих путей перехода.
+fn validate_detail_matches_route(
+    route: &crate::pitch_accent::JpdbVocabularyRoute,
+    vocabulary_id: u64,
+    detail: &DetailSnapshot,
+    query: &JpdbPitchQuery,
+) -> Result<(), JpdbPitchFailure> {
+    if !same_route_identity(&parse_detail_route(&detail.url), route)
+        || detail.vocabulary_id != vocabulary_id
+        || !route_matches_forms(route, &unique_forms(&detail.forms))
+        || !detail_matches_query(detail, query)
+    {
+        return Err(JpdbPitchFailure::DetailIdentityMismatch {
+            stage: JpdbPitchStage::DetailVerification,
+            expected_surface: query.surface.clone(),
+            expected_reading: query.reading.clone(),
+            vocabulary_id: Some(vocabulary_id),
+            observed_surface_forms: unique_forms(&detail.forms)
+                .into_iter()
+                .map(|form| form.surface)
+                .collect(),
+            observed_readings: unique_readings(&detail.forms),
+        });
+    }
+    Ok(())
+}
+
 fn validate_redirected_detail_identity(
     route: &crate::pitch_accent::JpdbVocabularyRoute,
     detail: &DetailSnapshot,
@@ -2063,24 +2173,7 @@ fn validate_redirected_detail_identity(
                     .into(),
         });
     }
-    if !same_route_identity(&parse_detail_route(&detail.url), route)
-        || detail.vocabulary_id != route.vocabulary_id
-        || !route_matches_forms(route, &unique_forms(&detail.forms))
-        || !detail_matches_query(detail, query)
-    {
-        return Err(JpdbPitchFailure::DetailIdentityMismatch {
-            stage: JpdbPitchStage::DetailVerification,
-            expected_surface: query.surface.clone(),
-            expected_reading: query.reading.clone(),
-            vocabulary_id: Some(route.vocabulary_id),
-            observed_surface_forms: unique_forms(&detail.forms)
-                .into_iter()
-                .map(|form| form.surface)
-                .collect(),
-            observed_readings: unique_readings(&detail.forms),
-        });
-    }
-    Ok(())
+    validate_detail_matches_route(route, route.vocabulary_id, detail, query)
 }
 
 fn select_explicit_candidate(
@@ -3051,10 +3144,22 @@ const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
       .map(node => (node.innerText || node.textContent || '').trim()).filter(Boolean);
     const meanings = [...row.querySelectorAll('.subsection-meanings .description')]
       .map(node => (node.innerText || node.textContent || '').replace(/\s+/gu, ' ').trim()).filter(Boolean);
-    if (!forms.length || !partOfSpeech.length || !meanings.length || !detailRoute) {
-      return { error: 'Строка JPDB не содержит подтверждённые формы, часть речи, значения и фактическую ссылку на словарную запись', result_count: resultCount, vocabulary_row_count: vocabularyRows.length, candidate_count: candidates.length, no_results_found: noResultsFound, truncated: resultCount > 128 || vocabularyRows.length > 128, invalid_row_index: candidates.length, form_count: forms.length, has_forms: forms.length > 0, part_of_speech_count: partOfSpeech.length, has_part_of_speech: partOfSpeech.length > 0, meaning_count: meanings.length, has_meanings: meanings.length > 0, has_detail_url: !!detailRoute, has_detail_route: !!detailRoute, detail_route_parse_succeeded: !!route };
+    if (!forms.length || !partOfSpeech.length || !meanings.length) {
+      return { error: 'Строка JPDB не содержит подтверждённые формы, часть речи и значения', result_count: resultCount, vocabulary_row_count: vocabularyRows.length, candidate_count: candidates.length, no_results_found: noResultsFound, truncated: resultCount > 128 || vocabularyRows.length > 128, invalid_row_index: candidates.length, form_count: forms.length, has_forms: forms.length > 0, part_of_speech_count: partOfSpeech.length, has_part_of_speech: partOfSpeech.length > 0, meaning_count: meanings.length, has_meanings: meanings.length > 0, has_detail_url: !!detailRoute, has_detail_route: !!detailRoute, detail_route_parse_succeeded: !!route };
     }
-    candidates.push({ detail_url: detailRoute.href, forms, part_of_speech: partOfSpeech, meanings });
+    // Ссылки `Used in` передаются как есть: допустимость и смысл проверяет Rust.
+    // Свидетельством считается и ссылка с подписью `Used in`, и ссылка с путём `/used-in`:
+    // повреждённый адрес не отбрасывается, а доходит до Rust и отменяет вывод canonical.
+    // Ссылка с подписью `Used in` без атрибута `href` — тоже повреждённое
+    // свидетельство: она передаётся пустым адресом, а не исчезает из выборки.
+    const usedInUrls = [...row.querySelectorAll('a.view-conjugations-link')]
+      .filter(link => {
+        if (/^\s*Used in\b/iu.test(link.textContent || '')) return true;
+        if (!link.hasAttribute('href')) return false;
+        try { return /\/used-in$/u.test(new URL(link.href, location.href).pathname); }
+        catch (_) { return false; }
+      }).map(link => link.hasAttribute('href') ? link.href : '');
+    candidates.push({ detail_url: detailRoute ? detailRoute.href : null, forms, part_of_speech: partOfSpeech, meanings, used_in_urls: usedInUrls });
   }
   return {
     ready: true,
@@ -3063,6 +3168,8 @@ const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
     vocabulary_row_count: vocabularyRows.length,
     truncated: resultCount > 128 || vocabularyRows.length > 128,
     candidates,
+    canonical_urls: [...document.querySelectorAll('link[rel~="canonical"][href]')].map(link => link.href),
+    details_view: results.classList.contains('details'),
   };
 }"#;
 const DETAIL_SNAPSHOT_SCRIPT: &str = r#"() => {
@@ -3956,6 +4063,7 @@ mod tests {
             forms,
             part_of_speech: part_of_speech.iter().map(|value| (*value).into()).collect(),
             meanings: meanings.iter().map(|value| (*value).into()).collect(),
+            used_in_urls: Vec::new(),
         }
     }
 
@@ -4386,6 +4494,492 @@ mod tests {
         );
     }
 
+    /// Снимок поиска, который `SEARCH_CANDIDATES_SCRIPT` отдаёт для одиночной
+    /// записи JPDB в режиме подробностей: строка без ссылки на карточку.
+    fn single_entry_search(
+        row_form: (&str, &str),
+        used_in_urls: &[&str],
+        canonical_urls: &[&str],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "ready": true,
+            "no_results_found": false,
+            "result_count": 1,
+            "vocabulary_row_count": 1,
+            "truncated": false,
+            "details_view": true,
+            "canonical_urls": canonical_urls,
+            "candidates": [{
+                "detail_url": null,
+                "forms": [{ "surface": row_form.0, "reading": row_form.1 }],
+                "part_of_speech": ["Noun"],
+                "meanings": ["meaning"],
+                "used_in_urls": used_in_urls,
+            }],
+        })
+    }
+
+    fn detail_snapshot(
+        url: &str,
+        vocabulary_id: u64,
+        forms: Vec<JpdbVocabularyForm>,
+    ) -> DetailSnapshot {
+        DetailSnapshot {
+            url: url.into(),
+            vocabulary_id,
+            forms,
+            part_of_speech: vec!["Noun".into()],
+            section_inventory: vec!["Meanings".into(), "Pitch accent".into()],
+            base_page_contract_valid: true,
+            pitch_section_present: true,
+            pitch_label: Some("Pitch accent".into()),
+            pitch_marker_count: 1,
+            graph_count: 1,
+        }
+    }
+
+    /// Повторяет проверки `acquire_one_in_session` между поиском и переходом.
+    fn resolve_single(
+        raw: serde_json::Value,
+        query: &JpdbPitchQuery,
+    ) -> Result<Vec<JpdbVocabularyCandidate>, JpdbPitchFailure> {
+        let snapshot = decode_search_snapshot(raw)?;
+        let candidates = select_candidates(&snapshot.candidates, query)?;
+        for candidate in &candidates {
+            let route = parse_detail_route(&candidate.detail_url).unwrap();
+            assert_eq!(route.vocabulary_id, candidate.vocabulary_id);
+            assert!(route_matches_resolved_forms(
+                &route,
+                &candidate.resolved_forms
+            ));
+        }
+        Ok(candidates)
+    }
+
+    #[test]
+    fn single_entry_without_row_link_resolves_only_through_corroborated_canonical() {
+        for (id, surface, reading, canonical_reading) in [
+            (1_192_150, "家族", "かぞく", Some("かぞく")),
+            (1_544_590, "余裕", "よゆう", Some("よゆう")),
+            (1_421_520, "地雷", "じらい", Some("じらい")),
+            // Запись каной: canonical JPDB не содержит сегмента чтения.
+            (1_061_520, "シャツ", "シャツ", None),
+        ] {
+            let canonical = match canonical_reading {
+                Some(reading) => {
+                    format!("https://jpdb.io/vocabulary/{id}/{surface}/{reading}?lang=english")
+                }
+                None => format!("https://jpdb.io/vocabulary/{id}/{surface}?lang=english"),
+            };
+            let used_in = format!("https://jpdb.io/vocabulary/{id}/{surface}/used-in");
+            let raw = single_entry_search((surface, reading), &[&used_in], &[&canonical]);
+
+            for query in [
+                JpdbPitchQuery::new(surface, None),
+                JpdbPitchQuery::new(surface, Some(reading.into())),
+            ] {
+                let candidates = resolve_single(raw.clone(), &query).unwrap();
+                assert_eq!(candidates.len(), 1, "{surface}");
+                let candidate = &candidates[0];
+                assert_eq!(candidate.vocabulary_id, id);
+                assert_eq!(candidate.detail_url, canonical);
+                assert_eq!(
+                    candidate.resolved_forms,
+                    vec![PitchAccentResolvedForm {
+                        surface: surface.into(),
+                        reading: reading.into(),
+                    }],
+                    "canonical не добавляет форм, которых нет в строке"
+                );
+
+                // Переход по canonical-маршруту открывает ту же карточку.
+                let route = parse_detail_route(&candidate.detail_url).unwrap();
+                let detail = detail_snapshot(&canonical, id, vec![form(surface, reading)]);
+                assert!(
+                    validate_navigated_detail_identity(candidate, &route, &detail, &query).is_ok()
+                );
+
+                let selection = JpdbPitchSelection::new(id, canonical.clone()).unwrap();
+                let selection_route = selection.validate().unwrap();
+                assert_eq!(
+                    select_explicit_candidate(&candidates, &selection, &selection_route).unwrap(),
+                    *candidate
+                );
+                let other = JpdbPitchSelection::new(
+                    id + 1,
+                    format!("https://jpdb.io/vocabulary/{}/{surface}", id + 1),
+                )
+                .unwrap();
+                let other_route = other.validate().unwrap();
+                assert!(matches!(
+                    select_explicit_candidate(&candidates, &other, &other_route),
+                    Err(JpdbPitchFailure::ExplicitSelectionMismatch { .. })
+                ));
+            }
+
+            // Canonical подтверждает запись, но не чужое чтение или написание запроса.
+            for query in [
+                JpdbPitchQuery::new(surface, Some("べつのよみ".into())),
+                JpdbPitchQuery::new("別語", None),
+            ] {
+                assert_eq!(resolve_single(raw.clone(), &query).unwrap(), Vec::new());
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_fallback_refuses_without_complete_consistent_identity_evidence() {
+        let used_in = "https://jpdb.io/vocabulary/1192150/家族/used-in";
+        let canonical = "https://jpdb.io/vocabulary/1192150/家族/かぞく?lang=english";
+        let row = ("家族", "かぞく");
+        let query = JpdbPitchQuery::new("家族", None);
+        assert_eq!(
+            resolve_single(single_entry_search(row, &[used_in], &[canonical]), &query)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut cases: Vec<(&str, serde_json::Value)> = vec![
+            ("нет canonical", single_entry_search(row, &[used_in], &[])),
+            (
+                "два canonical",
+                single_entry_search(row, &[used_in], &[canonical, canonical]),
+            ),
+            (
+                "нет ссылки Used in",
+                single_entry_search(row, &[], &[canonical]),
+            ),
+            (
+                "чтение canonical не наблюдено в строке",
+                single_entry_search(("家族", "いえぞく"), &[used_in], &[canonical]),
+            ),
+            (
+                "написание canonical не наблюдено в строке",
+                single_entry_search(("家", "いえ"), &[used_in], &[canonical]),
+            ),
+            (
+                "canonical без чтения для записи с кандзи",
+                single_entry_search(
+                    row,
+                    &[used_in],
+                    &["https://jpdb.io/vocabulary/1192150/家族?lang=english"],
+                ),
+            ),
+            (
+                "ID canonical не совпадает со строкой",
+                single_entry_search(
+                    row,
+                    &[used_in],
+                    &["https://jpdb.io/vocabulary/1192151/家族/かぞく"],
+                ),
+            ),
+            (
+                "написание canonical не совпадает с Used in",
+                single_entry_search(
+                    row,
+                    &["https://jpdb.io/vocabulary/1192150/家/used-in"],
+                    &[canonical],
+                ),
+            ),
+            (
+                "одна из ссылок Used in противоречит canonical",
+                single_entry_search(
+                    row,
+                    &[used_in, "https://jpdb.io/vocabulary/1405770/族/used-in"],
+                    &[canonical],
+                ),
+            ),
+            (
+                "Used in на другом origin",
+                single_entry_search(
+                    row,
+                    &["https://evil.example/vocabulary/1192150/家族/used-in"],
+                    &[canonical],
+                ),
+            ),
+        ];
+        for bad in [
+            "https://evil.example/vocabulary/1192150/家族/かぞく",
+            "https://jpdb.io.evil.example/vocabulary/1192150/家族/かぞく",
+            "http://jpdb.io/vocabulary/1192150/家族/かぞく",
+            "https://jpdb.io/vocabulary/1192150/家族/used-in",
+            "https://jpdb.io/vocabulary/1192150",
+            "https://jpdb.io/search?q=家族&lang=english",
+            "https://jpdb.io/kanji/家",
+            "/vocabulary/1192150/家族/かぞく",
+            "",
+        ] {
+            cases.push((
+                "недопустимый canonical",
+                single_entry_search(row, &[used_in], &[bad]),
+            ));
+        }
+        let mut not_details = single_entry_search(row, &[used_in], &[canonical]);
+        not_details["details_view"] = false.into();
+        cases.push(("не режим подробностей", not_details));
+        let mut more_results = single_entry_search(row, &[used_in], &[canonical]);
+        more_results["result_count"] = 2.into();
+        cases.push(("результатов больше одной строки", more_results));
+        let mut second_row = single_entry_search(row, &[used_in], &[canonical]);
+        let copy = second_row["candidates"][0].clone();
+        second_row["candidates"].as_array_mut().unwrap().push(copy);
+        second_row["result_count"] = 2.into();
+        cases.push(("несколько строк", second_row));
+
+        for (name, raw) in cases {
+            assert!(
+                matches!(
+                    resolve_single(raw, &query),
+                    Err(JpdbPitchFailure::PageContract {
+                        stage: JpdbPitchStage::SearchResolution,
+                        ..
+                    })
+                ),
+                "canonical не должен подтверждать запись: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_without_reading_is_accepted_only_for_kana_surfaces() {
+        let query_for = |surface: &str| JpdbPitchQuery::new(surface, None);
+        for (id, surface) in [
+            (1_061_520, "シャツ"),
+            (2_008_730, "それにしても"),
+            (1_000_001, "ゔぁー"),
+        ] {
+            let raw = single_entry_search(
+                (surface, surface),
+                &[&format!(
+                    "https://jpdb.io/vocabulary/{id}/{surface}/used-in"
+                )],
+                &[&format!(
+                    "https://jpdb.io/vocabulary/{id}/{surface}?lang=english"
+                )],
+            );
+            assert_eq!(
+                resolve_single(raw, &query_for(surface)).unwrap().len(),
+                1,
+                "{surface}"
+            );
+        }
+        // Чтение, совпавшее с написанием, не делает запись с кандзи или латиницей записью каной:
+        // например, если `<rt>` повторяет основу.
+        for (id, surface) in [
+            (1_192_150, "家族"),
+            (1_000_002, "お茶"),
+            (1_000_003, "Tシャツ"),
+            (1_000_004, "シャツ1"),
+        ] {
+            let raw = single_entry_search(
+                (surface, surface),
+                &[&format!(
+                    "https://jpdb.io/vocabulary/{id}/{surface}/used-in"
+                )],
+                &[&format!(
+                    "https://jpdb.io/vocabulary/{id}/{surface}?lang=english"
+                )],
+            );
+            assert!(
+                matches!(
+                    resolve_single(raw, &query_for(surface)),
+                    Err(JpdbPitchFailure::PageContract { .. })
+                ),
+                "canonical без чтения не подтверждает запись не каной: {surface}"
+            );
+        }
+    }
+
+    #[test]
+    fn kana_text_matches_the_page_script_ranges() {
+        for text in ["かな", "カナ", "ー", "ゔ", "\u{3099}", "ヿ"] {
+            assert!(is_kana_text(text), "{text}");
+        }
+        for text in ["", "家", "お茶", "Tシャツ", "ｶﾅ", "かな ", "々"] {
+            assert!(!is_kana_text(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn row_detail_link_keeps_priority_over_canonical() {
+        let row_link = "https://jpdb.io/vocabulary/1358280/食べる/たべる?lang=english#a";
+        for canonical in [
+            "https://jpdb.io/vocabulary/1358280/食べる/たべる?lang=english",
+            "https://jpdb.io/vocabulary/999/別語/べつご",
+        ] {
+            let raw = serde_json::json!({
+                "ready": true, "no_results_found": false, "result_count": 1,
+                "truncated": false, "details_view": true, "canonical_urls": [canonical],
+                "candidates": [{
+                    "detail_url": row_link,
+                    "forms": [
+                        { "surface": "食べる", "reading": "たべる" },
+                        { "surface": "喰べる", "reading": "たべる" },
+                    ],
+                    "part_of_speech": ["Ichidan verb", "Transitive verb"],
+                    "meanings": ["to eat"],
+                    "used_in_urls": ["https://jpdb.io/vocabulary/1358280/食べる/used-in"],
+                }],
+            });
+            let candidates = resolve_single(raw, &JpdbPitchQuery::new("食べる", None)).unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].vocabulary_id, 1_358_280);
+            assert_eq!(candidates[0].detail_url, row_link);
+        }
+    }
+
+    #[test]
+    fn single_entry_canonical_is_rejected_when_any_used_in_link_is_invalid() {
+        for extra in [
+            "https://jpdb.io/vocabulary/1192150/家族/used-in/",
+            "http://[",
+            "https://jpdb.io/vocabulary/999/別語/used-in",
+            "",
+        ] {
+            let raw = serde_json::json!({
+                "ready": true, "no_results_found": false, "result_count": 1,
+                "truncated": false, "details_view": true,
+                "canonical_urls": ["https://jpdb.io/vocabulary/1192150/家族/かぞく"],
+                "candidates": [{
+                    "detail_url": null,
+                    "forms": [{ "surface": "家族", "reading": "かぞく" }],
+                    "part_of_speech": ["Noun"],
+                    "meanings": ["family"],
+                    "used_in_urls": ["https://jpdb.io/vocabulary/1192150/家族/used-in", extra],
+                }],
+            });
+            assert!(resolve_single(raw, &JpdbPitchQuery::new("家族", None)).is_err());
+        }
+    }
+
+    #[test]
+    fn ambiguous_search_is_never_narrowed_by_canonical() {
+        let row = |id: u64, surface: &str, reading: &str| {
+            serde_json::json!({
+                "detail_url": format!("https://jpdb.io/vocabulary/{id}/{surface}/{reading}?lang=english#a"),
+                "forms": [{ "surface": surface, "reading": reading }],
+                "part_of_speech": ["Noun"],
+                "meanings": ["meaning"],
+                "used_in_urls": [format!("https://jpdb.io/vocabulary/{id}/{surface}/used-in")],
+            })
+        };
+        // Одинаковое написание, разные чтения и ID: canonical одного из них не выбирает его.
+        for canonical in [
+            Vec::<String>::new(),
+            vec!["https://jpdb.io/vocabulary/1580210/上手/じょうず".into()],
+        ] {
+            let raw = serde_json::json!({
+                "ready": true, "no_results_found": false, "result_count": 2,
+                "truncated": false, "details_view": false, "canonical_urls": canonical,
+                "candidates": [row(1_580_210, "上手", "じょうず"), row(1_580_230, "上手", "うわて")],
+            });
+            let candidates =
+                resolve_single(raw.clone(), &JpdbPitchQuery::new("上手", None)).unwrap();
+            assert_eq!(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.vocabulary_id)
+                    .collect::<Vec<_>>(),
+                vec![1_580_210, 1_580_230]
+            );
+            let narrowed =
+                resolve_single(raw, &JpdbPitchQuery::new("上手", Some("うわて".into()))).unwrap();
+            assert_eq!(narrowed.len(), 1);
+            assert_eq!(narrowed[0].vocabulary_id, 1_580_230);
+        }
+
+        // Неоднозначная выдача с одной строкой без ссылки отказывает целиком.
+        let raw = serde_json::json!({
+            "ready": true, "no_results_found": false, "result_count": 2,
+            "truncated": false, "details_view": false,
+            "canonical_urls": ["https://jpdb.io/vocabulary/1589150/神/かみ"],
+            "candidates": [
+                row(1_589_150, "神", "かみ"),
+                {
+                    "detail_url": null,
+                    "forms": [{ "surface": "紙", "reading": "かみ" }],
+                    "part_of_speech": ["Noun"],
+                    "meanings": ["paper"],
+                    "used_in_urls": ["https://jpdb.io/vocabulary/1589160/紙/used-in"],
+                },
+            ],
+        });
+        assert!(matches!(
+            resolve_single(raw, &JpdbPitchQuery::new("紙", None)),
+            Err(JpdbPitchFailure::PageContract { .. })
+        ));
+    }
+
+    #[test]
+    fn navigated_detail_must_keep_the_identity_resolved_from_search() {
+        let canonical = "https://jpdb.io/vocabulary/1192150/家族/かぞく?lang=english";
+        let raw = single_entry_search(
+            ("家族", "かぞく"),
+            &["https://jpdb.io/vocabulary/1192150/家族/used-in"],
+            &[canonical],
+        );
+        let query = JpdbPitchQuery::new("家族", None);
+        let candidate = resolve_single(raw, &query).unwrap().remove(0);
+        let route = parse_detail_route(&candidate.detail_url).unwrap();
+        let mut named = detail_snapshot(canonical, 1_192_150, vec![form("家族", "かぞく")]);
+        named.part_of_speech.push("Name".into());
+
+        for (name, detail) in [
+            (
+                "другой ID в маршруте",
+                detail_snapshot(
+                    "https://jpdb.io/vocabulary/1192151/家族/かぞく",
+                    1_192_151,
+                    vec![form("家族", "かぞく")],
+                ),
+            ),
+            (
+                "ID страницы расходится с кандидатом",
+                detail_snapshot(canonical, 1_192_151, vec![form("家族", "かぞく")]),
+            ),
+            (
+                "другое чтение в маршруте",
+                detail_snapshot(
+                    "https://jpdb.io/vocabulary/1192150/家族/いえぞく",
+                    1_192_150,
+                    vec![form("家族", "いえぞく")],
+                ),
+            ),
+            (
+                "маршрут без чтения вместо подтверждённого",
+                detail_snapshot(
+                    "https://jpdb.io/vocabulary/1192150/家族",
+                    1_192_150,
+                    vec![form("家族", "かぞく")],
+                ),
+            ),
+            (
+                "формы страницы другого слова",
+                detail_snapshot(canonical, 1_192_150, vec![form("家", "いえ")]),
+            ),
+            ("имя собственное", named),
+        ] {
+            assert!(
+                matches!(
+                    validate_navigated_detail_identity(&candidate, &route, &detail, &query),
+                    Err(JpdbPitchFailure::DetailIdentityMismatch { .. })
+                ),
+                "подмена записи после перехода должна отвергаться: {name}"
+            );
+        }
+        let detail = detail_snapshot(canonical, 1_192_150, vec![form("家族", "かぞく")]);
+        assert!(matches!(
+            validate_navigated_detail_identity(
+                &candidate,
+                &route,
+                &detail,
+                &JpdbPitchQuery::new("家族", Some("いえぞく".into()))
+            ),
+            Err(JpdbPitchFailure::DetailIdentityMismatch { .. })
+        ));
+    }
+
     #[test]
     fn not_found_requires_a_valid_ready_empty_search_inventory() {
         let explicit_empty = RawSearchSnapshot {
@@ -4394,6 +4988,8 @@ mod tests {
             result_count: 0,
             truncated: false,
             candidates: Vec::new(),
+            canonical_urls: Vec::new(),
+            details_view: false,
         };
         assert!(validate_search_inventory(&explicit_empty).is_ok());
         let unresolved_empty = RawSearchSnapshot {
@@ -4402,6 +4998,8 @@ mod tests {
             result_count: 0,
             truncated: false,
             candidates: Vec::new(),
+            canonical_urls: Vec::new(),
+            details_view: false,
         };
         assert!(matches!(
             validate_search_inventory(&unresolved_empty),
@@ -4413,6 +5011,8 @@ mod tests {
             result_count: 129,
             truncated: true,
             candidates: Vec::new(),
+            canonical_urls: Vec::new(),
+            details_view: false,
         };
         assert!(matches!(
             validate_search_inventory(&capped),
@@ -4731,6 +5331,167 @@ mod tests {
         if let Err(error) = session.close().await {
             eprintln!("сессия браузера закрыта с ошибкой: {error}");
         }
+    }
+
+    /// Страница поиска со структурой разметки JPDB; `<base>` задаёт origin ссылок.
+    fn jpdb_like_search_page(
+        canonical: Option<&str>,
+        results_class: &str,
+        rows: &[String],
+    ) -> String {
+        let canonical = canonical
+            .map(|href| format!(r#"<link rel="canonical" href="{href}" />"#))
+            .unwrap_or_default();
+        let rows = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                format!(
+                    r#"<div id="result-{index}"><div class="result vocabulary">{row}</div></div>"#
+                )
+            })
+            .collect::<String>();
+        format!(
+            r#"<!doctype html><html><head><base href="https://jpdb.io/">{canonical}</head><body><select id="search-bar-lang"><option value="english" selected>English</option></select><div class="{results_class}">{rows}</div></body></html>"#
+        )
+    }
+
+    fn jpdb_like_search_row(headword: &str, links: &str, alternates: &str) -> String {
+        format!(
+            r#"<div class="subsection-headword"><div class="primary-spelling"><div class="spelling"><div>{headword}</div></div></div></div><div class="subsection-meanings"><h6 class="subsection-label">Meanings</h6><div class="subsection"><div class="part-of-speech"><div>Noun</div></div><div class="description">1. meaning</div></div></div>{alternates}<div class="hbox">{links}</div>"#
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "требует установленного Chromium; запустить: cargo test -p asset-store jpdb::tests::browser_search -- --ignored"]
+    async fn browser_search_script_reports_canonical_evidence_of_single_entries() {
+        let _serial = BROWSER_CAPTURE_TESTS.lock().await;
+        let single = jpdb_like_search_page(
+            Some("https://jpdb.io/vocabulary/1192150/家族/かぞく?lang=english"),
+            "results details",
+            &[jpdb_like_search_row(
+                r#"<ruby class="v">家<rt>か</rt>族<rt>ぞく</rt></ruby>"#,
+                r#"<a class="view-conjugations-link" href="http://[">Broken</a><a class="view-conjugations-link" href="/vocabulary/1192150/家族/used-in">Used in: 5493</a>"#,
+                "",
+            )],
+        );
+        let tainted = jpdb_like_search_page(
+            Some("https://jpdb.io/vocabulary/1192150/家族/かぞく?lang=english"),
+            "results details",
+            &[jpdb_like_search_row(
+                r#"<ruby class="v">家<rt>か</rt>族<rt>ぞく</rt></ruby>"#,
+                r#"<a class="view-conjugations-link" href="/vocabulary/1192150/家族/used-in">Used in: 5493</a>__BAD__"#,
+                "",
+            )],
+        ).replace("__BAD__", r#"<a class="view-conjugations-link" href="/vocabulary/1192150/家族/used-in/">Used in: 1</a><a class="view-conjugations-link" href="http://[">Used in: 2</a>"#);
+        let without_href = jpdb_like_search_page(
+            Some("https://jpdb.io/vocabulary/1192150/家族/かぞく?lang=english"),
+            "results details",
+            &[jpdb_like_search_row(
+                r#"<ruby class="v">家<rt>か</rt>族<rt>ぞく</rt></ruby>"#,
+                r#"<a class="view-conjugations-link" href="/vocabulary/1192150/家族/used-in">Used in: 5493</a><a class="view-conjugations-link">Used in: 1</a><a class="view-conjugations-link">Conjugations...</a>"#,
+                "",
+            )],
+        );
+        let with_alternates = jpdb_like_search_page(
+            Some("https://jpdb.io/vocabulary/1358280/食べる/たべる?lang=english"),
+            "results details",
+            &[jpdb_like_search_row(
+                r#"<ruby class="v">食<rt>た</rt></ruby><ruby>べ</ruby><ruby>る</ruby>"#,
+                r#"<a class="view-conjugations-link" href="/conjugate/1358280/食べる/たべる">Conjugations...</a><a class="view-conjugations-link" href="/vocabulary/1358280/食べる/used-in">Used in: 6198</a>"#,
+                r#"<div class="subsection-other-spellings"><div class="alt-spelling"><a class="plain" href="/vocabulary/1358280/喰べる/たべる?lang=english#a"><ruby>喰<rt>た</rt></ruby><ruby>べ</ruby><ruby>る</ruby></a></div></div>"#,
+            )],
+        );
+        let list = jpdb_like_search_page(
+            None,
+            "results search",
+            &[
+                jpdb_like_search_row(
+                    r#"<ruby>髪<rt>かみ</rt></ruby>"#,
+                    "",
+                    r#"<div class="subsection-other-spellings"><div class="alt-spelling"><a class="plain" href="/vocabulary/1203850/かみ?lang=english#a">かみ</a></div></div>"#,
+                ),
+                jpdb_like_search_row(
+                    r#"<ruby>紙<rt>かみ</rt></ruby>"#,
+                    "",
+                    r#"<div class="subsection-other-spellings"><div class="alt-spelling"><a class="plain" href="/vocabulary/1589150/かみ?lang=english#a">かみ</a></div></div>"#,
+                ),
+            ],
+        );
+
+        let session = browser_session_with(&single).await;
+        let snapshot = read_search_candidates(session.page()).await.unwrap();
+        let resolved = select_candidates(&snapshot.candidates, &JpdbPitchQuery::new("家族", None));
+        session.page().set_content(tainted).await.unwrap();
+        let tainted_snapshot = read_search_candidates(session.page()).await.unwrap();
+        session.page().set_content(without_href).await.unwrap();
+        let without_href_snapshot = read_search_candidates(session.page()).await.unwrap();
+        session.page().set_content(with_alternates).await.unwrap();
+        let alternates = read_search_candidates(session.page()).await.unwrap();
+        session.page().set_content(list).await.unwrap();
+        let ambiguous = read_search_candidates(session.page()).await.unwrap();
+        close_capture_session(session).await;
+
+        assert!(snapshot.details_view);
+        assert_eq!(
+            snapshot.candidates[0].used_in_urls,
+            ["https://jpdb.io/vocabulary/1192150/%E5%AE%B6%E6%97%8F/used-in"]
+        );
+        // Повреждённые ссылки с подписью `Used in` доходят до Rust и блокируют canonical.
+        assert_eq!(
+            tainted_snapshot.candidates[0].used_in_urls,
+            [
+                "https://jpdb.io/vocabulary/1192150/%E5%AE%B6%E6%97%8F/used-in",
+                "https://jpdb.io/vocabulary/1192150/%E5%AE%B6%E6%97%8F/used-in/",
+                "http://[",
+            ]
+        );
+        assert!(tainted_snapshot.candidates[0].detail_url.is_none());
+        // Подпись `Used in` без адреса не выпадает из выборки: одна валидная
+        // ссылка не разрешает canonical по неполному набору свидетельств.
+        assert_eq!(
+            without_href_snapshot.candidates[0].used_in_urls,
+            [
+                "https://jpdb.io/vocabulary/1192150/%E5%AE%B6%E6%97%8F/used-in",
+                ""
+            ]
+        );
+        assert!(without_href_snapshot.candidates[0].detail_url.is_none());
+        let resolved = resolved.unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].vocabulary_id, 1_192_150);
+        assert_eq!(
+            parse_detail_route(&resolved[0].detail_url).unwrap(),
+            crate::pitch_accent::JpdbVocabularyRoute {
+                vocabulary_id: 1_192_150,
+                surface: "家族".into(),
+                reading: Some("かぞく".into()),
+            }
+        );
+
+        let candidates =
+            select_candidates(&alternates.candidates, &JpdbPitchQuery::new("食べる", None))
+                .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            parse_detail_route(&candidates[0].detail_url)
+                .unwrap()
+                .surface,
+            "喰べる",
+            "ссылка строки остаётся основным источником маршрута"
+        );
+
+        assert!(!ambiguous.details_view);
+        assert!(ambiguous.canonical_urls.is_empty());
+        let candidates =
+            select_candidates(&ambiguous.candidates, &JpdbPitchQuery::new("かみ", None)).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.vocabulary_id)
+                .collect::<Vec<_>>(),
+            vec![1_203_850, 1_589_150]
+        );
     }
 
     #[tokio::test]

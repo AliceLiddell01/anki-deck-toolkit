@@ -8,9 +8,11 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("asset-store пока поддерживает только Linux");
 
+mod acquisition_pool;
 pub mod batch;
 pub mod batch_runtime;
 pub mod browser_diagnostics;
+mod browser_process;
 pub mod browser_runtime;
 pub mod cli;
 pub mod diagnostics;
@@ -30,6 +32,8 @@ pub mod pitch_accent;
 pub mod pitch_batch;
 pub mod pitch_cli;
 pub mod pitch_review;
+mod pitch_review_decisions;
+mod review_snapshot;
 pub mod selection;
 pub mod store;
 pub mod temp_workspace;
