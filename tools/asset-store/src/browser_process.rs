@@ -21,6 +21,9 @@ use tokio::process::{Child, Command};
 
 /// Максимальный объём `stderr`, сохраняемый для диагностики отказа запуска.
 const MAX_LAUNCH_STDERR_BYTES: usize = 16 * 1024;
+/// После выхода лидера его потомки (renderer, zygote, GPU) получают время на
+/// самостоятельный выход до принудительного завершения группы.
+const DESCENDANT_EXIT_GRACE: Duration = Duration::from_millis(500);
 
 /// Аргументы, совпадающие со стандартным запуском `chromiumoxide` 0.9.1
 /// (`DEFAULT_ARGS`, headless, без расширений, с песочницей) для настроек
@@ -86,6 +89,17 @@ pub(crate) enum ProcessStop {
     Killed,
 }
 
+/// Подробности последней остановки для диагностики lifecycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProcessStopDetails {
+    /// Сколько ждали самостоятельного выхода лидера.
+    pub leader_wait: Duration,
+    /// Сколько заняло доказательство пустоты группы после выхода лидера.
+    pub group_drain: Duration,
+    /// Потребовалось ли принудительно завершить оставшихся потомков.
+    pub descendants_killed: bool,
+}
+
 /// Ошибка запуска, после которой принадлежащая группа уже остановлена либо
 /// остановка явно недоказана.
 #[derive(Debug)]
@@ -101,6 +115,7 @@ pub(crate) struct OwnedBrowserProcess {
     group: Pid,
     /// Статус собранного лидера; до сбора номер группы не может быть переиспользован.
     exit: Option<ExitStatus>,
+    details: ProcessStopDetails,
 }
 
 impl OwnedBrowserProcess {
@@ -139,6 +154,7 @@ impl OwnedBrowserProcess {
             child,
             group,
             exit: None,
+            details: ProcessStopDetails::default(),
         };
         let address = match stderr {
             Some(stderr) => tokio::time::timeout(
@@ -164,6 +180,10 @@ impl OwnedBrowserProcess {
         self.group.as_raw_nonzero().get()
     }
 
+    pub(crate) fn stop_details(&self) -> ProcessStopDetails {
+        self.details
+    }
+
     /// Ждёт самостоятельного выхода лидера; затем доказывает пустоту группы.
     /// Возвращает `Ok(None)`, если лидер не завершился за отведённое время.
     pub(crate) async fn wait_exit(
@@ -174,7 +194,10 @@ impl OwnedBrowserProcess {
             self.drain_group(limit).await?;
             return Ok(Some(status));
         }
-        match tokio::time::timeout(limit, self.child.wait()).await {
+        let started = Instant::now();
+        let waited = tokio::time::timeout(limit, self.child.wait()).await;
+        self.details.leader_wait = started.elapsed();
+        match waited {
             Ok(Ok(status)) => {
                 self.exit = Some(status);
                 self.drain_group(limit).await?;
@@ -217,24 +240,29 @@ impl OwnedBrowserProcess {
 
     /// Потомки лидера (renderer, zygote, GPU) остаются в группе и после его выхода.
     async fn drain_group(&mut self, limit: Duration) -> Result<(), String> {
-        let deadline = Instant::now() + limit;
-        let mut killed = false;
-        loop {
+        let started = Instant::now();
+        let deadline = started + limit;
+        let grace = started + DESCENDANT_EXIT_GRACE.min(limit);
+        let result = loop {
             match self.group_has_members() {
-                Ok(false) => return Ok(()),
+                Ok(false) => break Ok(()),
                 Ok(true) => {}
-                Err(error) => return Err(format!("browser_process_group_probe_failed: {error}")),
+                Err(error) => break Err(format!("browser_process_group_probe_failed: {error}")),
             }
-            if !killed {
-                self.signal_group(Signal::KILL)
-                    .map_err(|error| format!("browser_kill_failed: {error}"))?;
-                killed = true;
+            let now = Instant::now();
+            if !self.details.descendants_killed && now >= grace {
+                if let Err(error) = self.signal_group(Signal::KILL) {
+                    break Err(format!("browser_kill_failed: {error}"));
+                }
+                self.details.descendants_killed = true;
             }
-            if Instant::now() >= deadline {
-                return Err("browser_process_group_stop_unproven".into());
+            if now >= deadline {
+                break Err("browser_process_group_stop_unproven".into());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        };
+        self.details.group_drain = started.elapsed();
+        result
     }
 
     fn group_has_members(&self) -> io::Result<bool> {

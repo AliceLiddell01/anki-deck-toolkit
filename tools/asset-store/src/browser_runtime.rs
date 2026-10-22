@@ -567,6 +567,12 @@ async fn profile_launch_failure(
     }
 }
 
+/// Окно самостоятельного выхода Chromium после `Browser.close`. Наблюдаемое время
+/// штатного выхода при закрытии во время активной навигации — от 0,4 до более чем
+/// 2 с под нагрузкой; прежнее окно 2 с попадало в хвост этого распределения и
+/// превращало штатный выход в принудительное завершение `browser_close_failed`.
+const BROWSER_EXIT_GRACE: Duration = Duration::from_secs(10);
+
 /// Закрытие транспорта CDP и завершение принадлежащего сессии процесса — независимые наблюдения.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BrowserTransportStop {
@@ -638,13 +644,14 @@ async fn stop_browser(
     );
     let started = Instant::now();
     let process_group = process.as_ref().map(|process| process.pid());
-    let (process_stopped, process_failure, process_outcome) = match process {
+    let mut process = process;
+    let (process_stopped, process_failure, process_outcome) = match process.as_deref_mut() {
         None => (
             false,
             Some("browser_process_stop_unproven".to_owned()),
             "unproven",
         ),
-        Some(process) => match process.wait_exit(Duration::from_secs(2)).await {
+        Some(process) => match process.wait_exit(BROWSER_EXIT_GRACE).await {
             Ok(Some(_)) => (true, None, "exited"),
             Err(error) => (false, Some(error), "stop_failed"),
             Ok(None) => match process.kill(Duration::from_secs(2)).await {
@@ -668,6 +675,10 @@ async fn stop_browser(
         (_, Some("browser_process_group_stop_unproven")) => "browser_process_group_stop_unproven",
         _ => "browser_kill_failed",
     };
+    let details = process
+        .as_deref()
+        .map(OwnedBrowserProcess::stop_details)
+        .unwrap_or_default();
     tracing::info!(
         event = "browser_lifecycle",
         stage = "browser_process_stop",
@@ -676,6 +687,9 @@ async fn stop_browser(
         process_group,
         outcome = process_outcome,
         process_stopped,
+        leader_wait_ms = duration_millis(details.leader_wait),
+        group_drain_ms = duration_millis(details.group_drain),
+        descendants_killed = details.descendants_killed,
         stage_duration_ms = duration_millis(started.elapsed()),
         "Завершена проверка остановки принадлежащего браузера и его группы процессов"
     );
