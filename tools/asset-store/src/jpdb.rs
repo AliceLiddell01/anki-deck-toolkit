@@ -3149,7 +3149,10 @@ const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
     }
     // Ссылки `Used in` передаются как есть: допустимость и смысл проверяет Rust.
     const usedInUrls = [...row.querySelectorAll('a.view-conjugations-link[href]')]
-      .map(link => link.href).filter(href => /\/used-in$/u.test(new URL(href, location.href).pathname));
+      .map(link => link.href).filter(href => {
+        try { return /\/used-in$/u.test(new URL(href, location.href).pathname); }
+        catch (_) { return false; }
+      });
     candidates.push({ detail_url: detailRoute ? detailRoute.href : null, forms, part_of_speech: partOfSpeech, meanings, used_in_urls: usedInUrls });
   }
   return {
@@ -5338,7 +5341,7 @@ mod tests {
             "results details",
             &[jpdb_like_search_row(
                 r#"<ruby class="v">家<rt>か</rt>族<rt>ぞく</rt></ruby>"#,
-                r#"<a class="view-conjugations-link" href="/vocabulary/1192150/家族/used-in">Used in: 5493</a>"#,
+                r#"<a class="view-conjugations-link" href="http://[">Broken</a><a class="view-conjugations-link" href="/vocabulary/1192150/家族/used-in">Used in: 5493</a>"#,
                 "",
             )],
         );
