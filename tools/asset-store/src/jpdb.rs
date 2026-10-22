@@ -3148,11 +3148,14 @@ const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
       return { error: 'Строка JPDB не содержит подтверждённые формы, часть речи и значения', result_count: resultCount, vocabulary_row_count: vocabularyRows.length, candidate_count: candidates.length, no_results_found: noResultsFound, truncated: resultCount > 128 || vocabularyRows.length > 128, invalid_row_index: candidates.length, form_count: forms.length, has_forms: forms.length > 0, part_of_speech_count: partOfSpeech.length, has_part_of_speech: partOfSpeech.length > 0, meaning_count: meanings.length, has_meanings: meanings.length > 0, has_detail_url: !!detailRoute, has_detail_route: !!detailRoute, detail_route_parse_succeeded: !!route };
     }
     // Ссылки `Used in` передаются как есть: допустимость и смысл проверяет Rust.
+    // Свидетельством считается и ссылка с подписью `Used in`, и ссылка с путём `/used-in`:
+    // повреждённый адрес не отбрасывается, а доходит до Rust и отменяет вывод canonical.
     const usedInUrls = [...row.querySelectorAll('a.view-conjugations-link[href]')]
-      .map(link => link.href).filter(href => {
-        try { return /\/used-in$/u.test(new URL(href, location.href).pathname); }
+      .filter(link => {
+        if (/^\s*Used in\b/iu.test(link.textContent || '')) return true;
+        try { return /\/used-in$/u.test(new URL(link.href, location.href).pathname); }
         catch (_) { return false; }
-      });
+      }).map(link => link.href);
     candidates.push({ detail_url: detailRoute ? detailRoute.href : null, forms, part_of_speech: partOfSpeech, meanings, used_in_urls: usedInUrls });
   }
   return {
@@ -4824,6 +4827,29 @@ mod tests {
     }
 
     #[test]
+    fn single_entry_canonical_is_rejected_when_any_used_in_link_is_invalid() {
+        for extra in [
+            "https://jpdb.io/vocabulary/1192150/家族/used-in/",
+            "http://[",
+            "https://jpdb.io/vocabulary/999/別語/used-in",
+        ] {
+            let raw = serde_json::json!({
+                "ready": true, "no_results_found": false, "result_count": 1,
+                "truncated": false, "details_view": true,
+                "canonical_urls": ["https://jpdb.io/vocabulary/1192150/家族/かぞく"],
+                "candidates": [{
+                    "detail_url": null,
+                    "forms": [{ "surface": "家族", "reading": "かぞく" }],
+                    "part_of_speech": ["Noun"],
+                    "meanings": ["family"],
+                    "used_in_urls": ["https://jpdb.io/vocabulary/1192150/家族/used-in", extra],
+                }],
+            });
+            assert!(resolve_single(raw, &JpdbPitchQuery::new("家族", None)).is_err());
+        }
+    }
+
+    #[test]
     fn ambiguous_search_is_never_narrowed_by_canonical() {
         let row = |id: u64, surface: &str, reading: &str| {
             serde_json::json!({
@@ -5345,6 +5371,15 @@ mod tests {
                 "",
             )],
         );
+        let tainted = jpdb_like_search_page(
+            Some("https://jpdb.io/vocabulary/1192150/家族/かぞく?lang=english"),
+            "results details",
+            &[jpdb_like_search_row(
+                r#"<ruby class="v">家<rt>か</rt>族<rt>ぞく</rt></ruby>"#,
+                r#"<a class="view-conjugations-link" href="/vocabulary/1192150/家族/used-in">Used in: 5493</a>__BAD__"#,
+                "",
+            )],
+        ).replace("__BAD__", r#"<a class="view-conjugations-link" href="/vocabulary/1192150/家族/used-in/">Used in: 1</a><a class="view-conjugations-link" href="http://[">Used in: 2</a>"#);
         let with_alternates = jpdb_like_search_page(
             Some("https://jpdb.io/vocabulary/1358280/食べる/たべる?lang=english"),
             "results details",
@@ -5374,6 +5409,8 @@ mod tests {
         let session = browser_session_with(&single).await;
         let snapshot = read_search_candidates(session.page()).await.unwrap();
         let resolved = select_candidates(&snapshot.candidates, &JpdbPitchQuery::new("家族", None));
+        session.page().set_content(tainted).await.unwrap();
+        let tainted_snapshot = read_search_candidates(session.page()).await.unwrap();
         session.page().set_content(with_alternates).await.unwrap();
         let alternates = read_search_candidates(session.page()).await.unwrap();
         session.page().set_content(list).await.unwrap();
@@ -5385,6 +5422,16 @@ mod tests {
             snapshot.candidates[0].used_in_urls,
             ["https://jpdb.io/vocabulary/1192150/%E5%AE%B6%E6%97%8F/used-in"]
         );
+        // Повреждённые ссылки с подписью `Used in` доходят до Rust и блокируют canonical.
+        assert_eq!(
+            tainted_snapshot.candidates[0].used_in_urls,
+            [
+                "https://jpdb.io/vocabulary/1192150/%E5%AE%B6%E6%97%8F/used-in",
+                "https://jpdb.io/vocabulary/1192150/%E5%AE%B6%E6%97%8F/used-in/",
+                "http://[",
+            ]
+        );
+        assert!(tainted_snapshot.candidates[0].detail_url.is_none());
         let resolved = resolved.unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].vocabulary_id, 1_192_150);
