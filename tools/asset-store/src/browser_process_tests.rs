@@ -201,6 +201,51 @@ async fn exit_before_address_keeps_bounded_safe_stderr() {
 }
 
 #[tokio::test]
+async fn stderr_eof_before_reapable_exit_is_a_natural_exit() {
+    let workspace = TempWorkspace::create("browser-process-eof-exit-test").unwrap();
+    // EOF наступает заметно раньше выхода лидера — растянутое окно той же гонки,
+    // что между закрытием дескрипторов и доступностью статуса для `wait`.
+    let spec = fake_browser(
+        &workspace,
+        "browser",
+        "echo 'отказ до выхода' >&2\nexec 2>&-\nsleep 0.1\nexit 3",
+    );
+    let failure = OwnedBrowserProcess::spawn(&spec).await.unwrap_err();
+    assert!(
+        failure
+            .message
+            .contains("процесс завершился (exit status: 3)"),
+        "{}",
+        failure.message
+    );
+    assert!(failure.message.contains("отказ до выхода"));
+    assert_eq!(failure.stop, Ok(ProcessStop::Exited));
+    workspace.close().unwrap();
+}
+
+#[tokio::test]
+async fn closed_stderr_with_live_leader_is_stopped_by_force() {
+    let workspace = TempWorkspace::create("browser-process-eof-alive-test").unwrap();
+    let spec = fake_browser(
+        &workspace,
+        "browser",
+        "echo 'stderr закрыт' >&2\nsleep 300 2>&- &\nexec 2>&-\nexec sleep 300",
+    );
+    let started = Instant::now();
+    let failure = OwnedBrowserProcess::spawn(&spec).await.unwrap_err();
+    assert!(
+        failure.message.contains("stderr закрыт до адреса DevTools"),
+        "{}",
+        failure.message
+    );
+    // Живой лидер и его потомок не выдаются за самостоятельный выход и не
+    // удерживают запуск до общего таймаута.
+    assert_eq!(failure.stop, Ok(ProcessStop::Killed));
+    assert!(started.elapsed() < spec.launch_timeout);
+    workspace.close().unwrap();
+}
+
+#[tokio::test]
 async fn missing_executable_is_a_setup_error_without_process() {
     let workspace = TempWorkspace::create("browser-process-missing-test").unwrap();
     let spec = BrowserLaunchSpec {
