@@ -2123,16 +2123,26 @@ fn validate_navigated_detail_identity(
     detail: &DetailSnapshot,
     query: &JpdbPitchQuery,
 ) -> Result<(), JpdbPitchFailure> {
-    if !same_route_identity(&parse_detail_route(&detail.url), candidate_route)
-        || detail.vocabulary_id != candidate.vocabulary_id
-        || !route_matches_forms(candidate_route, &unique_forms(&detail.forms))
+    validate_detail_matches_route(candidate_route, candidate.vocabulary_id, detail, query)
+}
+
+/// Общая сверка открытой карточки с маршрутом и ожидаемым ID для обоих путей перехода.
+fn validate_detail_matches_route(
+    route: &crate::pitch_accent::JpdbVocabularyRoute,
+    vocabulary_id: u64,
+    detail: &DetailSnapshot,
+    query: &JpdbPitchQuery,
+) -> Result<(), JpdbPitchFailure> {
+    if !same_route_identity(&parse_detail_route(&detail.url), route)
+        || detail.vocabulary_id != vocabulary_id
+        || !route_matches_forms(route, &unique_forms(&detail.forms))
         || !detail_matches_query(detail, query)
     {
         return Err(JpdbPitchFailure::DetailIdentityMismatch {
             stage: JpdbPitchStage::DetailVerification,
             expected_surface: query.surface.clone(),
             expected_reading: query.reading.clone(),
-            vocabulary_id: Some(candidate.vocabulary_id),
+            vocabulary_id: Some(vocabulary_id),
             observed_surface_forms: unique_forms(&detail.forms)
                 .into_iter()
                 .map(|form| form.surface)
@@ -2163,24 +2173,7 @@ fn validate_redirected_detail_identity(
                     .into(),
         });
     }
-    if !same_route_identity(&parse_detail_route(&detail.url), route)
-        || detail.vocabulary_id != route.vocabulary_id
-        || !route_matches_forms(route, &unique_forms(&detail.forms))
-        || !detail_matches_query(detail, query)
-    {
-        return Err(JpdbPitchFailure::DetailIdentityMismatch {
-            stage: JpdbPitchStage::DetailVerification,
-            expected_surface: query.surface.clone(),
-            expected_reading: query.reading.clone(),
-            vocabulary_id: Some(route.vocabulary_id),
-            observed_surface_forms: unique_forms(&detail.forms)
-                .into_iter()
-                .map(|form| form.surface)
-                .collect(),
-            observed_readings: unique_readings(&detail.forms),
-        });
-    }
-    Ok(())
+    validate_detail_matches_route(route, route.vocabulary_id, detail, query)
 }
 
 fn select_explicit_candidate(
