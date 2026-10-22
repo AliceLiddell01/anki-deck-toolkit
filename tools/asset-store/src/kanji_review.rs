@@ -1,21 +1,31 @@
 //! Производный текстовый пакет проверки. Источник истины — KanjiBatch;
 //! редактируемый TSV никогда не исполняется и не сканируется по маске файлов.
+//! Снимок, копии байтов и файл решений принадлежат общему `review_snapshot`;
+//! здесь — строки Kanji, их действия и предпросмотр групп OCR.
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
-
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
 use crate::batch::{
     BatchCandidate, BatchRuntime, HumanBatchAction, HumanBatchDecision, KanjiBatch,
 };
 use crate::error::{AssetError, ErrorCode};
-use crate::hashing::sha256_hex;
 use crate::kanji_domain::parse_kanji_character;
-use crate::model::{AssetIdentity, ValidatorIdentity};
+use crate::model::AssetIdentity;
+pub(crate) use crate::review_snapshot::ReviewBundle;
+#[cfg(test)]
+use crate::review_snapshot::preview_image_source;
+use crate::review_snapshot::{ReviewCell, ReviewFormat};
 
 const SCHEMA: u32 = 1;
+
+const FORMAT: ReviewFormat = ReviewFormat {
+    schema: SCHEMA,
+    comments: &[
+        "# Проверка изображений кандзи Yarxi, формат v1",
+        "# y = ожидаемый символ; e = непригодное изображение; другой один Han = фактический символ; пусто = без решения; - = пропуск",
+        "# Только первая колонка; разделитель TAB. Сохраните файл перед применением.",
+    ],
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,20 +64,34 @@ impl ReviewRow {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReviewSnapshot {
-    pub schema_version: u32,
-    pub batch_id: String,
-    pub validator: ValidatorIdentity,
-    pub rows: Vec<ReviewRow>,
+impl crate::review_snapshot::ReviewRow for ReviewRow {
+    fn identity(&self) -> &AssetIdentity {
+        &self.identity
+    }
+
+    fn image(&self) -> Option<(&str, &str)> {
+        Some((&self.filename, &self.sha256))
+    }
+
+    fn columns(&self) -> String {
+        ReviewRow::columns(self)
+    }
+
+    fn validate(&self) -> Result<(), AssetError> {
+        if self
+            .ocr
+            .as_ref()
+            .is_some_and(|ocr| ocr.identity != self.identity || ocr.source_sha256 != self.sha256)
+        {
+            return Err(invalid(
+                "предложение OCR не принадлежит точным байтам review",
+            ));
+        }
+        Ok(())
+    }
 }
 
-pub(crate) struct ReviewBundle {
-    pub id: String,
-    pub directory: PathBuf,
-    pub decisions: PathBuf,
-}
+pub(crate) type ReviewSnapshot = crate::review_snapshot::ReviewSnapshot<ReviewRow>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParsedDecision {
@@ -164,147 +188,59 @@ pub(crate) fn prepare(
         validator: state.policy.validator.clone(),
         rows,
     };
-    let encoded = serde_json::to_vec(&snapshot).map_err(|error| invalid(error.to_string()))?;
-    let id = sha256_hex(&encoded);
-    let directory = runtime.artifact_directory(&format!("review-{id}"))?;
-    // Повторный export не перезаписывает уже заполненный файл редактора.
-    match directory.read("snapshot.json") {
-        Ok(existing) if existing == encoded => {
-            for row in &snapshot.rows {
-                match directory.read(&row.filename) {
-                    Ok(bytes) if sha256_hex(&bytes) == row.sha256 => {}
-                    Ok(_) => return Err(invalid("копия изображения review изменена")),
-                    Err(error) if error.code == ErrorCode::MissingAssetFile => {
-                        let bytes = runtime.read_candidate(candidate(state, row)?)?;
-                        if sha256_hex(&bytes) != row.sha256 {
-                            return Err(invalid("исходный кандидат review изменён"));
-                        }
-                        directory.write_if_absent(&row.filename, &bytes)?;
-                        if sha256_hex(&directory.read(&row.filename)?) != row.sha256 {
-                            return Err(invalid("копия изображения review изменена"));
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            match directory.read("decisions.tsv") {
-                Ok(_) => {}
-                Err(error) if error.code == ErrorCode::MissingAssetFile => {
-                    directory.write_if_absent(
-                        "decisions.tsv",
-                        decisions_template(&snapshot, &id).as_bytes(),
-                    )?;
-                    directory.read("decisions.tsv")?;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(_) => return Err(invalid("содержимое снимка review не совпадает с его SHA")),
-        Err(error) if error.code == ErrorCode::MissingAssetFile => {
-            for row in &snapshot.rows {
-                let bytes = runtime.read_candidate(candidate(state, row)?)?;
-                directory.write(&row.filename, &bytes)?;
-            }
-            directory.write(
-                "decisions.tsv",
-                decisions_template(&snapshot, &id).as_bytes(),
-            )?;
-            // Снимок записывается последним: неполный export безопасно повторяется.
-            directory.write("snapshot.json", &encoded)?;
-        }
-        Err(error) => return Err(error),
-    }
+    let (bundle, directory) = crate::review_snapshot::export(
+        |name| runtime.artifact_directory(name),
+        &snapshot,
+        &FORMAT,
+        |row| runtime.read_candidate(candidate(state, row)?),
+    )?;
     write_preview(&directory, &snapshot)?;
-    Ok(ReviewBundle {
-        id,
-        decisions: directory.path.join("decisions.tsv"),
-        directory: directory.path,
-    })
-}
-
-fn decisions_template(snapshot: &ReviewSnapshot, id: &str) -> String {
-    let mut text = format!(
-        "# YARXI REVIEW v{SCHEMA}\n# y = ожидаемый символ; e = непригодное изображение; другой один Han = фактический символ; пусто = без решения; - = пропуск\n# Только первая колонка; разделитель TAB. Сохраните файл перед применением.\n@review\t{SCHEMA}\t{}\t{id}\n",
-        snapshot.batch_id
-    );
-    for row in &snapshot.rows {
-        text.push_str(&format!("\t{}\n", row.columns()));
-    }
-    text
+    Ok(bundle)
 }
 
 pub(crate) fn read(
     runtime: &BatchRuntime,
     id: &str,
 ) -> Result<(ReviewSnapshot, Vec<ParsedDecision>), AssetError> {
-    crate::batch::validate_hash(id)?;
-    let directory = runtime.artifact_directory(&format!("review-{id}"))?;
-    let encoded = directory.read("snapshot.json")?;
-    if sha256_hex(&encoded) != id {
-        return Err(invalid("SHA снимка review не совпадает"));
-    }
-    let snapshot: ReviewSnapshot =
-        serde_json::from_slice(&encoded).map_err(|error| invalid(error.to_string()))?;
-    if snapshot.schema_version != SCHEMA || snapshot.batch_id != runtime.batch_id() {
-        return Err(invalid("неверная схема или batch_id файла review"));
-    }
-    for row in &snapshot.rows {
-        if row
-            .ocr
-            .as_ref()
-            .is_some_and(|ocr| ocr.identity != row.identity || ocr.source_sha256 != row.sha256)
-        {
-            return Err(invalid(
-                "предложение OCR не принадлежит точным байтам review",
-            ));
-        }
-        if sha256_hex(&directory.read(&row.filename)?) != row.sha256 {
-            return Err(invalid("SHA копии изображения review не совпадает"));
-        }
-    }
-    let bytes = directory.read("decisions.tsv")?;
-    let text =
-        std::str::from_utf8(&bytes).map_err(|_| invalid("файл решений должен быть UTF-8"))?;
-    let decisions = parse(&snapshot, id, text)?;
+    let (snapshot, cells) = crate::review_snapshot::read(
+        |name| runtime.artifact_directory(name),
+        runtime.batch_id(),
+        id,
+        &FORMAT,
+    )?;
+    let decisions = decide(&snapshot, id, cells)?;
     Ok((snapshot, decisions))
 }
 
+#[cfg(test)]
 fn parse(
     snapshot: &ReviewSnapshot,
     id: &str,
     text: &str,
 ) -> Result<Vec<ParsedDecision>, AssetError> {
-    let mut lines = text
-        .trim_start_matches('\u{feff}')
-        .lines()
-        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'));
-    if lines.next() != Some(format!("@review\t{SCHEMA}\t{}\t{id}", snapshot.batch_id).as_str()) {
-        return Err(invalid("изменена подпись, схема или идентичность review"));
-    }
-    let mut decisions = Vec::new();
-    let mut seen = BTreeSet::new();
-    for (index, row) in snapshot.rows.iter().enumerate() {
-        if !seen.insert(&row.identity) {
-            return Err(invalid("повторяющийся Unicode в review"));
-        }
-        let line = lines
-            .next()
-            .ok_or_else(|| invalid("в review отсутствуют строки"))?;
-        let (action, columns) = line
-            .split_once('\t')
-            .ok_or_else(|| invalid("в review требуется TAB"))?;
-        if columns != row.columns() {
-            return Err(invalid(format!("изменены метаданные строки {}", index + 1)));
-        }
-        let (action, reason) = match action {
-            "" => {
+    let cells = crate::review_snapshot::parse_cells(snapshot, &FORMAT, id, text)?;
+    decide(snapshot, id, cells)
+}
+
+fn decide(
+    snapshot: &ReviewSnapshot,
+    id: &str,
+    cells: Vec<ReviewCell>,
+) -> Result<Vec<ParsedDecision>, AssetError> {
+    let mut decisions = Vec::with_capacity(cells.len());
+    for (row, cell) in snapshot.rows.iter().zip(cells) {
+        let action = match cell {
+            ReviewCell::Unspecified => {
                 decisions.push(ParsedDecision::Unspecified);
                 continue;
             }
-            "-" => {
+            ReviewCell::Skip => {
                 decisions.push(ParsedDecision::Skip);
                 continue;
             }
+            ReviewCell::Action(action) => action,
+        };
+        let (action, reason) = match action.as_str() {
             "y" => (
                 HumanBatchAction::Confirm,
                 "expected_character_confirmed".to_owned(),
@@ -334,26 +270,7 @@ fn parse(
             reason: format!("review:{id}; {reason}"),
         }));
     }
-    if lines.next().is_some() {
-        return Err(invalid("лишние или повторяющиеся строки review"));
-    }
     Ok(decisions)
-}
-
-/// HTML для ручного просмотра остаётся переносимым при длинных UNC-путях WSL.
-/// Объём встроенных изображений ограничен, чтобы крупный пакет не создавал
-/// неограниченный HTML; после исчерпания бюджета остаются относительные ссылки.
-fn preview_image_source(filename: &str, bytes: &[u8], remaining: &mut usize) -> String {
-    let mime = match filename.rsplit_once('.').map(|(_, ext)| ext) {
-        Some("gif") => "image/gif",
-        Some("png") => "image/png",
-        _ => return crate::batch::html_escape(filename),
-    };
-    if bytes.len() > *remaining {
-        return crate::batch::html_escape(filename);
-    }
-    *remaining -= bytes.len();
-    format!("data:{mime};base64,{}", STANDARD.encode(bytes))
 }
 
 fn write_preview(
@@ -365,8 +282,7 @@ fn write_preview(
         "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src 'self' file: data:; style-src 'unsafe-inline'\"><title>Ручная проверка</title><style>body{font-family:system-ui;margin:2rem}article{border:1px solid #999;padding:1rem;margin:1rem 0}img{max-width:300px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style><h1>Предложения OCR и решения человека</h1><p>Просмотрите изображения. OCR может ошибаться при совпадении метки. Только явное решение человека подтверждает байты.</p>",
     );
     let mut group = None;
-    // 32 МиБ исходных изображений: бюджет применяется к данным до base64.
-    let mut inline_budget = 32 * 1024 * 1024;
+    let mut inline_budget = crate::review_snapshot::PREVIEW_INLINE_BUDGET;
     for row in &snapshot.rows {
         let next_group = row.ocr.as_ref().map_or(3, |ocr| ocr.group());
         if group != Some(next_group) {
@@ -379,7 +295,8 @@ fn write_preview(
             group = Some(next_group);
         }
         let image = directory.read(&row.filename)?;
-        let source = preview_image_source(&row.filename, &image, &mut inline_budget);
+        let source =
+            crate::review_snapshot::preview_image_source(&row.filename, &image, &mut inline_budget);
         html.push_str(&format!("<article><h3>{}</h3><img src=\"{}\" alt=\"{}\"><pre>SHA: {}\nПоколение: {}\n{}</pre></article>",
             html_escape(&row.identity.key), source, html_escape(&row.identity.key), row.sha256, row.generation,
             html_escape(&row.ocr.as_ref().map_or_else(|| "Без OCR".into(), |ocr| ocr.summary()))));

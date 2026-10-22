@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: bec32057f9f6a58ef042c5bd577e92a61eb48df8 -->
+<!-- i18n-source-git-blob: 3866874ededc90b48eb107a2da20c09b822f72d3 -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -63,6 +63,10 @@
 公共批处理运行时负责 `.runtime/batches/<batch-id>` 下安全的文件机制：`NOFOLLOW`、锁、修订号/CAS、原子状态写入、有界读取和按 SHA 寻址的内容。它不依赖 `KanjiBatch`、`KanjiMetrics`、Yarxi 数据或 HTML 报告，这些都由领域适配器负责。纯文本测试状态验证重新打开和读取内容，无需汉字或图片规则。
 
 公共 Chromium 会话、可执行文件定位、启动诊断、CDP 指标和网络技术遥测在 `browser_runtime.rs` 中。Yarxi 保留自身选择器、URL、TLS 策略、过滤器、后备来源、深色主题和截图几何；公共运行时支持独立的 `3.0` 缩放系数。JPDB 使用隔离会话，`pitch-assets` 独立处理批次并发布已验证 PNG。与 `anki-repo` 的集成仍是单独能力。
+
+Chromium 进程由 `browser_process.rs` 拥有，而不是 `chromiumoxide`：浏览器使用与原 `Browser::launch` 相同的参数启动，但位于**自己的进程组**（`process_group(0)`），CDP 连接到其打印的 DevTools 地址。因此终端 `Ctrl+C` 只把 `SIGINT` 发送给 CLI，而不发送给浏览器：取消由协调器执行，正在进行的请求不会因浏览器退出而变成伪造的 `technical_failure`。停止过程区分各阶段：关闭 CDP（`browser_transport_stop`）、进程组首进程在最多 10 秒窗口内自行退出（`browser_process_exited`）或强制结束整个组（`browser_process_killed`），随后回收组内后代直到 `ESRCH`；组内残留的 zombie（例如没有 reaper、CLI 是容器的 PID 1 时）根据 `/proc` 不计为组成员。信号只发送给本次启动创建的组：在首进程被回收（`wait`）之前，组号不会转给其他进程；回收之后，仅当探测确认组内仍有进程时才向后代发送 `SIGKILL`，探测与发送信号之间仍存在一个狭窄窗口。CLI 自身因 `SIGKILL`/`SIGQUIT` 异常退出时不经过此路径：只要残留进程仍引用运行目录树，孤立运行清理就拒绝删除它。
+
+Yarxi 与 JPDB 共用的并行获取层是 `acquisition_pool.rs`：分配账本（每个 worker 至多一项、校验结果属于其分配、重新入队、使 worker 退出池）、以首个原因（`ctrl_c` 或协调器故障）取消整个池、会话恢复预算，以及对 `SIGINT`/`SIGTERM`/`SIGHUP` 的订阅。该层不了解浏览器和提供者：`token`/`CAS` 检查、检查点、验证器和信任规则仍由领域协调器负责，因此也可以接入非浏览器来源。
 
 用户区域不会通过 Git 发布，无论是整体还是部分：根目录 `.gitignore` 完整忽略 `/.asset-store/` 和 `/decks/`，这两个区域内没有任何例外。可以用真实的 `git check-ignore` 通过专门的回归脚本验证这些规则——脚本将根 `.gitignore` 复制到临时仓库，证明两个区域下的全部路径（包括 `.owner.json`、`manifest.json`、`assets/**`、`.runtime/**`、`.journal/events.jsonl`、旧分组目录及嵌套目录）都被忽略，并检查 `git add -A` 之后索引中不再残留任何此类路径：
 
@@ -269,6 +273,12 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch reacquire \
 cargo run --locked -p asset-store --bin pitch-assets -- batch reject \
   --batch-id my-pitch-batch --surface '幽霊' \
   --sha256 "$CANDIDATE_SHA256" --reason 'визуально отклонён'
+
+# 审查快照及基于快照的人工决定。
+cargo run --locked -p asset-store --bin pitch-assets -- --output json batch review-export \
+  --batch-id my-pitch-batch
+cargo run --locked -p asset-store --bin pitch-assets -- --output json batch review-apply \
+  --batch-id my-pitch-batch --review-id FULL_REVIEW_SHA256
 ```
 
 外部 `PitchPlan` JSON 要求 `schema_version: 1`，拒绝未知字段或版本。持久批次状态则独立使用**版本 3**；早期版本或使用早期验证器的状态（包括使用验证器 v5 的版本 2）会在解析前以代码 `unsupported_schema_version` 被拒绝，CLI 不会凭历史猜测当前候选尝试或原始计划，也不会沿用早期证据的可信状态；请创建新批次。每项包含准确的 `surface`、可选 `reading`、可选带 `vocabulary_id` 和 `detail_url` 的 `selection`。完全相同的请求合并，具有相同 `surface` 但不兼容的请求在浏览器启动前触发 `identity_conflict`。
@@ -316,7 +326,9 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch reject \
 
 无法通过更换会话解决的故障会中止整个运行：返回两个以上结果的报告，或没有结果且没有会话失败的报告（`invalid_provider_report`）、无法确认会话清理（`browser_cleanup_failed`）、worker panic、任务通道关闭、检查点/CAS/存储错误。本地会话恢复不能掩盖这些故障。
 
-收到 `Ctrl+C` 后，协调器停止新派发并通知正在运行的请求。与信号同时完成、已经被 worker 接收到的结果仍须通过 CAS 并可靠保存。所有会话关闭，等待 worker 清理临时目录后退出。未保存检查点和未分配项继续为 `pending`，不增加虚假尝试。之后的 `batch resume` 对账保存状态，继续当前 `pending`，保留原检查点。
+收到 `Ctrl+C`、`SIGTERM` 或 `SIGHUP` 后，协调器停止新派发并向正在运行的请求发出取消信号。worker 的浏览器位于各自的进程组中，不会收到终端 `SIGINT`。与信号同时完成、已经被 worker 接收到的结果仍须通过 CAS 并可靠保存。所有会话关闭，等待 worker 清理临时目录后退出。未保存检查点和未分配项继续为 `pending`，不增加虚假尝试。之后的 `batch resume` 对账保存状态，继续当前 `pending`，保留原检查点。
+
+在这一停止过程中再次收到信号不会中断它：否则位于各自进程组中的浏览器会比 CLI 存活更久。信号由进程级监听器处理：当没有任何获取运行拥有浏览器（获取尚未开始或已经关闭）时，`SIGINT`、`SIGTERM` 和 `SIGHUP` 以 `128 + 信号编号`（130、143、129）的退出码结束进程，与默认行为一致。
 
 发布只读取**指定当前尝试**的元数据和 `evidence`，要求 `PitchAccentImageValidator` v6 给出当前 `VERIFIED`。写入前 `AssetStore::ingest_verified` 再次验证字节，通过 compare-and-swap 核对上一记录的预期 SHA。规范路径为 `assets/png/<surface>.png`，消费者名为 `<surface>.pitch.png`。如果最新存储对账证明已有规范记录符合现行验证器，可不联网而复用。
 
@@ -327,6 +339,18 @@ cargo run --locked -p asset-store --bin pitch-assets -- batch reject \
 `batch retry-technical` 必须配合 `--reason`，对全批次按**相同条件**选择可重试技术失败，并为其开始新世代。不可重试错误、已发布项、未完成发布意图、歧义、无重音、找不到词条、冲突项、`pending` 均不变。该操作要么全部应用，要么全部不应用；成功后重复执行不会再选中项目。若所有者对账没有造成其他保存变化，返回 `changed: false`，否则 `changed` 包含该变化。JSON 中 `retried_identities` 按原计划顺序列出选中身份；空集则不提供此字段。`no_pitch_accent_on_source` 只结束**当前批次**，不会创建空记录或永久负缓存；`vocabulary_not_found` 保持独立未解决结果。
 
 `batch review` 将 `review.html` 保存到被 Git 忽略的批次 `.runtime` 中。页面显示获取及规范 PNG、词形/读音、JPDB 链接、检测到的图形变体数量、所选变体及选择依据、PNG 中的图形数量、SHA-256、大小、验证状态及来源/渲染证据。歧义列出全部候选；无重音图、词条不存在、技术故障以有类型结果显示，绝不伪造图片。文字经过转义；HTML 不修改批次状态，也不是权威来源。决策使用明确的 `select`、`reject`、`retry` 和 `reacquire`；没有绕过现行自动验证而手动发布字节的办法。
+
+### 审查快照及其决定
+
+`batch review-export` 使用与 `kanji-assets` 共用的机制创建可寻址快照 `.runtime/batches/<id>/review-<review_id>/`：`review_id` 是规范 `snapshot.json` 的 SHA-256，旁边是精确的 PNG 副本 `<surface>-<SHA>.png`、`index.html` 和可编辑的 `decisions.tsv`。快照列出歧义词条，以及状态为 `acquired_verified`、`published`、`candidate_rejected` 的当前候选；每行绑定世代、项目修订号、请求指纹、尝试编号、精确 SHA 和验证状态。对同一状态再次导出返回相同 `review_id`，不会覆盖已填写的决定文件。JSON 中 `review_id` 标识快照，`review_artifact` 是 `decisions.tsv` 的路径。
+
+只编辑第一列：候选行 `y` 表示已查看——当前自动 `VERIFIED` 按原样接受；`r` 拒绝该精确 SHA；歧义词条行填写数字，即该行候选列中的 JPDB 词条 ID（ID 与 URL 成对取自快照）；空表示无决定，`-` 表示跳过。
+
+`batch review-apply` 原子执行：先检查所有行，再一次性保存批次状态。若签名、某列、行顺序、`snapshot.json` 或 PNG 副本被改动；`review_id` 不属于该批次；导出后某行的世代、修订号、尝试或当前 SHA 已变化（`review устарел`）；或所选 ID 不在该行候选中（`identity_conflict`），则整个文件被拒绝，批次、语料库和日志均不改变。对没有当前验证器最新 `VERIFIED` 的候选填写 `y` 以 `invalid_validation_evidence` 拒绝。竞争命令由批次锁串行化：`review-apply` 等待其完成后再检查各行是否最新。重复应用同一快照是幂等的：已应用的决定计入 `already_applied`，不做任何修改。
+
+信任级别不变：该领域仍为 `AUTOMATED_VERIFIED_ONLY`。`y` 既不发布也不修改所有者记录，因此任何人工决定都不能使 `UNCERTAIN`、`REJECTED`、`CORRUPT`、缺失或旧 v5 证据变为可用。选择词条与 `batch select` 使用相同转换；下一次 `batch run` 会通过 JPDB 搜索再次确认。`r` 与 `batch reject` 使用相同转换；若被拒绝的 SHA 与已发布的所有者记录一致，则通过 `AssetStore::attest` 隔离，并写入 `trust_revoked` 日志事件，重复执行不会写入第二个事件。应用摘要在 `review_decisions` 中返回。
+
+可选的外部检查（例如将来的语言模型）只能为某行附加提示，并绑定到该行身份和精确 SHA，正如目前 `kanji-assets` 的 OCR。提示永远不会成为决定：只有显式的第一列才是决定，也不能绕过领域的信任规则。
 
 ### 从验证器 v5 迁移
 
@@ -419,7 +443,7 @@ cargo run --locked --features session-rotation-acceptance -p asset-store --bin k
 
 每个运行树包含 `.anki-decks-owner.json`，字段为 `schema`、`repository`、`tool`、PID、创建时间、`run_id` 和用途。新 schema 2 还包含 `boot_id`、`process_start_ticks`，并原子发布。旧 schema 1 仍可读，但清理需要至少 **24 小时 TTL**。需要浏览器时才创建其配置目录。`browser-profile-<32 lowercase hex>` 与 Chromium 的简短 `t<3 lowercase hex>` 目录，是同一 `BrowserProfile` 管理的两个相邻私有（`0700`）目录。短名称保证 Unix socket 不超过 `sockaddr_un.sun_path` 限制。
 
-启动时**只有 Chromium 子进程**通过 `BrowserConfig` 收到 `TMPDIR=<run>/t<3 lowercase hex>`；不修改 `asset-store` 进程环境或用户 shell。仅当规范化的 `ASSET_STORE_TEMP_ROOT` 与 `asset-store` 当前目录一致，才使用相对 `TMPDIR`；其他情况用绝对路径。相对值按 Chromium 进程自己的 `/proc/<pid>/cwd` 验证。
+启动时**只有 Chromium 子进程**通过 `BrowserLaunchSpec` 收到 `TMPDIR=<run>/t<3 lowercase hex>`；不修改 `asset-store` 进程环境或用户 shell。仅当规范化的 `ASSET_STORE_TEMP_ROOT` 与 `asset-store` 当前目录一致，才使用相对 `TMPDIR`；其他情况用绝对路径。相对值按 Chromium 进程自己的 `/proc/<pid>/cwd` 验证。
 
 删除配置目录前，检查关联运行树：只要同 UID Chromium 进程的命令行、`TMPDIR` 或文件描述符还指向该树，就拒绝删除并保留目录。必须**先**终止浏览器和 CDP 处理器，再删除浏览器配置/临时目录，最后关闭运行工作区。组装证据后显式关闭；正常退出时 `Drop` 尽可能清理。清理失败包含 `stage`、稳定 `code`、`path_category` 和去除绝对路径的安全消息。ZIP 独立创建，即使临时工作区删除也会保留。
 
