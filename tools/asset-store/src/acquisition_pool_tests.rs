@@ -199,9 +199,15 @@ async fn dropped_coordinator_is_reported_as_coordinator_failure() {
 #[tokio::test]
 async fn signal_reaches_active_runs_and_exits_once_none_remain() {
     let dispatch = SignalDispatch::default();
+    let exits = std::sync::Mutex::new(Vec::new());
+    let exit = |code| {
+        // Учёт запусков ещё заблокирован: новый запуск не войдёт до выхода.
+        assert!(dispatch.scopes.try_lock().is_err());
+        exits.lock().unwrap().push(code);
+    };
     // Без запуска получения сигнал завершает процесс стандартным кодом.
     assert_eq!(
-        dispatch.deliver(TerminationSignal::Terminate),
+        dispatch.deliver(TerminationSignal::Terminate, exit),
         SignalDelivery::Exit(143)
     );
     dispatch.enter();
@@ -209,13 +215,13 @@ async fn signal_reaches_active_runs_and_exits_once_none_remain() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert!(!first.is_finished());
     assert_eq!(
-        dispatch.deliver(TerminationSignal::Interrupt),
+        dispatch.deliver(TerminationSignal::Interrupt, exit),
         SignalDelivery::Delivered
     );
     first.await.unwrap().unwrap();
     // Пока запуск закрывает браузеры, повторный сигнал не обрывает остановку.
     assert_eq!(
-        dispatch.deliver(TerminationSignal::Interrupt),
+        dispatch.deliver(TerminationSignal::Interrupt, exit),
         SignalDelivery::Delivered
     );
     // Ожидание, начатое позже, не видит уже принятых сигналов.
@@ -224,13 +230,15 @@ async fn signal_reaches_active_runs_and_exits_once_none_remain() {
     assert!(!later.is_finished());
     dispatch.leave();
     assert_eq!(
-        dispatch.deliver(TerminationSignal::Hangup),
+        dispatch.deliver(TerminationSignal::Hangup, exit),
         SignalDelivery::Exit(129)
     );
     assert_eq!(
-        dispatch.deliver(TerminationSignal::Interrupt),
+        dispatch.deliver(TerminationSignal::Interrupt, exit),
         SignalDelivery::Exit(130)
     );
+    // Выход вызывается только при отсутствии запусков.
+    assert_eq!(*exits.lock().unwrap(), vec![143, 129, 130]);
     later.abort();
 }
 

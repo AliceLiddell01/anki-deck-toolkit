@@ -22,9 +22,11 @@ fn fake_browser(workspace: &TempWorkspace, name: &str, body: &str) -> BrowserLau
     }
 }
 
+/// Та же проверка, что у владельца группы: zombie без reaper не считаются.
 fn group_alive(group: i32) -> bool {
     match test_kill_process_group(Pid::from_raw(group).unwrap()) {
-        Ok(()) => true,
+        Ok(()) => group_has_live_members(Path::new(PROC_ROOT), group, std::process::id())
+            .unwrap_or_else(|error| panic!("проверка группы: {error}")),
         Err(rustix::io::Errno::SRCH) => false,
         Err(error) => panic!("проверка группы: {error}"),
     }
@@ -101,6 +103,25 @@ async fn leader_exit_before_address_still_drains_descendants_within_limit() {
         failure.message
     );
     // Лидер вышел сам, а оставшийся потомок собран в пределах лимита остановки.
+    assert_eq!(failure.stop, Ok(ProcessStop::Exited));
+    workspace.close().unwrap();
+}
+
+#[tokio::test]
+async fn exit_before_address_keeps_unterminated_stderr_held_open_by_descendant() {
+    let workspace = TempWorkspace::create("browser-process-partial-stderr-test").unwrap();
+    // Потомок держит stderr открытым, а строка отказа не завершена переводом строки.
+    let spec = fake_browser(
+        &workspace,
+        "browser",
+        "sleep 300 &\nprintf 'частичный отказ' >&2\nexit 3",
+    );
+    let failure = OwnedBrowserProcess::spawn(&spec).await.unwrap_err();
+    assert!(
+        failure.message.contains("частичный отказ"),
+        "{}",
+        failure.message
+    );
     assert_eq!(failure.stop, Ok(ProcessStop::Exited));
     workspace.close().unwrap();
 }

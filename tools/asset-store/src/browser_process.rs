@@ -17,7 +17,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 /// Максимальный объём `stderr`, сохраняемый для диагностики отказа запуска.
@@ -25,6 +25,9 @@ const MAX_LAUNCH_STDERR_BYTES: usize = 16 * 1024;
 /// После выхода лидера его потомки (renderer, zygote, GPU) получают время на
 /// самостоятельный выход до принудительного завершения группы.
 const DESCENDANT_EXIT_GRACE: Duration = Duration::from_millis(500);
+/// После выхода лидера до адреса DevTools уже записанный `stderr` дочитывается
+/// не дольше этого: потомки могут держать канал открытым, и EOF не наступит.
+const LAUNCH_STDERR_DRAIN: Duration = Duration::from_millis(200);
 const PROC_ROOT: &str = "/proc";
 
 /// Аргументы, совпадающие со стандартным запуском `chromiumoxide` 0.9.1
@@ -372,6 +375,8 @@ async fn devtools_address(
     loop {
         line.clear();
         tokio::select! {
+            // Готовые данные `stderr` разбираются раньше выхода процесса.
+            biased;
             read = reader.read_until(b'\n', &mut line) => {
                 let read = read.map_err(|error| format!("запуск браузера: чтение stderr: {error}"))?;
                 if read == 0 {
@@ -380,15 +385,29 @@ async fn devtools_address(
                 if let Some(address) = parse_devtools_address(&String::from_utf8_lossy(&line)) {
                     return Ok(address);
                 }
-                let room = MAX_LAUNCH_STDERR_BYTES.saturating_sub(captured.len());
-                captured.extend_from_slice(&line[..line.len().min(room)]);
+                append_bounded(&mut captured, &line);
             }
             status = child.wait() => {
                 let status = status.map_err(|error| format!("запуск браузера: {error}"))?;
+                // Незавершённая строка и уже записанный хвост тоже объясняют отказ.
+                append_bounded(&mut captured, &line);
+                let deadline = tokio::time::Instant::now() + LAUNCH_STDERR_DRAIN;
+                let mut chunk = [0_u8; 4096];
+                while captured.len() < MAX_LAUNCH_STDERR_BYTES {
+                    match tokio::time::timeout_at(deadline, reader.read(&mut chunk)).await {
+                        Ok(Ok(read)) if read > 0 => append_bounded(&mut captured, &chunk[..read]),
+                        _ => break,
+                    }
+                }
                 return Err(launch_output_error(&format!("запуск браузера: процесс завершился ({status}) до адреса DevTools"), &captured));
             }
         }
     }
+}
+
+fn append_bounded(captured: &mut Vec<u8>, bytes: &[u8]) {
+    let room = MAX_LAUNCH_STDERR_BYTES.saturating_sub(captured.len());
+    captured.extend_from_slice(&bytes[..bytes.len().min(room)]);
 }
 
 fn launch_output_error(message: &str, stderr: &[u8]) -> String {

@@ -393,11 +393,17 @@ impl Default for SignalDispatch {
 }
 
 impl SignalDispatch {
-    /// Решение и передача происходят под той же блокировкой, что и учёт
-    /// запусков: сигнал после выхода последнего запуска завершает процесс.
-    pub(crate) fn deliver(&self, signal: TerminationSignal) -> SignalDelivery {
+    /// Решение, передача и завершение `exit` происходят под той же
+    /// блокировкой, что и учёт запусков: новый запуск не может начаться между
+    /// решением о выходе и самим выходом.
+    pub(crate) fn deliver(
+        &self,
+        signal: TerminationSignal,
+        exit: impl FnOnce(i32),
+    ) -> SignalDelivery {
         let scopes = self.scopes();
         if *scopes == 0 {
+            exit(signal.exit_code());
             return SignalDelivery::Exit(signal.exit_code());
         }
         self.received.send_modify(|received| *received += 1);
@@ -470,9 +476,7 @@ fn process_signals() -> io::Result<&'static SignalDispatch> {
                         while let Ok(signal) = signals.recv().await {
                             let dispatch = process_signals()
                                 .expect("обработчик зарегистрирован до первого сигнала");
-                            if let SignalDelivery::Exit(code) = dispatch.deliver(signal) {
-                                std::process::exit(code);
-                            }
+                            dispatch.deliver(signal, |code| std::process::exit(code));
                         }
                     });
                 })
