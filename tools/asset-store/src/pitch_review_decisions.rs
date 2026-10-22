@@ -78,6 +78,9 @@ pub(crate) struct PitchReviewRow {
     pub validation_status: Option<SemanticStatus>,
     pub filename: Option<String>,
     pub vocabulary_candidates: Vec<PitchReviewVocabulary>,
+    /// Необязательное предложение LLM для точного кандидата строки; не решение.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<crate::pitch_llm_review::PitchLlmSuggestion>,
 }
 
 fn status_name(status: PitchBatchItemStatus) -> String {
@@ -103,7 +106,7 @@ impl crate::review_snapshot::ReviewRow for PitchReviewRow {
             .map(|candidate| format!("{}={}", candidate.vocabulary_id, candidate.detail_url))
             .collect::<Vec<_>>()
             .join(" ");
-        format!(
+        let mut columns = format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.identity.key,
             self.kind.as_str(),
@@ -119,7 +122,11 @@ impl crate::review_snapshot::ReviewRow for PitchReviewRow {
             } else {
                 &candidates
             },
-        )
+        );
+        if let Some(llm) = &self.llm {
+            columns.push_str(&format!("\t{}\t{}", llm.label(), llm.key()));
+        }
+        columns
     }
 
     fn validate(&self) -> Result<(), AssetError> {
@@ -140,6 +147,11 @@ impl crate::review_snapshot::ReviewRow for PitchReviewRow {
         if !consistent {
             return Err(invalid(
                 "строка review pitch accent внутренне несогласована",
+            ));
+        }
+        if self.llm.as_ref().is_some_and(|llm| !llm.matches_row(self)) {
+            return Err(invalid(
+                "предложение LLM не принадлежит точному кандидату строки review",
             ));
         }
         Ok(())
@@ -177,7 +189,7 @@ fn rejection_reason(review_id: &str) -> String {
 }
 
 /// Строки, по которым человек может принять решение, в порядке пакета.
-fn review_rows(batch: &PitchAccentBatch) -> Result<Vec<PitchReviewRow>, AssetError> {
+pub(crate) fn review_rows(batch: &PitchAccentBatch) -> Result<Vec<PitchReviewRow>, AssetError> {
     let mut ambiguous = Vec::new();
     let mut candidates = Vec::new();
     for item in &batch.items {
@@ -221,6 +233,7 @@ fn review_rows(batch: &PitchAccentBatch) -> Result<Vec<PitchReviewRow>, AssetErr
                     validation_status: None,
                     filename: None,
                     vocabulary_candidates,
+                    llm: None,
                 });
             }
             (
@@ -248,6 +261,7 @@ fn review_rows(batch: &PitchAccentBatch) -> Result<Vec<PitchReviewRow>, AssetErr
                     validation_status: Some(candidate.validation.status),
                     filename: Some(format!("{}-{}.png", item.identity.key, candidate.sha256)),
                     vocabulary_candidates: Vec::new(),
+                    llm: None,
                 });
             }
             _ => {}
@@ -257,7 +271,7 @@ fn review_rows(batch: &PitchAccentBatch) -> Result<Vec<PitchReviewRow>, AssetErr
     Ok(ambiguous)
 }
 
-fn owner_snapshot(
+pub(crate) fn owner_snapshot(
     store: &AssetStore,
 ) -> Result<(Vec<AssetRecord>, PitchBatchOwnerSnapshot), AssetError> {
     let records = store.verify_integrity()?;
@@ -266,7 +280,7 @@ fn owner_snapshot(
 }
 
 /// Возвращает сохранённое состояние пакета и его сверку с владельцем в памяти.
-fn load_reconciled(
+pub(crate) fn load_reconciled(
     runtime: &mut PitchAccentBatchRuntime,
     owner: &PitchBatchOwnerSnapshot,
 ) -> Result<(PitchAccentBatch, PitchAccentBatch), AssetError> {
@@ -289,7 +303,14 @@ pub(crate) fn export(
     if batch != stored {
         runtime.save(&batch)?;
     }
-    let rows = review_rows(&batch)?;
+    let mut rows = review_rows(&batch)?;
+    let suggestions = crate::pitch_llm_review::saved_or_empty(&runtime);
+    for row in &mut rows {
+        row.llm = suggestions
+            .get(&row.identity)
+            .filter(|suggestion| suggestion.matches_row(row))
+            .cloned();
+    }
     if rows.is_empty() {
         return Err(invalid(
             "нет кандидатов или неоднозначных записей, ожидающих просмотра",
@@ -595,6 +616,9 @@ fn write_preview(
                 "<img src=\"{source}\" alt=\"{}\">",
                 html_escape(&row.identity.key)
             ));
+            if let Some(llm) = &row.llm {
+                html.push_str(&format!("<pre>{}</pre>", html_escape(&llm.summary())));
+            }
         } else {
             html.push_str("</pre><ul>");
             for candidate in &row.vocabulary_candidates {

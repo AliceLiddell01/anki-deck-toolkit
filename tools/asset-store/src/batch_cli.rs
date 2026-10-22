@@ -1541,7 +1541,11 @@ fn execute_command_with_snapshots_and_progress(
                 },
             ));
             let artifact = runtime.write_review(&state)?.display().to_string();
-            let code = if issues.is_empty() { 0 } else { 3 };
+            let code = if issues.is_empty() && !report.stop_unproven {
+                0
+            } else {
+                3
+            };
             let changed = state.revision != initial_revision || report.saved > 0;
             let mut response = batch_response(
                 operation,
@@ -1552,6 +1556,11 @@ fn execute_command_with_snapshots_and_progress(
                 Some(artifact),
                 "ocr_suggestions_saved",
             );
+            if report.stop_unproven {
+                response
+                    .blockers
+                    .push("inference_server_stop_unproven".into());
+            }
             response.ocr_summary = Some(report);
             Ok((response, code))
         }

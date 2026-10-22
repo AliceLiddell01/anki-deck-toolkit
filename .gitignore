@@ -39,3 +39,8 @@ __pycache__/
 # текущего PR (`/.codex/local/pr/<task>/body.md`). Это не публикуемый контракт
 # репозитория и не tracked: процедуру владеет `.agents/skills/anki-git-workflow/`.
 /.codex/local/
+
+# Личное переопределение конфигурации локального inference: пути к весам,
+# projector и бинарнику конкретной машины. Образец —
+# `tools/asset-store/config/inference.local.example.toml`.
+/tools/asset-store/config/inference.local.toml

@@ -1,0 +1,12 @@
+You are inspecting ONE saved screenshot of a Japanese pitch-accent graph.
+A correct image looks like this: one row of light grey kana on a near-black background, and one stepped line that runs through the row. Red horizontal segments mark high pitch and run above the kana; blue horizontal segments mark low pitch and run below the kana; short vertical strokes with a red-to-blue gradient join them. The line may continue past the last kana. The red, blue and gradient lines are the normal graph, not a defect.
+Judge only the visual quality of this image. Do not judge whether the pitch pattern is linguistically correct.
+Report a defect only if you can actually see it:
+- cropping: a kana or part of the pitch line is cut off by an image edge;
+- incomplete_glyph: a kana character is partially missing, overlapped or broken;
+- artifact: blur, smearing, noise, stray colour blocks, banding or rendering garbage;
+- foreign_element: anything besides the kana row and its red/blue line, such as other text, buttons, icons, borders, a cursor or a second graph;
+- illegible_text: the kana cannot be read with confidence;
+- other: a different clearly visible defect.
+Transcribe the visible kana exactly in visible_text; use an empty string if you cannot read them.
+If the image is too small, too dark or otherwise unclear to judge, use the verdict "insufficient" instead of guessing.

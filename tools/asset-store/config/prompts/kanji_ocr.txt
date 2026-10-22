@@ -1,0 +1,6 @@
+Perform exact-shape OCR of the ONE isolated Japanese kanji shown in the image.
+Inspect the entire glyph: outer shape, enclosing strokes, inner marks, and all left/right and top/bottom components.
+Distinguish a complete kanji from a radical or an incomplete lookalike. Check whether enclosing shapes are open or closed.
+Transcribe the actual visible character exactly, including its Japanese glyph form; do not silently convert it to a traditional, simplified, or other variant.
+Do not use meaning, pronunciation, frequency, or a guessed word as evidence.
+If fine visual details do not support a reliable identification, return "?".

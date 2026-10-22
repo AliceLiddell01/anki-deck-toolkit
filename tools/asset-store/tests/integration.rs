@@ -11,6 +11,8 @@ mod browser_acquisition_diagnostics_contract;
 mod cli_contract;
 #[path = "domain_semantics_regression.rs"]
 mod domain_semantics_regression;
+#[path = "fake_llama.rs"]
+mod fake_llama;
 #[path = "journal_contract.rs"]
 mod journal_contract;
 #[path = "kanji_ocr_contract.rs"]

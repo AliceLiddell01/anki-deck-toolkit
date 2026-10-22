@@ -321,7 +321,11 @@ impl Drop for OwnedBrowserProcess {
 /// Есть ли в группе процесс не в состоянии зомби (`Z`) или завершённого (`X`). Если `proc_root` не
 /// принадлежит пространству PID текущего процесса или отсутствует, единственным
 /// свидетельством остаётся успешный `kill(-pgid, 0)`, и группа считается непустой.
-fn group_has_live_members(proc_root: &Path, group: i32, own_pid: u32) -> io::Result<bool> {
+pub(crate) fn group_has_live_members(
+    proc_root: &Path,
+    group: i32,
+    own_pid: u32,
+) -> io::Result<bool> {
     let own = std::fs::read_link(proc_root.join("self"));
     if !own.is_ok_and(|own| own.as_os_str() == own_pid.to_string().as_str()) {
         return Ok(true);

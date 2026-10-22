@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 3866874ededc90b48eb107a2da20c09b822f72d3 -->
+<!-- i18n-source-git-blob: 1434777f9e0bd829e1f3b41adbf52d7fab7736aa -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -350,7 +350,7 @@ cargo run --locked -p asset-store --bin pitch-assets -- --output json batch revi
 
 信任级别不变：该领域仍为 `AUTOMATED_VERIFIED_ONLY`。`y` 既不发布也不修改所有者记录，因此任何人工决定都不能使 `UNCERTAIN`、`REJECTED`、`CORRUPT`、缺失或旧 v5 证据变为可用。选择词条与 `batch select` 使用相同转换；下一次 `batch run` 会通过 JPDB 搜索再次确认。`r` 与 `batch reject` 使用相同转换；若被拒绝的 SHA 与已发布的所有者记录一致，则通过 `AssetStore::attest` 隔离，并写入 `trust_revoked` 日志事件，重复执行不会写入第二个事件。应用摘要在 `review_decisions` 中返回。
 
-可选的外部检查（例如将来的语言模型）只能为某行附加提示，并绑定到该行身份和精确 SHA，正如目前 `kanji-assets` 的 OCR。提示永远不会成为决定：只有显式的第一列才是决定，也不能绕过领域的信任规则。
+可选的外部检查——例如本地模型的视觉检查（`batch llm-review`，见“本地推理”）——只能为某行附加提示，并绑定到该行身份和精确 SHA，正如 `kanji-assets` 的 OCR。提示永远不会成为决定：只有显式的第一列才是决定，也不能绕过领域的信任规则。
 
 ### 从验证器 v5 迁移
 
@@ -664,24 +664,85 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch review-appl
 
 旧 `kanji-distinct-mean-v2` 批次仍按旧规则读取。显式 `batch revalidate --batch-id ID` 使用当前验证器/解码器重新验证保存的字节，并原子迁移到 `kanji-single-candidate-v1`，**不联网、不伪造尝试**。旧人工批准保留在 `human_decisions`，与准确 SHA 绑定。相同字节通过当前技术检查且非 `Corrupt` 时，旧批准仍决定 `HumanVerified`；否则仅作为历史保存，重新计算有效状态并清理发布标志。`ExistingVerified` 继续受资源所有者信任规则约束，迁移后与最新规范存储对账。不同版本验证器的旧自动状态不继承；批次状态/版本变化后应重新导出编辑快照。
 
-### 可选的 Ollama 盲识别 OCR 建议
+### 本地推理：llama.cpp 与 Ollama
 
-`batch ocr` 按顺序处理**已经保存**的批次。普通 `start`、`run`、`status`、`review`、已验证资源读取及所有音高重音操作都不会连接 Ollama。首先核对规范资源库完整性和现行信任，复用已经确认的资源。只有当前技术有效、处于 `awaiting_human` 且 v6 验证器为 `Uncertain` 的候选可使用 OCR。`Verified`、`Rejected`、`Corrupt` 和已经解决的项目**甚至不会触发 Ollama discovery**，也不会重新访问 Yarxi。
+两个可选任务使用本地视觉模型：对已保存的不确定汉字候选进行盲识别 OCR（`kanji_ocr`），以及对已保存的 JPDB PNG 进行视觉检查（`jpdb_pitch_review`）。普通 `start`、`run`、`status`、`review`、已验证资源读取和发布从不调用模型。模型结果只是给人的**建议**：它从不授予 `AutoVerified` 或 `HumanVerified`，也不改变候选、决定、信任或 v6 验证器。
+
+#### 配置
+
+设置由多个层组合而成，后一层替换前一层的键：
+
+1. `tools/asset-store/config/inference.toml` —— 受版本控制的默认值，编译进二进制，并用注释说明每个键；
+2. `tools/asset-store/config/inference.local.toml` —— 工作副本的个人部分覆盖（被 Git 忽略；样例为 `inference.local.example.toml`）；
+3. `--inference-config FILE` —— 同格式的显式文件；
+4. `--inference-set KEY=VALUE` 以及针对所选任务配置档的快捷参数 `--backend`、`--model`、`--endpoint`、`--allow-remote`、`--timeout-seconds`。
+
+模式是严格的（`schema_version = 1`）：未知键、错误类型、超出范围的值或指向不存在配置档的引用，都会在启动模型之前返回 `inference_config_invalid`。配置分为三层：
+
+- `[backends.<名称>]` —— 推理运行方式：`kind = "llama_server"`（托管 `mode = "managed"` 或外部 `mode = "external"`）或 `kind = "ollama"`；
+- `[models.<配置档>]` —— 选定的 `backend`，以及 `llama_server` 和 `ollama` 子表中的权重、projector、上下文、CPU 线程、batch/ubatch、并行槽、GPU 层放置、`flash_attention`、`reasoning`、`keep_alive`；
+- `[tasks.kanji_ocr]`、`[tasks.jpdb_pitch_review]` —— 模型配置档、提示词文件、`temperature`、`max_output_tokens`、`structured_output`、`timeout_seconds`、`seed`。
+
+提示词是单独的文本文件，无需重新编译即可修改。JSON 答复格式、其校验和信任规则属于代码，不放入提示词。相对路径相对于设置它的文件所在目录解析；CLI 层相对于当前目录。空字符串表示“未配置”。没有环境变量或 shell 替换。默认未设置任何模型：任务返回类型化拒绝 `inference_unavailable`，原因为 `backend_not_configured`、`model_not_configured` 或 `projector_not_configured`，其他命令照常工作。工具从不下载模型，也不访问云服务。
+
+从 WSL 启动 Windows 版 llama.cpp：`llama-server.exe` 进程使用 Windows 的 CPU、GPU 和内存，并像 Windows 版 Ollama 一样监听 loopback。设置 `windows_interop = true`；模型和 projector 的 `/mnt/<盘符>/…` 路径以 `<盘符>:\…` 形式传给服务器，不在已挂载 Windows 磁盘上的路径会以 `path_not_visible_to_windows` 拒绝。
+
+```toml
+# tools/asset-store/config/inference.local.toml
+[backends.llama]
+binary = "/mnt/c/Tools/llama.cpp/llama-server.exe"
+windows_interop = true
+
+[models.kanji_vision.llama_server]
+model = "/mnt/c/Models/model.gguf"
+projector = "/mnt/c/Models/mmproj.gguf"
+
+[models.kanji_vision.ollama]
+model = "qwen3.5:9b-q4_K_M"
+```
+
+#### 诊断与试探请求
+
+```bash
+# 生效设置、每个键的来源和任务就绪状态；不启动模型：
+cargo run --quiet --locked --bin kanji-assets -- inference show
+# 启动并验证任务后端，然后停止自己启动的服务器：
+cargo run --quiet --locked --bin kanji-assets -- --output json inference check --task kanji-ocr
+# 对批次之外的本地图片发送一次请求；不修改资源库：
+cargo run --quiet --locked --bin kanji-assets -- --output json inference probe \
+  --task kanji-ocr --image /path/to/kanji.gif
+cargo run --quiet --locked --bin pitch-assets -- --output json inference probe \
+  --task jpdb-pitch-review --image /path/to/graph.png \
+  --inference-set tasks.jpdb_pitch_review.max_output_tokens=512
+```
+
+`inference show` 从不输出提示词内容或访问密钥。`check` 返回 `ready`，附带后端与模型身份、就绪耗时、进程 PID 与内存以及停止证明。`probe` 拒绝读取工作副本 `decks/` 下的文件，单张图片限制为 8 MiB，并输出最多 2000 个字符的原始答复。退出码：`0` 成功，`3` 模型不可用或推理拒绝，`130` 被信号中断。
+
+#### 托管 `llama-server`
+
+在 `mode = "managed"` 下，一次操作启动自己的进程，证明其就绪与身份，执行请求并将其停止。服务器不经 shell 启动，使用显式参数、随机 `--alias` 和 `--api-key`；不继承父进程的 `LLAMA_ARG_*` 变量。就绪意味着 `/health` 成功且 `/props` 一致：别名、权重路径和视觉支持。所选端口上的他人进程返回 `foreign_server`，无视觉能力的模型返回 `model_does_not_support_vision`，其他权重返回 `model_mismatch`。端口 `0` 表示 Linux 动态范围之外的随机空闲端口；被占用的显式端口返回 `port_in_use`。启动失败按服务器输出区分：`projector_load_failed`、`model_load_failed`、`invalid_server_arguments`、`server_exited_during_startup`、`startup_timeout`、`model_file_missing`。
+
+同一时间只加载一个重型模型（`max_loaded_models = 1`）：第二次启动得到 `managed_server_busy` 而不是并行加载，切换配置档会在启动下一个进程之前停止前一个。停止时向进程组发送 SIGTERM，超过 `shutdown_timeout_seconds` 后发送 SIGKILL；随后检查进程组为空、端口已释放，以及（Windows 情况下）Windows 进程已消失。只有被证明的停止才会删除 `$XDG_CACHE_HOME/anki-deck-toolkit/inference/`（否则为 `~/.cache/…`）中的 lease 文件。崩溃后遗留进程的 lease 按 PID、启动时间和命令行中的别名核对；下一次运行会停止这样的进程，绝不触碰他人的进程。Ctrl+C 中断当前请求、停止服务器并以退出码 `130` 返回 `interrupted`；已保存的记录保留。如果无法证明已停止，命令返回退出码 `3` 和 `inference_server_stop_unproven`。
+
+`mode = "external"` 连接到 `endpoint` 上已经运行的服务器；由用户启动和停止。如果配置档设置了 `model`，`/props` 中的权重路径必须一致；否则记录 `reported-path:<路径>` 作为身份。此模式下不计算权重 SHA-256。
+
+地址只支持 HTTP，不允许 credentials、路径、query 或 fragment。除**字面 IPv4/IPv6 loopback** 外的任何地址都需要 `allow_remote = true` 或 `--allow-remote`，即明确同意向该服务器发送图片。禁用代理和重定向；响应限制为 1 MiB，模型文本限制为 64 KiB。在 WSL 镜像网络模式下，Windows 上的 Ollama 可通过 `http://127.0.0.1:11434` 访问。
+
+#### 汉字 OCR
+
+`batch ocr` 按顺序处理**已经保存**的批次。首先核对规范资源库完整性和现行信任，复用已经确认的资源。只有当前技术有效、处于 `awaiting_human` 且 v6 验证器为 `Uncertain` 的候选可使用 OCR。`Verified`、`Rejected`、`Corrupt` 和已经解决的项目不会启动模型，也不会重新访问 Yarxi。
 
 ```bash
 # 常规路径，不使用 OCR：
 cargo run --quiet --locked --bin kanji-assets -- batch start --batch-id my-kanji 漢 字
 cargo run --quiet --locked --bin kanji-assets -- batch run --batch-id my-kanji
 
-# 显式对已保存的不确定候选启用 OCR：
-cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
-  --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' \
-  --endpoint 'http://127.0.0.1:11434' --timeout-seconds 120
+# 用已配置的后端（默认 llama.cpp）对已保存的不确定候选执行 OCR：
+cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr --batch-id my-kanji
 
-# 从 WSL 访问 Windows 主机时，请改成实际可用的地址，而不是示例地址：
+# 通过本地 Ollama 执行同样的 OCR：
 cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
-  --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' \
-  --endpoint 'http://192.168.1.2:11434' --allow-remote
+  --batch-id my-kanji --backend ollama --model 'qwen3.5:9b-q4_K_M' --timeout-seconds 120
 
 # 获取 TSV 及其旁边的 index.html；决定最初为空，'-' 表示显式跳过：
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-export --batch-id my-kanji
@@ -697,20 +758,31 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch review-appl
   --batch-id my-kanji --review-id NEW_REVIEW_SHA256
 # 显式重跑 OCR，包括已保存的拒绝结果：
 cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
-  --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' --rescan
+  --batch-id my-kanji --rescan
 ```
 
 应用一组匹配之后，应为剩余行重新执行 `review-export`：它们的状态已经变化，之前的快照仍包含已应用的行。`review-confirm-matches` 与 `review-apply` 采用完全相同的 TSV/SHA/世代/图片副本检查和原子 `human_decisions`。只会为匹配组中的**空白行**新增确认；`-` 明确跳过。TSV 中显式填入的其他决定也会应用。`--confirm-reviewed` 表示使用者实际检查图片，并知晓 OCR 可能误识别；仅生成/打开报告不会确认任何内容。行顺序为匹配、不匹配、无法识别/失败、没有 OCR。增加的 TSV 列（`observed`、匹配标志、拒绝原因、建议键）属于受保护元数据，**不可编辑**；缺少这些列的旧快照仍可读取。
 
-Ollama 基础 URL 只支持 HTTP，不允许 credentials、路径、query 或 fragment。除**字面 IPv4/IPv6 loopback** 外的任何地址——包括 DNS 名称及私有 WSL 主机——都必须指定 `--allow-remote`，明确允许向该服务器发送图片。禁用代理和 HTTP 重定向。用户自行安装 Ollama、模型并启动服务器；工具不会下载模型或启动服务。`/api/tags` 固定已安装模型 digest，`/api/show` 要求 `vision` 能力，并拒绝声明 `remote_host` 的云模型。模型/地址可配置；WSL 内的 `127.0.0.1` 不一定能访问 Windows 主机。
+默认提示词为 `config/prompts/kanji_ocr.txt`；与答复格式指令组合后逐字再现 Structure 研究的 `structure-v1` 指令，其 SHA-256 有测试固定。模型**仅接收**提示词和 PNG，绝不发送期望 Unicode、路径、原文件名或文章上下文。答复是只有一个字符串字段 `observed` 的 JSON；仅接受**一个**受支持 Han/CJK 字符或 `?`，不对 Unicode 字形变体规范化。多余字段、解释文字、多字符 `observed`、不完整答复以及因 token 上限截断都记为建议拒绝。
 
-`structure-v1` 指令逐字采用 Structure 研究内容，其 SHA-256 有测试固定。`/api/chat` **仅接收**通用指令和 base64 PNG，绝不发送期望 Unicode、路径、原文件名或文章上下文。请求设置：`stream=false`、`think=false`、`temperature=0`、`num_predict=128`、`num_ctx=4096`，使用只有一个字符串字段 `observed` 的 JSON schema。仅接受**一个**受支持 Han/CJK 字符或 `?`，不对 Unicode 字形变体规范化。多余字段、解释文字、多字符 `observed`、不完整答复及 `done_reason=length` 都记为建议拒绝。
+准备输入时使用已保存的原始字节与 SHA。受限 v6 解码器选择完整的代表性 GIF 帧，再通过第二次有界解码获取该合成帧；PNG 必须完全解码。透明内容合成到白色背景，Rust `image` 使用 Lanczos3 **放大两倍**并编码单张 PNG。这是独立 Rust Lanczos3 实现，**不保证**与历史 PowerShell/System.Drawing 像素一致。源文件最大 **8 MiB**，单边最长 **2048** 像素，GIF 最多 **512 帧**，解码上限 **32 MiB**；输出最大 **4096×4096** 和 **8 MiB**。
 
-准备输入时使用已保存的原始字节与 SHA。受限 v6 解码器选择完整的代表性 GIF 帧，再通过第二次有界解码获取该合成帧；PNG 必须完全解码。透明内容合成到白色背景，Rust `image` 使用 Lanczos3 **放大两倍**并编码单张 PNG。这是独立 Rust Lanczos3 实现，**不保证**与历史 PowerShell/System.Drawing 像素一致。源文件最大 **8 MiB**，单边最长 **2048** 像素，GIF 最多 **512 帧**，解码上限 **32 MiB**；输出最大 **4096×4096** 和 **8 MiB**。网络响应最多 **1 MiB**，请求/读响应超时 `--timeout-seconds` 为 **1–600 秒**（默认 **120**）。每次仅执行一个模型请求。取消时保留已完成的原子检查点，未完成请求可重试。
+建议只存于 `.runtime/batches/<id>/ocr/suggestions.json`。缓存键和来源记录包括身份、原始 SHA、任务、答复契约、转换版本、组合后提示词的 SHA 及其来源、后端及其模式和版本、模型配置档与名称、权重文件 SHA-256（Ollama 为 digest）、projector SHA-256、加载与生成参数。其中任何一项变化都会产生新键：旧记录绝不会被当作另一模型或提示词的结果。大型 GGUF 的 SHA-256 按路径、大小和修改时间缓存在状态目录中。检查缓存需要已准备好的后端：托管服务器会被启动，之后命中缓存时进行 **0 次**模型请求。每次请求前后都重新读取模型身份：扫描过程中模型变化时存为 `model_changed_during_scan` 拒绝。后端准备失败会为每个候选以权重 `unavailable` 保存；稍后成功启动则产生不同的键。同配置下重试拒绝需要 `--rescan`。模型工作期间释放运行时锁；返回后检查当前 SHA、世代和候选，丢弃过期结果。
 
-建议只存于 `.runtime/batches/<id>/ocr/suggestions.json`，记录身份、原始及处理后 SHA、格式/帧/尺寸、提供者 URL、模型/digest、指令版本/SHA、转换版本、生成参数、超时、时间戳和拒绝类型。缓存绑定**准确字节和配置**。显式重复 OCR 会重新执行模型 discovery，但命中缓存时进行 **0 次 `/api/chat` 请求**。推理前后都重新核对 digest；中途变化时存为 `model_changed_during_scan` 拒绝，不写 `observed`。不同 SHA/模型/digest/提示/转换版本不可以复用旧结果。已保存建议及 HTML 可离线查看。Discovery 失败使用 digest `unavailable`；稍后成功则产生不同缓存键。同配置下重试已失败的 `/api/chat` 需要 `--rescan`。网络过程中释放运行时锁；返回后检查当前 SHA、世代和候选，丢弃过期结果。
+旧版仅 Ollama 路径的记录（`provider`、`endpoint`、`digest` 等）仍可读取，并在 `review-export` 中标注为旧版仅 Ollama 路径。它们的键与新模式的键不同，因此绝不会成为新运行的缓存命中。
 
-命令 JSON 包含 `ocr_summary`（`saved`、`cache_hits`、`chat_requests`）。保存的提供者拒绝返回退出码 `3`，并针对准确身份生成 `issues`，**不修改**候选及自动验证决定。磁盘/目录边界错误使用标准 `AssetError` 退出码。OCR **从不授予** `AutoVerified` 或 `HumanVerified`，不把错误 Unicode 重命名，也不是信任验证器。更新可选模型不会重新评估已确认的规范资源。
+命令 JSON 包含 `ocr_summary`（`saved`、`cache_hits`、`chat_requests`）以及带有服务器身份、就绪耗时和停止证明的 `inference` 报告。保存的模型拒绝返回退出码 `3`，并针对准确身份生成 `issues`，**不修改**候选及自动验证决定。磁盘/目录边界错误使用标准 `AssetError` 退出码。更新可选模型不会重新评估已确认的规范资源。
+
+#### JPDB PNG 视觉检查
+
+```bash
+cargo run --quiet --locked --bin pitch-assets -- --output json batch llm-review --batch-id my-pitch
+cargo run --quiet --locked --bin pitch-assets -- --output json batch review-export --batch-id my-pitch
+```
+
+`batch llm-review` 检查审核快照（`batch review-export`）中当前候选行已保存的 PNG，不会重新从 JPDB 获取。模型只看到用 Lanczos3 放大到长边约 448 px 的 PNG：不发送期望读音和 surface。答复包含 `verdict`（`no_defect_observed`、`defect_observed`、`insufficient`）、最多六条观察（类别为 `cropping`、`incomplete_glyph`、`artifact`、`foreign_element`、`illegible_text`、`other`）以及读到的文本 `visible_text`。代码把片假名折叠为平假名后，将读到的文本与期望读音比较；不一致或不完整的答复记为拒绝。
+
+建议保存在批次的 `llm-review/suggestions.json` 中，并绑定到身份、SHA、世代、条目修订、请求指纹、尝试以及完整的模型与提示词来源。在 `review-export` 中，该行获得两个受保护的列——`llm:<verdict>`（或 `llm_failure:<代码>`）和建议键——并在 HTML 中显示“LLM（建议，而非决定）”摘要。决定仍然只是显式的第一列；`AUTOMATED_VERIFIED_ONLY` 规则、`VERIFIED` 和发布都不变。如果请求期间该行发生变化，结果会被丢弃（`stale_discarded`）。退出码 `3` 表示存在模型拒绝或停止未被证明。
 
 ## 检查
 

@@ -26,6 +26,13 @@ pub enum ErrorCode {
     IoFailure,
     JournalTooLarge,
     ValidatorFailure,
+    /// Конфигурация локального inference нарушает схему или ссылается на несуществующее.
+    InferenceConfigInvalid,
+    /// Запрошенная задача inference не может быть выполнена: модель не настроена,
+    /// backend недоступен или не подтвердил идентичность модели.
+    InferenceUnavailable,
+    /// Операция прервана сигналом пользователя после корректной остановки ресурсов.
+    Interrupted,
 }
 
 impl ErrorCode {
@@ -53,12 +60,15 @@ impl ErrorCode {
             Self::IoFailure => "io_failure",
             Self::JournalTooLarge => "journal_too_large",
             Self::ValidatorFailure => "validator_failure",
+            Self::InferenceConfigInvalid => "inference_config_invalid",
+            Self::InferenceUnavailable => "inference_unavailable",
+            Self::Interrupted => "interrupted",
         }
     }
 
     /// Код завершения процесса: 0 — успех или отсутствие изменений, 3 —
     /// блокировка или ошибка ввода, 4 — нарушение целостности, границы или схемы,
-    /// 5 — ошибка ввода-вывода или валидатора.
+    /// 5 — ошибка ввода-вывода или валидатора, 130 — прерывание сигналом.
     pub const fn exit_code(self) -> u8 {
         match self {
             Self::InvalidIdentity
@@ -67,7 +77,9 @@ impl ErrorCode {
             | Self::SourceMissing
             | Self::SourceNotRegular
             | Self::InvalidTransition
-            | Self::InvalidValidationEvidence => 3,
+            | Self::InvalidValidationEvidence
+            | Self::InferenceConfigInvalid
+            | Self::InferenceUnavailable => 3,
             Self::InvalidStoreRoot
             | Self::BoundaryViolation
             | Self::StoreMissing
@@ -81,6 +93,7 @@ impl ErrorCode {
             | Self::IntegrityMismatch
             | Self::JournalTooLarge => 4,
             Self::IoFailure | Self::ValidatorFailure => 5,
+            Self::Interrupted => 130,
         }
     }
 }
