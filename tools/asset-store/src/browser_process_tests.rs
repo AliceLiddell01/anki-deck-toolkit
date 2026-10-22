@@ -213,3 +213,50 @@ fn devtools_address_requires_browser_websocket() {
         None
     );
 }
+
+fn fake_proc(workspace: &TempWorkspace, own_pid: u32, processes: &[(u32, &str)]) -> PathBuf {
+    let root = workspace.path().join("proc");
+    fs::create_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink(own_pid.to_string(), root.join("self")).unwrap();
+    for (pid, stat) in processes {
+        let directory = root.join(pid.to_string());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("stat"), stat).unwrap();
+    }
+    root
+}
+
+#[test]
+fn zombie_descendants_do_not_keep_the_group_alive() {
+    let workspace = TempWorkspace::create("browser-process-zombie-test").unwrap();
+    // Поле comm с пробелом и скобкой не сдвигает разбор полей.
+    let root = fake_proc(
+        &workspace,
+        1,
+        &[
+            (1, "1 (asset store) S 0 1 1 0 -1"),
+            (41, "41 (chrome) (x)) Z 1 40 40 0 -1"),
+            (42, "42 (chrome) X 1 40 40 0 -1"),
+            (43, "43 (other) S 1 77 77 0 -1"),
+        ],
+    );
+    assert!(!group_has_live_members(&root, 40, 1).unwrap());
+    fs::write(root.join("41/stat"), "41 (chrome) (x)) S 1 40 40 0 -1").unwrap();
+    assert!(group_has_live_members(&root, 40, 1).unwrap());
+    // Недоказуемое `/proc` чужого пространства PID оставляет группу непустой.
+    assert!(group_has_live_members(&root, 77, 2).unwrap());
+    assert!(group_has_live_members(&workspace.path().join("absent"), 40, 1).unwrap());
+    fs::write(root.join("41/stat"), "41 (chrome) (x)) Z 1 40 40 0 -1").unwrap();
+    fs::write(root.join("43/stat"), "43 (other").unwrap();
+    assert_eq!(
+        group_has_live_members(&root, 40, 1).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    workspace.close().unwrap();
+}
+
+#[test]
+fn live_group_is_seen_through_the_real_proc() {
+    let group = getpgid(None).unwrap().as_raw_nonzero().get();
+    assert!(group_has_live_members(Path::new(PROC_ROOT), group, std::process::id()).unwrap());
+}

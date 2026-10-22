@@ -25,6 +25,7 @@ const MAX_LAUNCH_STDERR_BYTES: usize = 16 * 1024;
 /// После выхода лидера его потомки (renderer, zygote, GPU) получают время на
 /// самостоятельный выход до принудительного завершения группы.
 const DESCENDANT_EXIT_GRACE: Duration = Duration::from_millis(500);
+const PROC_ROOT: &str = "/proc";
 
 /// Аргументы, совпадающие со стандартным запуском `chromiumoxide` 0.9.1
 /// (`DEFAULT_ARGS`, headless, без расширений, с песочницей) для настроек
@@ -278,10 +279,13 @@ impl OwnedBrowserProcess {
 
     fn group_has_members(&self) -> io::Result<bool> {
         match test_kill_process_group(self.group) {
-            Ok(()) => Ok(true),
-            Err(rustix::io::Errno::SRCH) => Ok(false),
-            Err(error) => Err(error.into()),
+            Ok(()) => {}
+            Err(rustix::io::Errno::SRCH) => return Ok(false),
+            Err(error) => return Err(error.into()),
         }
+        // `kill(-pgid, 0)` успешен и для zombie: без reaper (например, CLI как
+        // PID 1 контейнера) вышедшие потомки иначе навсегда «занимали» бы группу.
+        group_has_live_members(Path::new(PROC_ROOT), self.pid(), std::process::id())
     }
 
     fn signal_group(&self, signal: Signal) -> io::Result<()> {
@@ -300,6 +304,52 @@ impl Drop for OwnedBrowserProcess {
             let _ = self.signal_group(Signal::KILL);
         }
     }
+}
+
+/// Есть ли в группе процесс не в состоянии zombie/dead. Если `proc_root` не
+/// принадлежит пространству PID текущего процесса или отсутствует, единственным
+/// свидетельством остаётся успешный `kill(-pgid, 0)`, и группа считается непустой.
+fn group_has_live_members(proc_root: &Path, group: i32, own_pid: u32) -> io::Result<bool> {
+    let own = std::fs::read_link(proc_root.join("self"));
+    if !own.is_ok_and(|own| own.as_os_str() == own_pid.to_string().as_str()) {
+        return Ok(true);
+    }
+    for entry in std::fs::read_dir(proc_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.is_empty() || !name.as_encoded_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let stat = match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            // Процесс завершился между чтением каталога и `stat`.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let (state, pgrp) = stat_state_and_group(&stat).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "невалидный /proc/PID/stat")
+        })?;
+        if pgrp == group && !matches!(state, b'Z' | b'X' | b'x') {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Состояние (поле 3) и группа процессов (поле 5) из `/proc/PID/stat`; поле
+/// `comm` может содержать `)`, поэтому разбор идёт от последней скобки.
+fn stat_state_and_group(stat: &[u8]) -> Option<(u8, i32)> {
+    let closing = stat.iter().rposition(|byte| *byte == b')')?;
+    let tail = std::str::from_utf8(&stat[closing + 1..]).ok()?;
+    let mut fields = tail.split_ascii_whitespace();
+    let state = fields.next().filter(|state| state.len() == 1)?.as_bytes()[0];
+    let pgrp = fields.nth(1)?.parse().ok()?;
+    Some((state, pgrp))
 }
 
 async fn resolve_executable(path: &Path) -> io::Result<PathBuf> {

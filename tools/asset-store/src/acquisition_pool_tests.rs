@@ -89,7 +89,8 @@ fn stale_or_foreign_result_is_rejected_and_keeps_assignment() {
 
 #[test]
 fn requeued_job_goes_to_a_neighbour_when_worker_retires() {
-    let (mut ledger, mut receivers) = ledger(vec![job(0, 1), job(1, 1)], 2);
+    // В очереди только одно задание: соседу может достаться лишь возвращённое.
+    let (mut ledger, mut receivers) = ledger(vec![job(0, 1)], 2);
     ledger.mark_ready(1).unwrap();
     ledger.dispatch().unwrap();
     let returned = ledger.accept(1, |_| true).unwrap();
@@ -105,11 +106,12 @@ fn requeued_job_goes_to_a_neighbour_when_worker_retires() {
         receivers[0].try_recv(),
         Err(mpsc::error::TryRecvError::Disconnected)
     ));
-    assert_eq!(receivers[1].try_recv().unwrap(), job(1, 1));
+    assert_eq!(receivers[1].try_recv().unwrap(), job(0, 1));
+    assert_eq!(ledger.active(2), Some(&job(0, 1)));
     assert_eq!(ledger.retired_workers(), vec![1]);
     assert_eq!(
         ledger.unfinished().cloned().collect::<Vec<_>>(),
-        vec![job(0, 1), job(1, 1)]
+        vec![job(0, 1)]
     );
 }
 

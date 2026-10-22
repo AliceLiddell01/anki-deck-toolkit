@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 051524598bdeaf789e18e9032508b249ef1d7863 -->
+<!-- i18n-source-git-blob: f0a7f6917d1ba862c070929561a7a1d4db43fc4b -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -64,7 +64,7 @@
 
 公共 Chromium 会话、可执行文件定位、启动诊断、CDP 指标和网络技术遥测在 `browser_runtime.rs` 中。Yarxi 保留自身选择器、URL、TLS 策略、过滤器、后备来源、深色主题和截图几何；公共运行时支持独立的 `3.0` 缩放系数。JPDB 使用隔离会话，`pitch-assets` 独立处理批次并发布已验证 PNG。与 `anki-repo` 的集成仍是单独能力。
 
-Chromium 进程由 `browser_process.rs` 拥有，而不是 `chromiumoxide`：浏览器使用与原 `Browser::launch` 相同的参数启动，但位于**自己的进程组**（`process_group(0)`），CDP 连接到其打印的 DevTools 地址。因此终端 `Ctrl+C` 只把 `SIGINT` 发送给 CLI，而不发送给浏览器：取消由协调器执行，正在进行的请求不会因浏览器退出而变成伪造的 `technical_failure`。停止过程区分各阶段：关闭 CDP（`browser_transport_stop`）、进程组首进程在最多 10 秒窗口内自行退出（`browser_process_exited`）或强制结束整个组（`browser_process_killed`），随后回收组内后代直到 `ESRCH`。信号只发送给本次启动创建的组：在首进程被回收（`wait`）之前，组号不会转给其他进程；回收之后，仅当探测确认组内仍有进程时才向后代发送 `SIGKILL`，探测与发送信号之间仍存在一个狭窄窗口。CLI 自身因 `SIGKILL`/`SIGQUIT` 异常退出时不经过此路径：只要残留进程仍引用运行目录树，孤立运行清理就拒绝删除它。
+Chromium 进程由 `browser_process.rs` 拥有，而不是 `chromiumoxide`：浏览器使用与原 `Browser::launch` 相同的参数启动，但位于**自己的进程组**（`process_group(0)`），CDP 连接到其打印的 DevTools 地址。因此终端 `Ctrl+C` 只把 `SIGINT` 发送给 CLI，而不发送给浏览器：取消由协调器执行，正在进行的请求不会因浏览器退出而变成伪造的 `technical_failure`。停止过程区分各阶段：关闭 CDP（`browser_transport_stop`）、进程组首进程在最多 10 秒窗口内自行退出（`browser_process_exited`）或强制结束整个组（`browser_process_killed`），随后回收组内后代直到 `ESRCH`；组内残留的 zombie（例如没有 reaper、CLI 是容器的 PID 1 时）根据 `/proc` 不计为组成员。信号只发送给本次启动创建的组：在首进程被回收（`wait`）之前，组号不会转给其他进程；回收之后，仅当探测确认组内仍有进程时才向后代发送 `SIGKILL`，探测与发送信号之间仍存在一个狭窄窗口。CLI 自身因 `SIGKILL`/`SIGQUIT` 异常退出时不经过此路径：只要残留进程仍引用运行目录树，孤立运行清理就拒绝删除它。
 
 Yarxi 与 JPDB 共用的并行获取层是 `acquisition_pool.rs`：分配账本（每个 worker 至多一项、校验结果属于其分配、重新入队、使 worker 退出池）、以首个原因（`ctrl_c` 或协调器故障）取消整个池、会话恢复预算，以及对 `SIGINT`/`SIGTERM`/`SIGHUP` 的订阅。该层不了解浏览器和提供者：`token`/`CAS` 检查、检查点、验证器和信任规则仍由领域协调器负责，因此也可以接入非浏览器来源。
 
