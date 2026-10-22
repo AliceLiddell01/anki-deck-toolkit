@@ -32,6 +32,8 @@ pub mod pitch_accent;
 pub mod pitch_batch;
 pub mod pitch_cli;
 pub mod pitch_review;
+mod pitch_review_decisions;
+mod review_snapshot;
 pub mod selection;
 pub mod store;
 pub mod temp_workspace;

@@ -155,6 +155,18 @@ pub enum PitchBatchCommand {
         #[arg(long, required = true)]
         batch_id: String,
     },
+    /// Создаёт адресуемый SHA снимок проверки: копии PNG, `index.html` и `decisions.tsv`.
+    ReviewExport {
+        #[arg(long, required = true)]
+        batch_id: String,
+    },
+    /// Атомарно применяет решения снимка после сверки каждой строки с актуальным состоянием.
+    ReviewApply {
+        #[arg(long, required = true)]
+        batch_id: String,
+        #[arg(long, required = true)]
+        review_id: String,
+    },
     /// Сохраняет точный выбор пользователя; следующий `run` заново проверит его поиском JPDB.
     Select {
         #[arg(long, required = true)]
@@ -346,6 +358,15 @@ struct Response {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     retried_identities: Vec<String>,
     artifact: Option<String>,
+    /// Адрес снимка проверки (`batch review-export`/`review-apply`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_id: Option<String>,
+    /// Путь к `decisions.tsv` снимка проверки.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_artifact: Option<String>,
+    /// Сводка применённых решений `batch review-apply`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_decisions: Option<crate::pitch_review_decisions::PitchReviewApplied>,
     error: Option<ErrorSummary>,
     /// Машиночитаемая часть ответа команд `journal`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -543,8 +564,18 @@ fn prevalidate_command(
                 validate_pitch_workers(usize::from(*workers))?;
                 Ok((None, None))
             }
-            PitchBatchCommand::Status { batch_id } | PitchBatchCommand::Review { batch_id } => {
+            PitchBatchCommand::Status { batch_id }
+            | PitchBatchCommand::Review { batch_id }
+            | PitchBatchCommand::ReviewExport { batch_id } => {
                 crate::batch_runtime::validate_batch_id(batch_id)?;
+                Ok((None, None))
+            }
+            PitchBatchCommand::ReviewApply {
+                batch_id,
+                review_id,
+            } => {
+                crate::batch_runtime::validate_batch_id(batch_id)?;
+                crate::batch_runtime::validate_hash(review_id)?;
                 Ok((None, None))
             }
         },
@@ -654,6 +685,8 @@ fn operation_name(command: &PitchCommand) -> &'static str {
             PitchBatchCommand::Resume { .. } => "batch_resume",
             PitchBatchCommand::Status { .. } => "batch_status",
             PitchBatchCommand::Review { .. } => "batch_review",
+            PitchBatchCommand::ReviewExport { .. } => "batch_review_export",
+            PitchBatchCommand::ReviewApply { .. } => "batch_review_apply",
             PitchBatchCommand::Select { .. } => "batch_select",
             PitchBatchCommand::Retry { .. } => "batch_retry",
             PitchBatchCommand::RetryTechnical { .. } => "batch_retry_technical",
@@ -864,6 +897,9 @@ fn check_corpus(
                 blockers: Vec::new(),
                 retried_identities: Vec::new(),
                 artifact: None,
+                review_id: None,
+                review_artifact: None,
+                review_decisions: None,
                 error: None,
                 journal: None,
             },
@@ -905,6 +941,9 @@ fn list_corpus(
                 blockers: Vec::new(),
                 retried_identities: Vec::new(),
                 artifact: None,
+                review_id: None,
+                review_artifact: None,
+                review_decisions: None,
                 error: None,
                 journal: None,
             },
@@ -976,6 +1015,24 @@ fn render_response(response: Response, output: OutputFormat, exit_code: u8) -> P
             }
             if let Some(path) = response.artifact {
                 stdout.push_str(&format!("Артефакт проверки: {path}\n"));
+            }
+            if let Some(review_id) = &response.review_id {
+                stdout.push_str(&format!("Снимок проверки: {review_id}\n"));
+            }
+            if let Some(path) = &response.review_artifact {
+                stdout.push_str(&format!("Файл решений: {path}\n"));
+            }
+            if let Some(applied) = &response.review_decisions {
+                stdout.push_str(&format!(
+                    "Решения: применено {}, выбрано {}, отклонено {}, просмотрено {}, пропущено {}, уже применено {}, отказов владельца {}\n",
+                    applied.applied,
+                    applied.selected,
+                    applied.rejected,
+                    applied.acknowledged,
+                    applied.skipped,
+                    applied.already_applied,
+                    applied.owner_rejections
+                ));
             }
             if let Some(journal) = &response.journal {
                 stdout.push_str(&report_text(journal));
@@ -1068,6 +1125,8 @@ fn human_operation_name(operation: &str) -> &str {
         "batch_resume" => "возобновление пакета",
         "batch_status" => "состояние пакета",
         "batch_review" => "подготовка проверки",
+        "batch_review_export" => "снимок проверки",
+        "batch_review_apply" => "применение решений проверки",
         "batch_select" => "выбор записи JPDB",
         "batch_retry" => "повтор элемента",
         "batch_retry_technical" => "пакетный повтор технических сбоев",
@@ -1090,6 +1149,7 @@ fn human_outcome_name(outcome: &str) -> &str {
         "started" => "создан",
         "pending" => "ожидает обработки",
         "review_ready" => "материалы проверки готовы",
+        "review_applied" => "решения проверки применены",
         "updated" => "обновлён",
         "checked" => "проверен",
         "problems_found" => "найдены проблемы",
@@ -1221,6 +1281,9 @@ fn render_error(
             blockers: Vec::new(),
             retried_identities: Vec::new(),
             artifact: None,
+            review_id: None,
+            review_artifact: None,
+            review_decisions: None,
             error: Some(ErrorSummary {
                 code: error.code.as_str().to_owned(),
                 message: error.message,
@@ -1275,6 +1338,9 @@ fn render_batch_error(
             blockers: Vec::new(),
             retried_identities: Vec::new(),
             artifact: None,
+            review_id: None,
+            review_artifact: None,
+            review_decisions: None,
             error: Some(error),
             journal: None,
         },
@@ -1395,6 +1461,8 @@ fn pitch_batch_id_of(command: &PitchBatchCommand) -> Option<&str> {
         | PitchBatchCommand::Resume { batch_id, .. }
         | PitchBatchCommand::Status { batch_id }
         | PitchBatchCommand::Review { batch_id }
+        | PitchBatchCommand::ReviewExport { batch_id }
+        | PitchBatchCommand::ReviewApply { batch_id, .. }
         | PitchBatchCommand::Select { batch_id, .. }
         | PitchBatchCommand::Retry { batch_id, .. }
         | PitchBatchCommand::RetryTechnical { batch_id, .. }
@@ -1500,6 +1568,9 @@ fn execute_journal(
                 blockers,
                 retried_identities: Vec::new(),
                 artifact: None,
+                review_id: None,
+                review_artifact: None,
+                review_decisions: None,
                 error: None,
                 journal: Some(journal),
             },
@@ -1644,6 +1715,67 @@ async fn execute_batch(
                     summary,
                     &batch_id,
                     "batch_review",
+                    error,
+                    output,
+                    store_changed || batch_state_changed_since(store, &batch_id, before_revision),
+                ),
+            }
+        }
+        PitchBatchCommand::ReviewExport { batch_id } => {
+            let before_revision = batch_state_revision(store, &batch_id).unwrap_or(None);
+            match crate::pitch_review_decisions::export(store, &batch_id) {
+                Ok((batch, bundle)) => {
+                    // Снимок — записанный производный артефакт, как и отчёт `batch review`.
+                    let mut response = batch_response(
+                        "batch_review_export",
+                        "review_ready",
+                        true,
+                        Some(summary),
+                        &batch,
+                        batch_blockers(&batch),
+                        Some(bundle.directory.display().to_string()),
+                    );
+                    response.review_id = Some(bundle.id);
+                    response.review_artifact = Some(bundle.decisions.display().to_string());
+                    render_response(response, output, 0)
+                }
+                Err(error) => render_batch_error(
+                    store,
+                    summary,
+                    &batch_id,
+                    "batch_review_export",
+                    error,
+                    output,
+                    store_changed || batch_state_changed_since(store, &batch_id, before_revision),
+                ),
+            }
+        }
+        PitchBatchCommand::ReviewApply {
+            batch_id,
+            review_id,
+        } => {
+            let store_changed = store_changed || store.did_mutate_on_open();
+            let before_revision = batch_state_revision(store, &batch_id).unwrap_or(None);
+            match crate::pitch_review_decisions::apply(store, &batch_id, &review_id) {
+                Ok((batch, applied)) => {
+                    let mut response = batch_response(
+                        "batch_review_apply",
+                        "review_applied",
+                        store_changed || applied.changed,
+                        Some(summary),
+                        &batch,
+                        batch_blockers(&batch),
+                        None,
+                    );
+                    response.review_id = Some(review_id);
+                    response.review_decisions = Some(applied);
+                    render_response(response, output, 0)
+                }
+                Err(error) => render_batch_error(
+                    store,
+                    summary,
+                    &batch_id,
+                    "batch_review_apply",
                     error,
                     output,
                     store_changed || batch_state_changed_since(store, &batch_id, before_revision),
@@ -4170,6 +4302,9 @@ fn batch_response(
         blockers,
         retried_identities: Vec::new(),
         artifact,
+        review_id: None,
+        review_artifact: None,
+        review_decisions: None,
         error: None,
         journal: None,
     }

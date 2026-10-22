@@ -1375,6 +1375,14 @@ impl PitchAccentBatchRuntime {
         self.runtime.batch_id()
     }
 
+    /// Каталог производного снимка проверки под блокировкой пакета.
+    pub(crate) fn artifact_directory(
+        &self,
+        name: &str,
+    ) -> Result<crate::batch_runtime::ArtifactDirectory, AssetError> {
+        self.runtime.artifact_directory(name)
+    }
+
     pub fn load(&mut self) -> Result<Option<PitchAccentBatch>, AssetError> {
         self.runtime.load()
     }

@@ -5922,3 +5922,114 @@ async fn batch_retry_technical_empty_selection_reports_owner_reconciliation_chan
     assert_eq!(response["changed"], false);
     assert!(response.get("retried_identities").is_none());
 }
+
+#[tokio::test]
+async fn review_export_and_apply_bind_decisions_to_snapshot_across_separate_processes() {
+    let workspace = temp_root();
+    let root = workspace.path();
+    let store = store_at(root);
+    let store_root = store.root().to_path_buf();
+    let mut batch = PitchAccentBatch::new(
+        "cli-review",
+        vec![JpdbPitchRequest::new(JpdbPitchQuery::new(
+            "幽霊",
+            Some("ゆうれい".into()),
+        ))],
+        PitchAccentImageValidator::validator_identity(),
+    )
+    .unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(store.root(), &batch).unwrap();
+    let token = batch.item_token("幽霊").unwrap();
+    assert!(
+        runtime
+            .record_outcome(
+                &mut batch,
+                &token,
+                JpdbPitchOutcome::AmbiguousVocabulary {
+                    surface: "幽霊".into(),
+                    reading: Some("ゆうれい".into()),
+                    candidates: ambiguity_candidates(),
+                },
+            )
+            .unwrap()
+    );
+    drop(runtime);
+    drop(store);
+    let batch_command = |command| {
+        execute(cli(
+            store_root.clone(),
+            root.to_path_buf(),
+            OutputFormat::Json,
+            PitchCommand::Batch { command },
+        ))
+    };
+
+    // Export и apply — отдельные вызовы CLI: снимок и решения живут на диске.
+    let exported = batch_command(PitchBatchCommand::ReviewExport {
+        batch_id: "cli-review".into(),
+    })
+    .await;
+    assert_eq!(exported.exit_code, 0, "{}", exported.stdout);
+    let exported: serde_json::Value = serde_json::from_str(&exported.stdout).unwrap();
+    assert_eq!(exported["operation"], "batch_review_export");
+    let review_id = exported["review_id"].as_str().unwrap().to_owned();
+    let decisions = PathBuf::from(exported["review_artifact"].as_str().unwrap());
+    let text = fs::read_to_string(&decisions).unwrap();
+    assert!(text.contains(&format!("@review\t1\tcli-review\t{review_id}")));
+    fs::write(
+        &decisions,
+        text.replace(
+            "\t幽霊\tambiguous_vocabulary",
+            "124\t幽霊\tambiguous_vocabulary",
+        ),
+    )
+    .unwrap();
+
+    // Чужой review_id отклоняется, не меняя пакет.
+    let foreign = batch_command(PitchBatchCommand::ReviewApply {
+        batch_id: "cli-review".into(),
+        review_id: "0".repeat(64),
+    })
+    .await;
+    assert_ne!(foreign.exit_code, 0);
+    let foreign: serde_json::Value = serde_json::from_str(&foreign.stdout).unwrap();
+    assert_eq!(foreign["changed"], false);
+
+    let applied = batch_command(PitchBatchCommand::ReviewApply {
+        batch_id: "cli-review".into(),
+        review_id: review_id.clone(),
+    })
+    .await;
+    assert_eq!(applied.exit_code, 0, "{}", applied.stdout);
+    let applied: serde_json::Value = serde_json::from_str(&applied.stdout).unwrap();
+    assert_eq!(applied["changed"], true);
+    assert_eq!(applied["review_decisions"]["selected"], 1);
+    let saved = PitchAccentBatchRuntime::open(&store_root, "cli-review")
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+    let selection = saved
+        .item("幽霊")
+        .unwrap()
+        .request
+        .selection
+        .clone()
+        .unwrap();
+    assert_eq!(selection.vocabulary_id, 124);
+    assert_eq!(
+        selection.detail_url,
+        "https://jpdb.io/vocabulary/124/幽霊/ゆうれい"
+    );
+
+    // Повтор того же снимка идемпотентен.
+    let replay = batch_command(PitchBatchCommand::ReviewApply {
+        batch_id: "cli-review".into(),
+        review_id,
+    })
+    .await;
+    assert_eq!(replay.exit_code, 0, "{}", replay.stdout);
+    let replay: serde_json::Value = serde_json::from_str(&replay.stdout).unwrap();
+    assert_eq!(replay["changed"], false);
+    assert_eq!(replay["review_decisions"]["already_applied"], 1);
+}
