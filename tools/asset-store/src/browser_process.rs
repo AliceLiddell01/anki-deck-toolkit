@@ -32,6 +32,10 @@ const DESCENDANT_EXIT_GRACE: Duration = Duration::from_millis(500);
 /// После выхода лидера до адреса DevTools уже записанный `stderr` дочитывается
 /// не дольше этого: потомки могут держать канал открытым, и EOF не наступит.
 const LAUNCH_STDERR_DRAIN: Duration = Duration::from_millis(200);
+/// EOF `stderr` до адреса DevTools обычно означает выход лидера, но ядро закрывает
+/// его дескрипторы раньше, чем статус становится доступен `wait`. Столько ждём
+/// самостоятельного выхода, прежде чем признать лидера живым и остановить группу.
+const LEADER_EXIT_AFTER_STDERR_EOF: Duration = Duration::from_millis(500);
 const PROC_ROOT: &str = "/proc";
 
 /// Аргументы, совпадающие со стандартным запуском `chromiumoxide` 0.9.1
@@ -387,7 +391,15 @@ async fn devtools_address(
                     if let Some(address) = output.finish_line() {
                         return Ok(address);
                     }
-                    return Err(launch_output_error("запуск браузера: stderr закрыт до адреса DevTools", &output.captured));
+                    // Без этого ожидания уже вышедший лидер ещё не виден `try_wait`,
+                    // получает `SIGKILL` и ложную причину остановки `Killed`.
+                    return match tokio::time::timeout(LEADER_EXIT_AFTER_STDERR_EOF, child.wait()).await {
+                        Ok(status) => {
+                            let status = status.map_err(|error| format!("запуск браузера: {error}"))?;
+                            Err(launch_output_error(&format!("запуск браузера: процесс завершился ({status}) до адреса DevTools"), &output.captured))
+                        }
+                        Err(_) => Err(launch_output_error("запуск браузера: stderr закрыт до адреса DevTools", &output.captured)),
+                    };
                 }
                 if let Some(address) = output.push(&chunk[..read]) {
                     return Ok(address);
