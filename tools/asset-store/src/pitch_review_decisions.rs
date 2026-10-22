@@ -265,20 +265,17 @@ fn owner_snapshot(
     Ok((records, snapshot))
 }
 
+/// Возвращает сохранённое состояние пакета и его сверку с владельцем в памяти.
 fn load_reconciled(
     runtime: &mut PitchAccentBatchRuntime,
     owner: &PitchBatchOwnerSnapshot,
-) -> Result<(PitchAccentBatch, bool), AssetError> {
-    let mut batch = runtime
+) -> Result<(PitchAccentBatch, PitchAccentBatch), AssetError> {
+    let stored = runtime
         .load()?
         .ok_or_else(|| invalid("сохранённое состояние batch не найдено"))?;
-    let before = batch.clone();
+    let mut batch = stored.clone();
     batch.reconcile_owner(owner)?;
-    let changed = batch != before;
-    if changed {
-        runtime.save(&batch)?;
-    }
-    Ok((batch, changed))
+    Ok((stored, batch))
 }
 
 /// Создаёт снимок по сверенному с владельцем состоянию пакета.
@@ -288,7 +285,10 @@ pub(crate) fn export(
 ) -> Result<(PitchAccentBatch, ReviewBundle), AssetError> {
     let (_, owner) = owner_snapshot(store)?;
     let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
-    let (batch, _) = load_reconciled(&mut runtime, &owner)?;
+    let (stored, batch) = load_reconciled(&mut runtime, &owner)?;
+    if batch != stored {
+        runtime.save(&batch)?;
+    }
     let rows = review_rows(&batch)?;
     if rows.is_empty() {
         return Err(invalid(
@@ -431,7 +431,9 @@ pub(crate) fn apply(
 ) -> Result<(PitchAccentBatch, PitchReviewApplied), AssetError> {
     let (owner_records, owner) = owner_snapshot(store)?;
     let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
-    let (batch, reconciled) = load_reconciled(&mut runtime, &owner)?;
+    // Сверка с владельцем остаётся в памяти до проверки всех строк: отклонённый
+    // файл решений не меняет сохранённый пакет.
+    let (stored, batch) = load_reconciled(&mut runtime, &owner)?;
     let (snapshot, cells) = crate::review_snapshot::read::<PitchReviewRow>(
         |name| runtime.artifact_directory(name),
         runtime.batch_id(),
@@ -537,9 +539,10 @@ pub(crate) fn apply(
     next.validate()?;
     // Намерения сохраняются одной атомарной записью до побочных эффектов у
     // владельца; сбой после неё повторяется тем же `review-apply`.
-    if next != batch {
+    if next != stored {
         runtime.save(&next)?;
     }
+    let saved = next.clone();
     for (identity, sha256) in owner_rejections {
         let rejected = store.attest(HumanAttestationRequest {
             identity,
@@ -552,10 +555,10 @@ pub(crate) fn apply(
         }
         next.observe_owner(&rejected.asset)?;
     }
-    if next != batch {
+    if next != saved {
         runtime.save(&next)?;
     }
-    applied.changed = reconciled || next != batch || applied.owner_rejections > 0;
+    applied.changed = next != stored || applied.owner_rejections > 0;
     Ok((next, applied))
 }
 

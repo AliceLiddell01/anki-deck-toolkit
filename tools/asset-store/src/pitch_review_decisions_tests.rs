@@ -465,8 +465,8 @@ fn apply_waits_for_competing_command_and_then_refuses_stale_rows() {
     assert_eq!(journal_lines(&fixture.store), journal);
 }
 
-/// Публикует текущего кандидата штатными шагами пакета и хранилища без браузера.
-fn publish_verified(fixture: &Fixture) {
+/// Публикует текущего кандидата у владельца, не сверяя с ним пакет.
+fn ingest_verified_owner(fixture: &Fixture) -> (PitchAccentBatchRuntime, PitchAccentBatch) {
     let mut runtime = PitchAccentBatchRuntime::open(fixture.store.root(), BATCH).unwrap();
     let mut batch = runtime.load().unwrap().unwrap();
     batch
@@ -496,6 +496,12 @@ fn publish_verified(fixture: &Fixture) {
             &PitchAccentImageValidator,
         )
         .unwrap();
+    (runtime, batch)
+}
+
+/// Публикует текущего кандидата штатными шагами пакета и хранилища без браузера.
+fn publish_verified(fixture: &Fixture) {
+    let (mut runtime, mut batch) = ingest_verified_owner(fixture);
     batch
         .reconcile_owner(
             &PitchBatchOwnerSnapshot::from_records(fixture.store.verify_integrity().unwrap())
@@ -503,6 +509,21 @@ fn publish_verified(fixture: &Fixture) {
         )
         .unwrap();
     runtime.save(&batch).unwrap();
+}
+
+#[test]
+fn refused_apply_does_not_persist_owner_reconciliation() {
+    let fixture = fixture();
+    let (_, bundle) = export(&fixture.store, BATCH).unwrap();
+    decide(&bundle.decisions, &[("化物", "999")]);
+    // Владелец изменился после export: сверка в `apply` меняет пакет в памяти.
+    drop(ingest_verified_owner(&fixture));
+    let owner =
+        PitchBatchOwnerSnapshot::from_records(fixture.store.verify_integrity().unwrap()).unwrap();
+    let mut reconciled = load(&fixture.store);
+    reconciled.reconcile_owner(&owner).unwrap();
+    assert_ne!(reconciled, load(&fixture.store));
+    assert_refused_without_change(&fixture, &bundle.id, ErrorCode::IdentityConflict);
 }
 
 #[test]

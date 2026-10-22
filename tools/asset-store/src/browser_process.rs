@@ -6,9 +6,10 @@
 //! координатор успевал выполнить свою семантику отмены. Здесь браузер
 //! запускается в собственной группе процессов (`process_group(0)`), а CDP
 //! подключается к нему через `Browser::connect_with_config`. Владелец группы —
-//! только этот объект: сигнал отправляется лишь группе, созданной этим запуском,
-//! пока её лидер не собран `wait`, то есть пока номер группы не может перейти
-//! к постороннему процессу.
+//! только этот объект: сигнал отправляется лишь группе, созданной этим запуском.
+//! До сбора лидера `wait` номер группы не может перейти к постороннему процессу;
+//! после сбора `SIGKILL` потомкам отправляется, только пока проверка подтверждает
+//! непустую группу, — между проверкой и сигналом остаётся узкое окно.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -232,7 +233,17 @@ impl OwnedBrowserProcess {
 
     /// Самостоятельный выход либо принудительная остановка; результат типизирован.
     pub(crate) async fn stop(&mut self, limit: Duration) -> Result<ProcessStop, String> {
-        if self.wait_exit(Duration::ZERO).await?.is_some() {
+        if self.exit.is_none() {
+            self.exit = self.child.try_wait().map_err(|error| {
+                format!(
+                    "browser_process_wait_failed: {}",
+                    crate::diagnostics::safe_message(&error.to_string())
+                )
+            })?;
+        }
+        // Уже вышедший лидер не отменяет лимит на сбор его потомков.
+        if self.exit.is_some() {
+            self.drain_group(limit).await?;
             return Ok(ProcessStop::Exited);
         }
         self.kill(limit).await.map(|()| ProcessStop::Killed)

@@ -91,6 +91,21 @@ async fn leader_exit_with_lingering_descendant_drains_only_owned_group() {
 }
 
 #[tokio::test]
+async fn leader_exit_before_address_still_drains_descendants_within_limit() {
+    let workspace = TempWorkspace::create("browser-process-early-exit-test").unwrap();
+    let spec = fake_browser(&workspace, "browser", "sleep 300 &\nexit 1");
+    let failure = OwnedBrowserProcess::spawn(&spec).await.unwrap_err();
+    assert!(
+        failure.message.contains("до адреса DevTools"),
+        "{}",
+        failure.message
+    );
+    // Лидер вышел сам, а оставшийся потомок собран в пределах лимита остановки.
+    assert_eq!(failure.stop, Ok(ProcessStop::Exited));
+    workspace.close().unwrap();
+}
+
+#[tokio::test]
 async fn launch_timeout_stops_the_group_and_reports_typed_stop() {
     let workspace = TempWorkspace::create("browser-process-timeout-test").unwrap();
     let mut spec = fake_browser(&workspace, "browser", "sleep 300 &\nexec sleep 300");
