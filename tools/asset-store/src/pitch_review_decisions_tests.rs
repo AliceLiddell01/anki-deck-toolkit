@@ -468,6 +468,15 @@ fn apply_waits_for_competing_command_and_then_refuses_stale_rows() {
 /// Публикует текущего кандидата у владельца, не сверяя с ним пакет.
 fn ingest_verified_owner(fixture: &Fixture) -> (PitchAccentBatchRuntime, PitchAccentBatch) {
     let mut runtime = PitchAccentBatchRuntime::open(fixture.store.root(), BATCH).unwrap();
+    let batch = ingest_verified_owner_locked(fixture, &mut runtime);
+    (runtime, batch)
+}
+
+/// То же под уже удерживаемой блокировкой пакета.
+fn ingest_verified_owner_locked(
+    fixture: &Fixture,
+    runtime: &mut PitchAccentBatchRuntime,
+) -> PitchAccentBatch {
     let mut batch = runtime.load().unwrap().unwrap();
     batch
         .begin_publication("幽霊", &fixture.verified_sha, None)
@@ -496,7 +505,7 @@ fn ingest_verified_owner(fixture: &Fixture) -> (PitchAccentBatchRuntime, PitchAc
             &PitchAccentImageValidator,
         )
         .unwrap();
-    (runtime, batch)
+    batch
 }
 
 /// Публикует текущего кандидата штатными шагами пакета и хранилища без браузера.
@@ -524,6 +533,37 @@ fn refused_apply_does_not_persist_owner_reconciliation() {
     reconciled.reconcile_owner(&owner).unwrap();
     assert_ne!(reconciled, load(&fixture.store));
     assert_refused_without_change(&fixture, &bundle.id, ErrorCode::IdentityConflict);
+}
+
+#[test]
+fn apply_reconciles_with_owner_state_observed_under_batch_lock() {
+    let fixture = fixture();
+    let (_, bundle) = export(&fixture.store, BATCH).unwrap();
+    decide(&bundle.decisions, &[("空白", "r")]);
+    // Пока `apply` ждёт блокировку, конкурирующая команда публикует 幽霊.
+    let mut holder = PitchAccentBatchRuntime::open(fixture.store.root(), BATCH).unwrap();
+    let (batch, applied) = std::thread::scope(|scope| {
+        let pending = scope.spawn(|| apply(&fixture.store, BATCH, &bundle.id));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!pending.is_finished());
+        let mut batch = ingest_verified_owner_locked(&fixture, &mut holder);
+        batch
+            .reconcile_owner(
+                &PitchBatchOwnerSnapshot::from_records(fixture.store.verify_integrity().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        holder.save(&batch).unwrap();
+        drop(holder);
+        pending.join().unwrap().unwrap()
+    });
+    assert_eq!(applied.rejected, 1);
+    // Сверка не откатила публикацию по снимку владельца, снятому до ожидания.
+    assert_eq!(
+        batch.item("幽霊").unwrap().status(),
+        PitchBatchItemStatus::Published
+    );
+    assert_eq!(load(&fixture.store), batch);
 }
 
 #[test]

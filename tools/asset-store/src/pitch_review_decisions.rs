@@ -283,8 +283,8 @@ pub(crate) fn export(
     store: &AssetStore,
     batch_id: &str,
 ) -> Result<(PitchAccentBatch, ReviewBundle), AssetError> {
-    let (_, owner) = owner_snapshot(store)?;
     let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
+    let (_, owner) = owner_snapshot(store)?;
     let (stored, batch) = load_reconciled(&mut runtime, &owner)?;
     if batch != stored {
         runtime.save(&batch)?;
@@ -429,8 +429,10 @@ pub(crate) fn apply(
     batch_id: &str,
     review_id: &str,
 ) -> Result<(PitchAccentBatch, PitchReviewApplied), AssetError> {
-    let (owner_records, owner) = owner_snapshot(store)?;
+    // Снимок владельца берётся под блокировкой пакета: команда, которую `apply`
+    // дожидается, могла за это время изменить запись владельца.
     let mut runtime = PitchAccentBatchRuntime::open(store.root(), batch_id)?;
+    let (owner_records, owner) = owner_snapshot(store)?;
     // Сверка с владельцем остаётся в памяти до проверки всех строк: отклонённый
     // файл решений не меняет сохранённый пакет.
     let (stored, batch) = load_reconciled(&mut runtime, &owner)?;
