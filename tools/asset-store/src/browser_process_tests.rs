@@ -22,7 +22,7 @@ fn fake_browser(workspace: &TempWorkspace, name: &str, body: &str) -> BrowserLau
     }
 }
 
-/// Та же проверка, что у владельца группы: zombie без reaper не считаются.
+/// Та же проверка, что у владельца группы: несобранные зомби не считаются.
 fn group_alive(group: i32) -> bool {
     match test_kill_process_group(Pid::from_raw(group).unwrap()) {
         Ok(()) => group_has_live_members(Path::new(PROC_ROOT), group, std::process::id())
@@ -122,6 +122,46 @@ async fn exit_before_address_keeps_unterminated_stderr_held_open_by_descendant()
         "{}",
         failure.message
     );
+    assert_eq!(failure.stop, Ok(ProcessStop::Exited));
+    workspace.close().unwrap();
+}
+
+#[tokio::test]
+async fn long_unterminated_stderr_before_address_is_parsed_with_bounded_buffers() {
+    let workspace = TempWorkspace::create("browser-process-long-stderr-test").unwrap();
+    // Мегабайт без перевода строки, затем адрес отдельной строкой.
+    let spec = fake_browser(
+        &workspace,
+        "browser",
+        &format!(
+            "head -c 1048576 /dev/zero | tr '\\0' x >&2\necho >&2\necho 'DevTools listening on {ADDRESS}' >&2\nexec sleep 300"
+        ),
+    );
+    let (mut process, address) = OwnedBrowserProcess::spawn(&spec).await.unwrap();
+    assert_eq!(address, ADDRESS);
+    assert_eq!(
+        process.stop(Duration::from_secs(2)).await,
+        Ok(ProcessStop::Killed)
+    );
+    workspace.close().unwrap();
+}
+
+#[tokio::test]
+async fn long_unterminated_stderr_before_exit_keeps_bounded_diagnostics() {
+    let workspace = TempWorkspace::create("browser-process-long-exit-test").unwrap();
+    let spec = fake_browser(
+        &workspace,
+        "browser",
+        "printf 'начало отказа' >&2\nhead -c 1048576 /dev/zero | tr '\\0' x >&2\nexit 3",
+    );
+    let failure = OwnedBrowserProcess::spawn(&spec).await.unwrap_err();
+    assert!(
+        failure.message.contains("до адреса DevTools"),
+        "{}",
+        failure.message
+    );
+    assert!(failure.message.contains("начало отказа"));
+    assert!(failure.message.len() < 4 * MAX_LAUNCH_STDERR_BYTES);
     assert_eq!(failure.stop, Ok(ProcessStop::Exited));
     workspace.close().unwrap();
 }
@@ -233,6 +273,55 @@ fn devtools_address_requires_browser_websocket() {
         parse_devtools_address("listening on ws://x/devtools/page/1"),
         None
     );
+}
+
+/// Буферы ограничены по объёму удерживаемой памяти, а не только по длине
+/// итогового сообщения: проверяются длина и ёмкость при любой нарезке потока.
+fn assert_bounded(output: &LaunchStderr) {
+    assert!(output.line.len() <= MAX_LAUNCH_LINE_BYTES);
+    assert!(output.line.capacity() <= 2 * MAX_LAUNCH_LINE_BYTES);
+    assert!(output.captured.len() <= MAX_LAUNCH_STDERR_BYTES);
+    assert!(output.captured.capacity() <= 2 * MAX_LAUNCH_STDERR_BYTES);
+}
+
+#[test]
+fn launch_stderr_keeps_bounded_buffers_for_any_line_length_and_chunking() {
+    let noise = vec![b'x'; 1024 * 1024];
+    for chunk in [1, 7, LAUNCH_STDERR_CHUNK, noise.len()] {
+        let mut output = LaunchStderr::default();
+        for piece in noise.chunks(chunk) {
+            assert_eq!(output.push(piece), None);
+            assert_bounded(&output);
+        }
+        assert_eq!(output.captured, noise[..MAX_LAUNCH_STDERR_BYTES]);
+        assert_eq!(output.finish_line(), None);
+    }
+}
+
+#[test]
+fn launch_stderr_finds_address_split_across_chunks_after_long_noise() {
+    let mut stream = vec![b'x'; 256 * 1024];
+    stream.extend_from_slice(b"\n");
+    stream.extend_from_slice(format!("DevTools listening on {ADDRESS}\n").as_bytes());
+    for chunk in [1, 5, LAUNCH_STDERR_CHUNK] {
+        let mut output = LaunchStderr::default();
+        let found = stream.chunks(chunk).find_map(|piece| {
+            let found = output.push(piece);
+            assert_bounded(&output);
+            found
+        });
+        assert_eq!(found.as_deref(), Some(ADDRESS), "нарезка {chunk}");
+    }
+    // Адрес в хвосте длинной строки без отдельного перевода строки и без
+    // завершающего `\n` у EOF.
+    let mut output = LaunchStderr::default();
+    let mut tail = vec![b'x'; 64 * 1024];
+    tail.extend_from_slice(format!("DevTools listening on {ADDRESS}").as_bytes());
+    for piece in tail.chunks(LAUNCH_STDERR_CHUNK) {
+        assert_eq!(output.push(piece), None);
+        assert_bounded(&output);
+    }
+    assert_eq!(output.finish_line().as_deref(), Some(ADDRESS));
 }
 
 fn fake_proc(workspace: &TempWorkspace, own_pid: u32, processes: &[(u32, &str)]) -> PathBuf {

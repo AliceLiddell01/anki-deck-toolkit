@@ -5964,7 +5964,7 @@ async fn review_export_and_apply_bind_decisions_to_snapshot_across_separate_proc
         ))
     };
 
-    // Export и apply — отдельные вызовы CLI: снимок и решения живут на диске.
+    // Выгрузка и применение — отдельные вызовы CLI: снимок и решения живут на диске.
     let exported = batch_command(PitchBatchCommand::ReviewExport {
         batch_id: "cli-review".into(),
     })
@@ -5976,6 +5976,14 @@ async fn review_export_and_apply_bind_decisions_to_snapshot_across_separate_proc
     let decisions = PathBuf::from(exported["review_artifact"].as_str().unwrap());
     let text = fs::read_to_string(&decisions).unwrap();
     assert!(text.contains(&format!("@review\t1\tcli-review\t{review_id}")));
+    // Файл, выгруженный прежней версией с англоязычной шапкой, применяется так
+    // же: `#`-комментарии не входят ни в подпись, ни в разбор строк.
+    assert!(text.starts_with("# Проверка произношения JPDB, формат v1\n"));
+    let text = text.replacen(
+        "# Проверка произношения JPDB, формат v1",
+        "# JPDB PITCH REVIEW v1",
+        1,
+    );
     fs::write(
         &decisions,
         text.replace(

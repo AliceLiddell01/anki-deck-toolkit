@@ -3150,12 +3150,15 @@ const SEARCH_CANDIDATES_SCRIPT: &str = r#"() => {
     // Ссылки `Used in` передаются как есть: допустимость и смысл проверяет Rust.
     // Свидетельством считается и ссылка с подписью `Used in`, и ссылка с путём `/used-in`:
     // повреждённый адрес не отбрасывается, а доходит до Rust и отменяет вывод canonical.
-    const usedInUrls = [...row.querySelectorAll('a.view-conjugations-link[href]')]
+    // Ссылка с подписью `Used in` без атрибута `href` — тоже повреждённое
+    // свидетельство: она передаётся пустым адресом, а не исчезает из выборки.
+    const usedInUrls = [...row.querySelectorAll('a.view-conjugations-link')]
       .filter(link => {
         if (/^\s*Used in\b/iu.test(link.textContent || '')) return true;
+        if (!link.hasAttribute('href')) return false;
         try { return /\/used-in$/u.test(new URL(link.href, location.href).pathname); }
         catch (_) { return false; }
-      }).map(link => link.href);
+      }).map(link => link.hasAttribute('href') ? link.href : '');
     candidates.push({ detail_url: detailRoute ? detailRoute.href : null, forms, part_of_speech: partOfSpeech, meanings, used_in_urls: usedInUrls });
   }
   return {
@@ -4832,6 +4835,7 @@ mod tests {
             "https://jpdb.io/vocabulary/1192150/家族/used-in/",
             "http://[",
             "https://jpdb.io/vocabulary/999/別語/used-in",
+            "",
         ] {
             let raw = serde_json::json!({
                 "ready": true, "no_results_found": false, "result_count": 1,
@@ -5380,6 +5384,15 @@ mod tests {
                 "",
             )],
         ).replace("__BAD__", r#"<a class="view-conjugations-link" href="/vocabulary/1192150/家族/used-in/">Used in: 1</a><a class="view-conjugations-link" href="http://[">Used in: 2</a>"#);
+        let without_href = jpdb_like_search_page(
+            Some("https://jpdb.io/vocabulary/1192150/家族/かぞく?lang=english"),
+            "results details",
+            &[jpdb_like_search_row(
+                r#"<ruby class="v">家<rt>か</rt>族<rt>ぞく</rt></ruby>"#,
+                r#"<a class="view-conjugations-link" href="/vocabulary/1192150/家族/used-in">Used in: 5493</a><a class="view-conjugations-link">Used in: 1</a><a class="view-conjugations-link">Conjugations...</a>"#,
+                "",
+            )],
+        );
         let with_alternates = jpdb_like_search_page(
             Some("https://jpdb.io/vocabulary/1358280/食べる/たべる?lang=english"),
             "results details",
@@ -5411,6 +5424,8 @@ mod tests {
         let resolved = select_candidates(&snapshot.candidates, &JpdbPitchQuery::new("家族", None));
         session.page().set_content(tainted).await.unwrap();
         let tainted_snapshot = read_search_candidates(session.page()).await.unwrap();
+        session.page().set_content(without_href).await.unwrap();
+        let without_href_snapshot = read_search_candidates(session.page()).await.unwrap();
         session.page().set_content(with_alternates).await.unwrap();
         let alternates = read_search_candidates(session.page()).await.unwrap();
         session.page().set_content(list).await.unwrap();
@@ -5432,6 +5447,16 @@ mod tests {
             ]
         );
         assert!(tainted_snapshot.candidates[0].detail_url.is_none());
+        // Подпись `Used in` без адреса не выпадает из выборки: одна валидная
+        // ссылка не разрешает canonical по неполному набору свидетельств.
+        assert_eq!(
+            without_href_snapshot.candidates[0].used_in_urls,
+            [
+                "https://jpdb.io/vocabulary/1192150/%E5%AE%B6%E6%97%8F/used-in",
+                ""
+            ]
+        );
+        assert!(without_href_snapshot.candidates[0].detail_url.is_none());
         let resolved = resolved.unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].vocabulary_id, 1_192_150);

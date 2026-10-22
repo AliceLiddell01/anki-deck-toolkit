@@ -17,11 +17,15 @@ use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
 /// Максимальный объём `stderr`, сохраняемый для диагностики отказа запуска.
 const MAX_LAUNCH_STDERR_BYTES: usize = 16 * 1024;
+/// Сколько последних байтов текущей строки `stderr` хранится для поиска адреса
+/// DevTools; строка адреса Chromium заметно короче.
+const MAX_LAUNCH_LINE_BYTES: usize = 4 * 1024;
+const LAUNCH_STDERR_CHUNK: usize = 4 * 1024;
 /// После выхода лидера его потомки (renderer, zygote, GPU) получают время на
 /// самостоятельный выход до принудительного завершения группы.
 const DESCENDANT_EXIT_GRACE: Duration = Duration::from_millis(500);
@@ -94,7 +98,7 @@ pub(crate) enum ProcessStop {
     Killed,
 }
 
-/// Подробности последней остановки для диагностики lifecycle.
+/// Подробности последней остановки для диагностики жизненного цикла процесса.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ProcessStopDetails {
     /// Сколько ждали самостоятельного выхода лидера.
@@ -286,8 +290,9 @@ impl OwnedBrowserProcess {
             Err(rustix::io::Errno::SRCH) => return Ok(false),
             Err(error) => return Err(error.into()),
         }
-        // `kill(-pgid, 0)` успешен и для zombie: без reaper (например, CLI как
-        // PID 1 контейнера) вышедшие потомки иначе навсегда «занимали» бы группу.
+        // `kill(-pgid, 0)` успешен и для зомби: если их некому собрать (например,
+        // CLI работает как PID 1 контейнера), вышедшие потомки иначе навсегда
+        // «занимали» бы группу.
         group_has_live_members(Path::new(PROC_ROOT), self.pid(), std::process::id())
     }
 
@@ -309,7 +314,7 @@ impl Drop for OwnedBrowserProcess {
     }
 }
 
-/// Есть ли в группе процесс не в состоянии zombie/dead. Если `proc_root` не
+/// Есть ли в группе процесс не в состоянии зомби (`Z`) или завершённого (`X`). Если `proc_root` не
 /// принадлежит пространству PID текущего процесса или отсутствует, единственным
 /// свидетельством остаётся успешный `kill(-pgid, 0)`, и группа считается непустой.
 fn group_has_live_members(proc_root: &Path, group: i32, own_pid: u32) -> io::Result<bool> {
@@ -366,42 +371,81 @@ async fn resolve_executable(path: &Path) -> io::Result<PathBuf> {
 }
 
 async fn devtools_address(
-    stderr: tokio::process::ChildStderr,
+    mut stderr: tokio::process::ChildStderr,
     child: &mut Child,
 ) -> Result<String, String> {
-    let mut reader = BufReader::new(stderr);
-    let mut captured = Vec::new();
-    let mut line = Vec::new();
+    let mut output = LaunchStderr::default();
+    let mut chunk = [0_u8; LAUNCH_STDERR_CHUNK];
     loop {
-        line.clear();
         tokio::select! {
             // Готовые данные `stderr` разбираются раньше выхода процесса.
             biased;
-            read = reader.read_until(b'\n', &mut line) => {
+            read = stderr.read(&mut chunk) => {
                 let read = read.map_err(|error| format!("запуск браузера: чтение stderr: {error}"))?;
                 if read == 0 {
-                    return Err(launch_output_error("запуск браузера: stderr закрыт до адреса DevTools", &captured));
+                    // Строка адреса может быть последней и без перевода строки.
+                    if let Some(address) = output.finish_line() {
+                        return Ok(address);
+                    }
+                    return Err(launch_output_error("запуск браузера: stderr закрыт до адреса DevTools", &output.captured));
                 }
-                if let Some(address) = parse_devtools_address(&String::from_utf8_lossy(&line)) {
+                if let Some(address) = output.push(&chunk[..read]) {
                     return Ok(address);
                 }
-                append_bounded(&mut captured, &line);
             }
             status = child.wait() => {
                 let status = status.map_err(|error| format!("запуск браузера: {error}"))?;
-                // Незавершённая строка и уже записанный хвост тоже объясняют отказ.
-                append_bounded(&mut captured, &line);
+                // Уже записанный хвост тоже объясняет отказ.
                 let deadline = tokio::time::Instant::now() + LAUNCH_STDERR_DRAIN;
-                let mut chunk = [0_u8; 4096];
-                while captured.len() < MAX_LAUNCH_STDERR_BYTES {
-                    match tokio::time::timeout_at(deadline, reader.read(&mut chunk)).await {
-                        Ok(Ok(read)) if read > 0 => append_bounded(&mut captured, &chunk[..read]),
+                while output.captured.len() < MAX_LAUNCH_STDERR_BYTES {
+                    match tokio::time::timeout_at(deadline, stderr.read(&mut chunk)).await {
+                        Ok(Ok(read)) if read > 0 => append_bounded(&mut output.captured, &chunk[..read]),
                         _ => break,
                     }
                 }
-                return Err(launch_output_error(&format!("запуск браузера: процесс завершился ({status}) до адреса DevTools"), &captured));
+                return Err(launch_output_error(&format!("запуск браузера: процесс завершился ({status}) до адреса DevTools"), &output.captured));
             }
         }
+    }
+}
+
+/// Инкрементальный разбор `stderr` запуска с ограниченной памятью: начало
+/// вывода сохраняется для диагностики, а от текущей строки — только хвост, в
+/// котором Chromium печатает адрес DevTools. Строка без перевода строки любой
+/// длины не растит ни один буфер сверх своего предела.
+#[derive(Default)]
+struct LaunchStderr {
+    captured: Vec<u8>,
+    line: Vec<u8>,
+}
+
+impl LaunchStderr {
+    fn push(&mut self, bytes: &[u8]) -> Option<String> {
+        append_bounded(&mut self.captured, bytes);
+        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let room = MAX_LAUNCH_LINE_BYTES.saturating_sub(self.line.len());
+            if part.len() > room {
+                // Отбрасываем начало строки: адрес DevTools стоит в её конце.
+                let keep = part.len().min(MAX_LAUNCH_LINE_BYTES);
+                let excess = (self.line.len() + keep).saturating_sub(MAX_LAUNCH_LINE_BYTES);
+                self.line.drain(..excess);
+                self.line.extend_from_slice(&part[part.len() - keep..]);
+            } else {
+                self.line.extend_from_slice(part);
+            }
+            if part.ends_with(b"\n")
+                && let Some(address) = self.finish_line()
+            {
+                return Some(address);
+            }
+        }
+        None
+    }
+
+    fn finish_line(&mut self) -> Option<String> {
+        let address = parse_devtools_address(&String::from_utf8_lossy(&self.line));
+        self.line.clear();
+        address
     }
 }
 
