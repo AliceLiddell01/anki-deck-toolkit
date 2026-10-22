@@ -1785,6 +1785,15 @@ fn resolve_single_entry_canonical_route(snapshot: &mut RawSearchSnapshot) {
     snapshot.candidates[0].detail_url = Some(route.1);
 }
 
+/// Непустой текст только из хираганы и катаканы, включая `ー` и метки дакутэна;
+/// те же диапазоны, что у `isKana` в скриптах страниц JPDB.
+fn is_kana_text(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|character| matches!(character, '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}'))
+}
+
 fn single_entry_canonical_route(snapshot: &RawSearchSnapshot) -> Option<(u64, String)> {
     let [row] = snapshot.candidates.as_slice() else {
         return None;
@@ -1812,7 +1821,11 @@ fn single_entry_canonical_route(snapshot: &RawSearchSnapshot) -> Option<(u64, St
     }
     // Чтение маршрута должно быть наблюдено в строке, а не перенесено из canonical.
     // Маршрут без чтения JPDB даёт записи, написанной каной: тогда чтение — само написание.
-    let expected_reading = route.reading.as_deref().unwrap_or(route.surface.as_str());
+    let expected_reading = match route.reading.as_deref() {
+        Some(reading) => reading,
+        None if is_kana_text(&route.surface) => route.surface.as_str(),
+        None => return None,
+    };
     if !row
         .forms
         .iter()
@@ -4723,6 +4736,66 @@ mod tests {
                 ),
                 "canonical не должен подтверждать запись: {name}"
             );
+        }
+    }
+
+    #[test]
+    fn canonical_without_reading_is_accepted_only_for_kana_surfaces() {
+        let query_for = |surface: &str| JpdbPitchQuery::new(surface, None);
+        for (id, surface) in [
+            (1_061_520, "シャツ"),
+            (2_008_730, "それにしても"),
+            (1_000_001, "ゔぁー"),
+        ] {
+            let raw = single_entry_search(
+                (surface, surface),
+                &[&format!(
+                    "https://jpdb.io/vocabulary/{id}/{surface}/used-in"
+                )],
+                &[&format!(
+                    "https://jpdb.io/vocabulary/{id}/{surface}?lang=english"
+                )],
+            );
+            assert_eq!(
+                resolve_single(raw, &query_for(surface)).unwrap().len(),
+                1,
+                "{surface}"
+            );
+        }
+        // Чтение, совпавшее с написанием, не делает запись с кандзи или латиницей записью каной:
+        // например, если `<rt>` повторяет основу.
+        for (id, surface) in [
+            (1_192_150, "家族"),
+            (1_000_002, "お茶"),
+            (1_000_003, "Tシャツ"),
+            (1_000_004, "シャツ1"),
+        ] {
+            let raw = single_entry_search(
+                (surface, surface),
+                &[&format!(
+                    "https://jpdb.io/vocabulary/{id}/{surface}/used-in"
+                )],
+                &[&format!(
+                    "https://jpdb.io/vocabulary/{id}/{surface}?lang=english"
+                )],
+            );
+            assert!(
+                matches!(
+                    resolve_single(raw, &query_for(surface)),
+                    Err(JpdbPitchFailure::PageContract { .. })
+                ),
+                "canonical без чтения не подтверждает запись не каной: {surface}"
+            );
+        }
+    }
+
+    #[test]
+    fn kana_text_matches_the_page_script_ranges() {
+        for text in ["かな", "カナ", "ー", "ゔ", "\u{3099}", "ヿ"] {
+            assert!(is_kana_text(text), "{text}");
+        }
+        for text in ["", "家", "お茶", "Tシャツ", "ｶﾅ", "かな ", "々"] {
+            assert!(!is_kana_text(text), "{text:?}");
         }
     }
 
