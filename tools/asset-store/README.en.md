@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 6a14b1b2b8575923cd0570e2f1f2296fc4eded3d -->
+<!-- i18n-source-git-blob: 7e9d70d36b4d5dbef9093a9a0d96b5fb227d92d2 -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 

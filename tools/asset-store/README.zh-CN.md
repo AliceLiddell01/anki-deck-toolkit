@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 6a14b1b2b8575923cd0570e2f1f2296fc4eded3d -->
+<!-- i18n-source-git-blob: 7e9d70d36b4d5dbef9093a9a0d96b5fb227d92d2 -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
