@@ -1042,6 +1042,53 @@ pub(crate) enum JpdbVocabularyRouteError {
 pub(crate) fn parse_jpdb_vocabulary_route(
     value: &str,
 ) -> Result<JpdbVocabularyRoute, JpdbVocabularyRouteError> {
+    let (vocabulary_id, segments) = parse_jpdb_vocabulary_path(value)?;
+    let surface = segments[0].clone();
+    let reading = segments.get(1).cloned();
+    if surface.eq_ignore_ascii_case("used-in")
+        || reading
+            .as_ref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("used-in"))
+    {
+        return Err(JpdbVocabularyRouteError::Path);
+    }
+    Ok(JpdbVocabularyRoute {
+        vocabulary_id,
+        surface,
+        reading,
+    })
+}
+
+/// ID и написание из ссылки `Used in` строки JPDB.
+///
+/// Ссылка ведёт на список употреблений, а не на словарную запись, поэтому
+/// маршрутом карточки не является; она лишь свидетельствует, к какой записи
+/// относится строка поиска.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JpdbUsedInRoute {
+    pub(crate) vocabulary_id: u64,
+    pub(crate) surface: String,
+}
+
+/// Разбирает только точный путь `/vocabulary/<id>/<surface>/used-in` на `jpdb.io`.
+pub(crate) fn parse_jpdb_used_in_route(
+    value: &str,
+) -> Result<JpdbUsedInRoute, JpdbVocabularyRouteError> {
+    let (vocabulary_id, segments) = parse_jpdb_vocabulary_path(value)?;
+    if segments.len() != 2
+        || segments[1] != "used-in"
+        || segments[0].eq_ignore_ascii_case("used-in")
+    {
+        return Err(JpdbVocabularyRouteError::Path);
+    }
+    Ok(JpdbUsedInRoute {
+        vocabulary_id,
+        surface: segments[0].clone(),
+    })
+}
+
+/// Общая часть разбора: origin, `vocabulary`, ID и декодированные сегменты после ID.
+fn parse_jpdb_vocabulary_path(value: &str) -> Result<(u64, Vec<String>), JpdbVocabularyRouteError> {
     let url = Url::parse(value).map_err(|_| JpdbVocabularyRouteError::Url)?;
     if url.scheme() != "https"
         || !url.username().is_empty()
@@ -1074,27 +1121,14 @@ pub(crate) fn parse_jpdb_vocabulary_route(
         .ok()
         .filter(|id| *id > 0 && id.to_string() == encoded_segments[1])
         .ok_or(JpdbVocabularyRouteError::VocabularyId)?;
-    let surface = decode_path_segment(encoded_segments[2])?;
-    let reading = encoded_segments
-        .get(3)
+    let segments = encoded_segments[2..]
+        .iter()
         .map(|segment| decode_path_segment(segment))
-        .transpose()?;
-    if surface.trim().is_empty()
-        || reading
-            .as_ref()
-            .is_some_and(|value| value.trim().is_empty())
-        || surface.eq_ignore_ascii_case("used-in")
-        || reading
-            .as_ref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("used-in"))
-    {
+        .collect::<Result<Vec<_>, _>>()?;
+    if segments.iter().any(|segment| segment.trim().is_empty()) {
         return Err(JpdbVocabularyRouteError::Path);
     }
-    Ok(JpdbVocabularyRoute {
-        vocabulary_id,
-        surface,
-        reading,
-    })
+    Ok((vocabulary_id, segments))
 }
 
 fn decode_path_segment(segment: &str) -> Result<String, JpdbVocabularyRouteError> {
@@ -1672,6 +1706,37 @@ mod tests {
             SemanticStatus::Rejected,
             "структурно допустимый маршрут с неверным ID в метаданных отвергается"
         );
+    }
+
+    #[test]
+    fn used_in_link_is_evidence_of_id_and_surface_but_never_a_vocabulary_route() {
+        let used_in = "https://jpdb.io/vocabulary/123/%E5%B9%BD%E9%9C%8A/used-in";
+        assert_eq!(
+            parse_jpdb_used_in_route(used_in),
+            Ok(JpdbUsedInRoute {
+                vocabulary_id: 123,
+                surface: "幽霊".into(),
+            })
+        );
+        assert!(parse_jpdb_vocabulary_route(used_in).is_err());
+
+        for value in [
+            "https://jpdb.io/vocabulary/123/幽霊/ゆうれい",
+            "https://jpdb.io/vocabulary/123/幽霊",
+            "https://jpdb.io/vocabulary/123/used-in/used-in",
+            "https://jpdb.io/vocabulary/123/幽霊/USED-IN",
+            "https://jpdb.io/vocabulary/123/幽霊/used-in/extra",
+            "https://jpdb.io/vocabulary/0123/幽霊/used-in",
+            "https://jpdb.io/vocabulary/123//used-in",
+            "https://jpdb.io.evil.example/vocabulary/123/幽霊/used-in",
+            "http://jpdb.io/vocabulary/123/幽霊/used-in",
+            "https://jpdb.io/conjugate/123/幽霊/used-in",
+        ] {
+            assert!(
+                parse_jpdb_used_in_route(value).is_err(),
+                "разборщик `Used in` должен отвергать: {value}"
+            );
+        }
     }
 
     #[test]
