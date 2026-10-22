@@ -1897,6 +1897,8 @@ fn finish_acquisition_run(
 pub struct AcquisitionRun {
     runtime: tokio::runtime::Runtime,
     interrupt: CtrlCListener,
+    /// Пока запуск жив, сигналы завершения передаются его координатору.
+    _termination: crate::acquisition_pool::TerminationScope,
     stopped: bool,
     workspace: PathBuf,
     owned_workspace: Option<TempWorkspace>,
@@ -1949,10 +1951,12 @@ impl AcquisitionRun {
             .map_err(|error| {
                 AcquisitionStreamError::Provider(format!("среда браузера: {error}"))
             })?;
-        let interrupt = runtime.spawn(crate::acquisition_pool::termination_signal());
+        let (termination, signal) = crate::acquisition_pool::TerminationScope::enter();
+        let interrupt = runtime.spawn(signal);
         Ok(Self {
             runtime,
             interrupt,
+            _termination: termination,
             stopped: false,
             workspace,
             owned_workspace,

@@ -196,6 +196,44 @@ async fn dropped_coordinator_is_reported_as_coordinator_failure() {
     );
 }
 
+#[tokio::test]
+async fn signal_reaches_active_runs_and_exits_once_none_remain() {
+    let dispatch = SignalDispatch::default();
+    // Без запуска получения сигнал завершает процесс стандартным кодом.
+    assert_eq!(
+        dispatch.deliver(TerminationSignal::Terminate),
+        SignalDelivery::Exit(143)
+    );
+    dispatch.enter();
+    let first = tokio::spawn(dispatch.wait());
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!first.is_finished());
+    assert_eq!(
+        dispatch.deliver(TerminationSignal::Interrupt),
+        SignalDelivery::Delivered
+    );
+    first.await.unwrap().unwrap();
+    // Пока запуск закрывает браузеры, повторный сигнал не обрывает остановку.
+    assert_eq!(
+        dispatch.deliver(TerminationSignal::Interrupt),
+        SignalDelivery::Delivered
+    );
+    // Ожидание, начатое позже, не видит уже принятых сигналов.
+    let later = tokio::spawn(dispatch.wait());
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!later.is_finished());
+    dispatch.leave();
+    assert_eq!(
+        dispatch.deliver(TerminationSignal::Hangup),
+        SignalDelivery::Exit(129)
+    );
+    assert_eq!(
+        dispatch.deliver(TerminationSignal::Interrupt),
+        SignalDelivery::Exit(130)
+    );
+    later.abort();
+}
+
 #[test]
 fn recovery_budget_counts_only_consecutive_failures() {
     let mut budget = RecoveryBudget::new(3);
@@ -208,4 +246,54 @@ fn recovery_budget_counts_only_consecutive_failures() {
     assert!(!budget.exhausted());
     budget.record_failure();
     assert!(budget.exhausted());
+}
+
+const SIGNAL_CHILD: &str = "ASSET_STORE_TERMINATION_SIGNAL_CHILD";
+
+/// Дочерний процесс теста ниже: обычным прогоном ничего не делает.
+#[test]
+fn termination_signal_child_process() {
+    let Ok(mode) = std::env::var(SIGNAL_CHILD) else {
+        return;
+    };
+    let me = rustix::process::getpid();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    if mode == "active" {
+        // Запуск получения жив: сигнал передаётся ему, а процесс продолжает работу.
+        let (scope, signal) = TerminationScope::enter();
+        rustix::process::kill_process(me, rustix::process::Signal::TERM).unwrap();
+        runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), signal).await })
+            .unwrap()
+            .unwrap();
+        drop(scope);
+        std::process::exit(0);
+    }
+    // Запуск закрыт: следующий сигнал завершает процесс стандартным кодом, а
+    // не поглощается оставшейся регистрацией обработчика.
+    drop(TerminationScope::enter());
+    rustix::process::kill_process(me, rustix::process::Signal::TERM).unwrap();
+    std::thread::sleep(Duration::from_secs(5));
+    std::process::exit(0);
+}
+
+#[test]
+fn signal_after_last_run_terminates_the_process_with_shell_code() {
+    for (mode, code) in [("active", 0), ("released", 143)] {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "acquisition_pool::tests::termination_signal_child_process",
+                "--nocapture",
+            ])
+            .env(SIGNAL_CHILD, mode)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(code), "{mode}");
+    }
 }

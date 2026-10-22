@@ -2643,8 +2643,9 @@ async fn run_batch_workers(
     operation: &'static str,
     workers: usize,
 ) -> Result<(PitchAccentBatch, bool), AssetError> {
-    let mut listener =
-        PitchCtrlCListener(tokio::spawn(crate::acquisition_pool::termination_signal()));
+    // Область живёт до закрытия всех браузеров запуска.
+    let (_termination, signal) = crate::acquisition_pool::TerminationScope::enter();
+    let mut listener = PitchCtrlCListener(tokio::spawn(signal));
     let interruption = async {
         match (&mut listener.0).await {
             Ok(Ok(())) => Ok(()),

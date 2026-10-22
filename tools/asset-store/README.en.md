@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: f0a7f6917d1ba862c070929561a7a1d4db43fc4b -->
+<!-- i18n-source-git-blob: 3866874ededc90b48eb107a2da20c09b822f72d3 -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -327,6 +327,8 @@ If a report has **no result**, its assigned item goes to the queue's end without
 Unrecoverable failures abort the whole run: provider report with more than one result or no result without a session failure (`invalid_provider_report`), inability to confirm broken-session cleanup (`browser_cleanup_failed`), worker panic, closed task channel, or checkpoint/CAS/store error. Local session recovery does not conceal them.
 
 On `Ctrl+C`, `SIGTERM`, or `SIGHUP`, the coordinator stops dispatching and signals cancellation to active requests. Worker browsers run in their own process groups and do not receive the terminal `SIGINT`. A result already received as the signal arrives is still CAS-checked and durably checkpointed. Sessions close and workers are joined after temporary-directory cleanup. Uncheckpointed and undispatched items remain `pending`, without fabricated attempts. `batch resume` reconciles the persisted state and continues only current `pending`, retaining earlier checkpoints.
+
+A repeated signal during this shutdown does not cut it short: otherwise browsers in their own groups would outlive the CLI. Signals are handled by a process-wide listener: when no acquisition run owns browsers (acquisition has not started yet or is already closed), `SIGINT`, `SIGTERM`, and `SIGHUP` terminate the process with code `128 + signal number` (130, 143, 129), as the default behavior does.
 
 Publication reads metadata and `evidence` **only** from the identified attempt and requires its current `VERIFIED` result from `PitchAccentImageValidator` v6. `AssetStore::ingest_verified` rechecks bytes and CAS against the expected previous SHA before writing. Storage uses `assets/png/<surface>.png` and consumer name `<surface>.pitch.png`. If fresh reconciliation proves an existing canonical entry is valid under the current validator, it can be reused without a new network acquisition.
 

@@ -14,6 +14,7 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::{Mutex, OnceLock};
 
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
@@ -317,6 +318,15 @@ impl TerminationSignal {
             Self::Hangup => "SIGHUP",
         }
     }
+
+    /// Код выхода, которым оболочки обозначают завершение по этому сигналу.
+    pub(crate) fn exit_code(self) -> i32 {
+        128 + match self {
+            Self::Interrupt => 2,
+            Self::Terminate => 15,
+            Self::Hangup => 1,
+        }
+    }
 }
 
 /// Слушатель сигналов завершения. Chromium запускается в собственной группе
@@ -357,9 +367,157 @@ impl TerminationSignals {
     }
 }
 
-/// Ожидает первый сигнал завершения (аналог `tokio::signal::ctrl_c`).
-pub(crate) async fn termination_signal() -> io::Result<()> {
-    TerminationSignals::register()?.recv().await.map(|_| ())
+/// Что делать с сигналом, пришедшим в процессный обработчик.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignalDelivery {
+    /// Сигнал передан запускам получения: их остановка кооперативна.
+    Delivered,
+    /// Ни один запуск не владеет браузерами: стандартное завершение процесса.
+    Exit(i32),
+}
+
+/// Учёт активных запусков получения и порядковый номер принятых сигналов.
+#[derive(Debug)]
+pub(crate) struct SignalDispatch {
+    scopes: Mutex<usize>,
+    received: watch::Sender<u64>,
+}
+
+impl Default for SignalDispatch {
+    fn default() -> Self {
+        Self {
+            scopes: Mutex::new(0),
+            received: watch::channel(0).0,
+        }
+    }
+}
+
+impl SignalDispatch {
+    /// Решение и передача происходят под той же блокировкой, что и учёт
+    /// запусков: сигнал после выхода последнего запуска завершает процесс.
+    pub(crate) fn deliver(&self, signal: TerminationSignal) -> SignalDelivery {
+        let scopes = self.scopes();
+        if *scopes == 0 {
+            return SignalDelivery::Exit(signal.exit_code());
+        }
+        self.received.send_modify(|received| *received += 1);
+        SignalDelivery::Delivered
+    }
+
+    fn scopes(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn enter(&self) {
+        *self.scopes() += 1;
+    }
+
+    fn leave(&self) {
+        let mut scopes = self.scopes();
+        *scopes = scopes.saturating_sub(1);
+    }
+
+    /// Ожидание сигнала, принятого после этого вызова.
+    pub(crate) fn wait(&self) -> impl Future<Output = io::Result<()>> + Send + 'static {
+        let mut receiver = self.received.subscribe();
+        let baseline = *receiver.borrow_and_update();
+        async move {
+            receiver
+                .wait_for(|received| *received > baseline)
+                .await
+                .map(|_| ())
+                .map_err(|_| io::Error::other("обработчик сигналов завершения остановлен"))
+        }
+    }
+}
+
+/// Процессный владелец сигналов завершения. Регистрация tokio заменяет
+/// стандартный обработчик до конца процесса, поэтому слушатель живёт в
+/// собственном потоке, а не в среде выполнения отдельного запуска: сигнал,
+/// который не ждёт ни один запуск получения, завершает процесс с кодом
+/// 128 + номер сигнала, как стандартное поведение.
+fn process_signals() -> io::Result<&'static SignalDispatch> {
+    static PROCESS: OnceLock<Result<SignalDispatch, String>> = OnceLock::new();
+    PROCESS
+        .get_or_init(|| {
+            let (registered, registration) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("termination-signals".into())
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let _ = registered.send(Err(error));
+                            return;
+                        }
+                    };
+                    runtime.block_on(async move {
+                        let mut signals = match TerminationSignals::register() {
+                            Ok(signals) => {
+                                let _ = registered.send(Ok(()));
+                                signals
+                            }
+                            Err(error) => {
+                                let _ = registered.send(Err(error));
+                                return;
+                            }
+                        };
+                        while let Ok(signal) = signals.recv().await {
+                            let dispatch = process_signals()
+                                .expect("обработчик зарегистрирован до первого сигнала");
+                            if let SignalDelivery::Exit(code) = dispatch.deliver(signal) {
+                                std::process::exit(code);
+                            }
+                        }
+                    });
+                })
+                .map_err(|error| error.to_string())?;
+            match registration.recv() {
+                Ok(Ok(())) => Ok(SignalDispatch::default()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("поток сигналов завершения не запустился".into()),
+            }
+        })
+        .as_ref()
+        .map_err(|error| io::Error::other(error.clone()))
+}
+
+/// Время жизни запуска получения, владеющего браузерами: пока область жива,
+/// сигналы завершения только передаются его координатору.
+#[derive(Debug)]
+pub(crate) struct TerminationScope(Option<&'static SignalDispatch>);
+
+impl TerminationScope {
+    /// Регистрирует обработчик (при первом вызове) и возвращает область вместе
+    /// с ожиданием первого сигнала (аналог `tokio::signal::ctrl_c`).
+    pub(crate) fn enter() -> (Self, impl Future<Output = io::Result<()>> + Send + 'static) {
+        match process_signals() {
+            Ok(dispatch) => {
+                dispatch.enter();
+                (
+                    Self(Some(dispatch)),
+                    futures::future::Either::Left(dispatch.wait()),
+                )
+            }
+            Err(error) => (
+                Self(None),
+                futures::future::Either::Right(std::future::ready(Err(error))),
+            ),
+        }
+    }
+}
+
+impl Drop for TerminationScope {
+    fn drop(&mut self) {
+        if let Some(dispatch) = self.0 {
+            dispatch.leave();
+        }
+    }
 }
 
 #[cfg(test)]

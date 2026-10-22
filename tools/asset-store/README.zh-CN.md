@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: f0a7f6917d1ba862c070929561a7a1d4db43fc4b -->
+<!-- i18n-source-git-blob: 3866874ededc90b48eb107a2da20c09b822f72d3 -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -327,6 +327,8 @@ cargo run --locked -p asset-store --bin pitch-assets -- --output json batch revi
 无法通过更换会话解决的故障会中止整个运行：返回两个以上结果的报告，或没有结果且没有会话失败的报告（`invalid_provider_report`）、无法确认会话清理（`browser_cleanup_failed`）、worker panic、任务通道关闭、检查点/CAS/存储错误。本地会话恢复不能掩盖这些故障。
 
 收到 `Ctrl+C`、`SIGTERM` 或 `SIGHUP` 后，协调器停止新派发并向正在运行的请求发出取消信号。worker 的浏览器位于各自的进程组中，不会收到终端 `SIGINT`。与信号同时完成、已经被 worker 接收到的结果仍须通过 CAS 并可靠保存。所有会话关闭，等待 worker 清理临时目录后退出。未保存检查点和未分配项继续为 `pending`，不增加虚假尝试。之后的 `batch resume` 对账保存状态，继续当前 `pending`，保留原检查点。
+
+在这一停止过程中再次收到信号不会中断它：否则位于各自进程组中的浏览器会比 CLI 存活更久。信号由进程级监听器处理：当没有任何获取运行拥有浏览器（获取尚未开始或已经关闭）时，`SIGINT`、`SIGTERM` 和 `SIGHUP` 以 `128 + 信号编号`（130、143、129）的退出码结束进程，与默认行为一致。
 
 发布只读取**指定当前尝试**的元数据和 `evidence`，要求 `PitchAccentImageValidator` v6 给出当前 `VERIFIED`。写入前 `AssetStore::ingest_verified` 再次验证字节，通过 compare-and-swap 核对上一记录的预期 SHA。规范路径为 `assets/png/<surface>.png`，消费者名为 `<surface>.pitch.png`。如果最新存储对账证明已有规范记录符合现行验证器，可不联网而复用。
 
