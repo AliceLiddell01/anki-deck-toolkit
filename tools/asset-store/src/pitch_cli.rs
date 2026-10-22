@@ -11,6 +11,9 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::acquisition_pool::{
+    AssignmentLedger, CancellationListener, CancellationReason, PoolCancellation, RecoveryBudget,
+};
 use crate::batch_runtime::SafeBatchRuntime;
 use crate::browser_diagnostics::{BrowserItemContext, BrowserItemTimer};
 use crate::browser_runtime::{BrowserLaunchError, BrowserSession};
@@ -38,8 +41,8 @@ use crate::pitch_batch::{
 use crate::store::{AssetStore, HumanAttestationRequest, StoreOptions, VerifiedIngestRequest};
 use crate::temp_workspace::{TempWorkspace, cleanup_orphans_on_startup};
 use clap::{Parser, Subcommand, ValueEnum};
-use futures::channel::{mpsc, oneshot};
-use futures::future::{FutureExt, LocalBoxFuture, Shared};
+use futures::channel::mpsc;
+use futures::future::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -2508,7 +2511,8 @@ async fn run_batch_workers(
     operation: &'static str,
     workers: usize,
 ) -> Result<(PitchAccentBatch, bool), AssetError> {
-    let mut listener = PitchCtrlCListener(tokio::spawn(tokio::signal::ctrl_c()));
+    let mut listener =
+        PitchCtrlCListener(tokio::spawn(crate::acquisition_pool::termination_signal()));
     let interruption = async {
         match (&mut listener.0).await {
             Ok(Ok(())) => Ok(()),
@@ -2817,11 +2821,9 @@ struct PitchWorkerExit {
     result: Result<(), AssetError>,
 }
 
-type PitchCancellation = Shared<LocalBoxFuture<'static, ()>>;
-
 struct PitchWorkerControl<'a> {
     worker: u32,
-    cancellation: PitchCancellation,
+    cancellation: CancellationListener,
     dispatch_stopped: &'a AtomicBool,
     session_sequence: &'a AtomicU32,
     policy: PitchRunPolicy,
@@ -2885,10 +2887,11 @@ fn pitch_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 // и может явно её закрыть.
 async fn run_pitch_worker<D: PitchRunDriver>(
     driver: &mut D,
-    mut commands: mpsc::UnboundedReceiver<PitchAcquisitionJob>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<PitchAcquisitionJob>,
     events: mpsc::UnboundedSender<PitchWorkerEvent>,
     control: PitchWorkerControl<'_>,
 ) -> PitchWorkerExit {
+    let mut cancellation = control.cancellation.clone();
     let mut session = None;
     let mut session_started = Instant::now();
     let mut session_items = 0_usize;
@@ -2897,7 +2900,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
     // Последовательная серия сбоев сессии/запуска без доказанного здорового
     // прогресса. Плановая ротация по возрасту или лимиту записей и `Ctrl+C` её не
     // увеличивают.
-    let mut consecutive_recovery_failures = 0_u32;
+    let mut recovery = RecoveryBudget::new(PITCH_SESSION_RECOVERY_BUDGET);
     // Следующая сессия создаётся после аварийного восстановления, а не по плану.
     let mut recovering = false;
     let mut context = PitchWorkerContext {
@@ -2908,11 +2911,11 @@ async fn run_pitch_worker<D: PitchRunDriver>(
         loop {
             let job = tokio::select! {
                 biased;
-                _ = control.cancellation.clone() => {
+                _ = cancellation.cancelled() => {
                     stop_reason = Some("interrupted");
                     break;
                 },
-                job = commands.next() => match job {
+                job = commands.recv() => match job {
                     Some(job) => job,
                     None => break,
                 },
@@ -2948,7 +2951,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
             context.attempt = Some(job.attempt);
             let mut diagnostic_item = None;
             if session.is_none() {
-                if control.cancellation.clone().now_or_never().is_some() {
+                if control.cancellation.reason().is_some() {
                     stop_reason = Some("interrupted");
                     events.unbounded_send(PitchWorkerEvent::Cancelled { context: context.clone() })
                         .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
@@ -3006,14 +3009,13 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                         };
                         // Запуск не дал сессии: закрывать нечего, но задание обязано
                         // вернуться в очередь без попытки и без смены поколения.
-                        consecutive_recovery_failures += 1;
-                        let retired =
-                            consecutive_recovery_failures >= PITCH_SESSION_RECOVERY_BUDGET;
+                        recovery.record_failure();
+                        let retired = recovery.exhausted();
                         events.unbounded_send(PitchWorkerEvent::SessionFailure {
                             context: context.clone(),
                             job: Box::new(job),
                             failure: Box::new(failure),
-                            consecutive_failures: consecutive_recovery_failures,
+                            consecutive_failures: recovery.consecutive_failures(),
                             continuation: if retired {
                                 PitchWorkerContinuation::Retired
                             } else {
@@ -3046,9 +3048,9 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                     },
                     &context,
                     recovered.then_some("session_failure"),
-                    recovered.then_some(consecutive_recovery_failures),
+                    recovered.then_some(recovery.consecutive_failures()),
                 )?;
-                if control.cancellation.clone().now_or_never().is_some() {
+                if control.cancellation.reason().is_some() {
                     stop_reason = Some("interrupted");
                     events.unbounded_send(PitchWorkerEvent::Cancelled { context: context.clone() })
                         .map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
@@ -3077,7 +3079,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                     biased;
                     // Уже готовый результат выигрывает у Ctrl+C и передаётся координатору.
                     result = &mut acquisition => Some(result),
-                    _ = control.cancellation.clone() => None,
+                    _ = cancellation.cancelled() => None,
                 }
             };
             let report = match acquired {
@@ -3118,15 +3120,14 @@ async fn run_pitch_worker<D: PitchRunDriver>(
             // Настоящий терминальный результат доказывает, что сессия работала: серия
             // последовательных восстановлений прерывается.
             if class != PitchReportClass::SessionFailure {
-                consecutive_recovery_failures = 0;
+                recovery.record_success();
             }
             // Каждая непригодная сессия требует восстановления и расходует бюджет,
             // включая случай, когда результат уже получен и сохранён.
             if session_failure.is_some() {
-                consecutive_recovery_failures += 1;
+                recovery.record_failure();
             }
-            let retired = session_failure.is_some()
-                && consecutive_recovery_failures >= PITCH_SESSION_RECOVERY_BUDGET;
+            let retired = session_failure.is_some() && recovery.exhausted();
             let continuation = if retired {
                 PitchWorkerContinuation::Retired
             } else {
@@ -3147,7 +3148,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                         context: context.clone(),
                         job: Box::new(job),
                         failure: Box::new(failure.clone()),
-                        consecutive_failures: consecutive_recovery_failures,
+                        consecutive_failures: recovery.consecutive_failures(),
                         continuation,
                     }).map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
                 }
@@ -3157,7 +3158,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                         job: Box::new(job),
                         report: Box::new(report),
                         item,
-                        consecutive_failures: consecutive_recovery_failures,
+                        consecutive_failures: recovery.consecutive_failures(),
                         continuation,
                     }).map_err(|_| pitch_run_stopped("worker_channel_closed", "канал событий исполнителя закрыт"))?;
                 }
@@ -3175,7 +3176,7 @@ async fn run_pitch_worker<D: PitchRunDriver>(
                     "browser_session_ended",
                     &context,
                     Some("session_failure"),
-                    Some(consecutive_recovery_failures),
+                    Some(recovery.consecutive_failures()),
                 )?;
                 context.session = None;
             }
@@ -3306,58 +3307,37 @@ fn retain_pitch_run_error(saved: &mut Option<AssetError>, error: AssetError) {
     }
 }
 
-fn stop_pitch_dispatch(
-    commands: &mut [Option<mpsc::UnboundedSender<PitchAcquisitionJob>>],
-    stopped: &AtomicBool,
-) {
+type PitchAssignments = AssignmentLedger<PitchAcquisitionJob>;
+
+fn stop_pitch_dispatch(assignments: &mut PitchAssignments, stopped: &AtomicBool) {
     stopped.store(true, Ordering::Release);
-    for command in commands {
-        command.take();
-    }
+    assignments.stop_dispatch();
 }
 
-/// Выдаёт ожидающие задачи свободным исполнителям в порядке их номеров.
-///
-/// Исполнитель, вышедший из пула, теряет свой канал: он не получает новых задач.
-/// Если очередь опустела, свободные каналы остаются открытыми, пока выполняется хотя
-/// бы одно задание: после отказа соседа его задание вернётся в очередь. Когда все
-/// задания завершены и очередь пуста, свободные каналы закрываются.
-fn dispatch_pending_jobs(
-    commands: &mut [Option<mpsc::UnboundedSender<PitchAcquisitionJob>>],
-    pending: &mut VecDeque<PitchAcquisitionJob>,
-    active: &mut [Option<PitchAcquisitionJob>],
+/// Выдача принадлежит общему журналу назначений: свободный готовый исполнитель
+/// получает следующее задание, выведенный из пула — ничего. Пока выполняется хотя
+/// бы одно задание, свободные каналы остаются открытыми: отказ сессии соседа
+/// возвращает его задание в очередь.
+fn dispatch_pending_jobs(assignments: &mut PitchAssignments) -> Result<(), AssetError> {
+    assignments.dispatch().map_err(|_| {
+        pitch_run_stopped(
+            "worker_channel_closed",
+            "исполнитель больше не принимает задачи",
+        )
+    })
+}
+
+/// Результат принимается только от исполнителя, которому выдано это задание.
+fn accept_pitch_job(
+    assignments: &mut PitchAssignments,
+    worker: u32,
+    job: &PitchAcquisitionJob,
+    message: &'static str,
 ) -> Result<(), AssetError> {
-    for index in 0..commands.len() {
-        if active[index].is_some() {
-            continue;
-        }
-        // Выведенный из пула исполнитель больше не принимает задач: его канал уже
-        // закрыт координатором, и это не ошибка, а завершённое восстановление.
-        let Some(command) = commands[index].as_ref() else {
-            continue;
-        };
-        let Some(job) = pending.pop_front() else {
-            break;
-        };
-        command.unbounded_send(job.clone()).map_err(|_| {
-            pitch_run_stopped(
-                "worker_channel_closed",
-                "исполнитель больше не принимает задачи",
-            )
-        })?;
-        active[index] = Some(job);
-    }
-    // Пока у запуска есть активные задания, свободный исполнитель остаётся в
-    // пуле: отказ сессии соседа возвращает его задание в очередь, и кому-то
-    // нужно его принять. Пул закрывается только когда работы больше не осталось.
-    if pending.is_empty() && active.iter().all(Option::is_none) {
-        for index in 0..commands.len() {
-            if active[index].is_none() {
-                commands[index].take();
-            }
-        }
-    }
-    Ok(())
+    assignments
+        .accept(worker as usize, |assigned| assigned == job)
+        .map(|_| ())
+        .map_err(|_| pitch_run_stopped("invalid_provider_report", message))
 }
 
 fn emit_pitch_coordinator_progress(
@@ -3431,7 +3411,7 @@ async fn run_batch_with_drivers(
     };
     publish_ready(store, batch_id)?;
     let (batch, _) = reconcile_loaded_batch(store, batch_id)?;
-    let mut pending = batch
+    let pending = batch
         .items
         .iter()
         .filter(|item| item.status() == PitchBatchItemStatus::Pending)
@@ -3488,19 +3468,13 @@ async fn run_batch_with_drivers(
     let mut progress_enabled = true;
     let dispatch_stopped = AtomicBool::new(false);
     let session_sequence = AtomicU32::new(0);
-    let (cancel_sender, cancel_receiver) = oneshot::channel::<()>();
-    let mut cancel_sender = Some(cancel_sender);
-    let cancellation: PitchCancellation = async move {
-        let _ = cancel_receiver.await;
-    }
-    .boxed_local()
-    .shared();
+    let cancellation = PoolCancellation::default();
     let (event_sender, mut events) = mpsc::unbounded();
     let mut workers = FuturesUnordered::new();
     let mut commands = Vec::new();
     for (index, driver) in drivers.iter_mut().enumerate() {
-        let (sender, receiver) = mpsc::unbounded();
-        commands.push(Some(sender));
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        commands.push(sender);
         workers.push(
             run_pitch_worker(
                 driver,
@@ -3508,7 +3482,7 @@ async fn run_batch_with_drivers(
                 event_sender.clone(),
                 PitchWorkerControl {
                     worker: index as u32 + 1,
-                    cancellation: cancellation.clone(),
+                    cancellation: cancellation.subscribe(),
                     dispatch_stopped: &dispatch_stopped,
                     session_sequence: &session_sequence,
                     policy,
@@ -3522,12 +3496,17 @@ async fn run_batch_with_drivers(
     }
     drop(event_sender);
     let mut live_workers = commands.len();
-    let mut active = vec![None; commands.len()];
-    // Исполнители, исчерпавшие бюджет восстановления и выведенные из пула.
-    let mut retired_workers: Vec<u32> = Vec::new();
+    let worker_count = commands.len();
+    let mut assignments = PitchAssignments::new(pending, commands);
+    // Исполнитель JPDB ждёт следующее задание сразу после события о результате.
+    for worker in 1..=worker_count {
+        assignments
+            .mark_ready(worker)
+            .expect("номер исполнителя принадлежит пулу");
+    }
     // Последний отказ сессии остаётся в деталях итоговой ошибки исчерпания пула.
     let mut last_session_failure: Option<JpdbPitchFailure> = None;
-    let mut contexts = (1..=commands.len())
+    let mut contexts = (1..=worker_count)
         .map(|worker| PitchWorkerContext {
             worker: worker as u32,
             ..PitchWorkerContext::default()
@@ -3537,19 +3516,17 @@ async fn run_batch_with_drivers(
     if let Err(error) = check_pitch_interruption(interruption.as_mut()).await {
         interruption_seen = true;
         retain_pitch_run_error(&mut stop_error, error);
-        if let Some(sender) = cancel_sender.take() {
-            let _ = sender.send(());
-        }
+        cancellation.request(CancellationReason::Interrupted);
     }
     if stop_error.is_none()
-        && let Err(error) = dispatch_pending_jobs(&mut commands, &mut pending, &mut active)
+        && let Err(error) = dispatch_pending_jobs(&mut assignments)
     {
         retain_pitch_run_error(&mut stop_error, error);
     }
     if stop_error.is_some() {
-        stop_pitch_dispatch(&mut commands, &dispatch_stopped);
+        stop_pitch_dispatch(&mut assignments, &dispatch_stopped);
     }
-    progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+    progress.in_flight = assignments.in_flight();
     let mut heartbeat = tokio::time::interval(policy.heartbeat);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     heartbeat.tick().await;
@@ -3565,7 +3542,7 @@ async fn run_batch_with_drivers(
                         PitchWorkerEvent::Progress { event, context, reason, recovery } => {
                             let index = context.worker as usize - 1;
                             contexts[index] = context.clone();
-                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                            progress.in_flight = assignments.in_flight();
                             emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
                                 event, context.progress(), None, reason, recovery)?;
                         }
@@ -3579,11 +3556,9 @@ async fn run_batch_with_drivers(
                             );
                             let _entered = checkpoint.enter();
                             let index = context.worker as usize - 1;
-                            let expected = active[index].take();
-                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
-                            if expected.as_ref() != Some(&job) {
-                                return Err(pitch_run_stopped("invalid_provider_report", "отчёт не соответствует назначенным идентичности, токену и запросу"));
-                            }
+                            accept_pitch_job(&mut assignments, context.worker, &job,
+                                "отчёт не соответствует назначенным идентичности, токену и запросу")?;
+                            progress.in_flight = assignments.in_flight();
                             if report.outcomes.len() > 1
                                 || (report.outcomes.is_empty() && report.session_failure.is_none())
                             {
@@ -3621,9 +3596,10 @@ async fn run_batch_with_drivers(
                                 last_session_failure = Some(failure.clone());
                             }
                             if continuation == PitchWorkerContinuation::Accepting {
+                                assignments.mark_ready(context.worker as usize).expect("исполнитель проверен");
                                 refill = true;
                             } else {
-                                retire_pitch_worker(&mut commands, &mut retired_workers, &mut progress, &mut progress_enabled, index, &context, consecutive_failures)?;
+                                retire_pitch_worker(&mut assignments, &mut progress, &mut progress_enabled, index, &context, consecutive_failures)?;
                                 // Возвращённое задание должен успеть принять
                                 // свободный сосед, иначе оно останется в очереди зря.
                                 refill = true;
@@ -3633,11 +3609,9 @@ async fn run_batch_with_drivers(
                             let job = *job;
                             let index = context.worker as usize - 1;
                             contexts[index] = context.clone();
-                            let expected = active[index].take();
-                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
-                            if expected.as_ref() != Some(&job) {
-                                return Err(pitch_run_stopped("invalid_provider_report", "отказ сессии не соответствует назначенным идентичности, токену и запросу"));
-                            }
+                            accept_pitch_job(&mut assignments, context.worker, &job,
+                                "отказ сессии не соответствует назначенным идентичности, токену и запросу")?;
+                            progress.in_flight = assignments.in_flight();
                             // Задание не получило терминального результата: оно возвращается в
                             // очередь без попытки, без смены поколения и без
                             // синтетического `technical_failure`.
@@ -3645,30 +3619,30 @@ async fn run_batch_with_drivers(
                             last_session_failure = Some((*failure).clone());
                             emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
                                 "item_requeued", context.progress(), None, Some("session_failure".into()), Some(consecutive_failures))?;
-                            pending.push_back(job);
+                            assignments.requeue(job);
                             if continuation == PitchWorkerContinuation::Retired {
-                                retire_pitch_worker(&mut commands, &mut retired_workers, &mut progress, &mut progress_enabled, index, &context, consecutive_failures)?;
+                                retire_pitch_worker(&mut assignments, &mut progress, &mut progress_enabled, index, &context, consecutive_failures)?;
+                            } else {
+                                assignments.mark_ready(context.worker as usize).expect("исполнитель проверен");
                             }
                             // Задание снова в очереди: его обязан принять свободный
                             // исполнитель, включая случай вывода соседа из пула.
                             refill = true;
                         }
                         PitchWorkerEvent::Cancelled { context } => {
-                            let index = context.worker as usize - 1;
-                            active[index].take();
-                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                            let _ = assignments.release(context.worker as usize);
+                            progress.in_flight = assignments.in_flight();
                         }
                         PitchWorkerEvent::Failure { context, error } => {
                             let index = context.worker as usize - 1;
+                            let _ = assignments.release(context.worker as usize);
                             contexts[index] = context;
-                            active[index].take();
-                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                            progress.in_flight = assignments.in_flight();
                             return Err(error);
                         }
                         PitchWorkerEvent::Stopped { worker } => {
-                            let index = worker as usize - 1;
-                            active[index].take();
-                            progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                            let _ = assignments.release(worker as usize);
+                            progress.in_flight = assignments.in_flight();
                         }
                     }
                     Ok(())
@@ -3682,23 +3656,23 @@ async fn run_batch_with_drivers(
                 {
                     interruption_seen = true;
                     retain_pitch_run_error(&mut stop_error, error);
-                    if let Some(sender) = cancel_sender.take() { let _ = sender.send(()); }
+                    cancellation.request(CancellationReason::Interrupted);
                 }
                 if stop_error.is_some() || dispatch_stopped.load(Ordering::Acquire) {
-                    stop_pitch_dispatch(&mut commands, &dispatch_stopped);
+                    stop_pitch_dispatch(&mut assignments, &dispatch_stopped);
                 } else if refill {
-                    if let Err(error) = dispatch_pending_jobs(&mut commands, &mut pending, &mut active) {
+                    if let Err(error) = dispatch_pending_jobs(&mut assignments) {
                         retain_pitch_run_error(&mut stop_error, error);
-                        stop_pitch_dispatch(&mut commands, &dispatch_stopped);
+                        stop_pitch_dispatch(&mut assignments, &dispatch_stopped);
                     }
-                    progress.in_flight = active.iter().filter(|job| job.is_some()).count();
+                    progress.in_flight = assignments.in_flight();
                 }
             }
             signal = interruption.as_mut(), if !interruption_seen => {
                 interruption_seen = true;
                 retain_pitch_run_error(&mut stop_error, interruption_result(signal));
-                stop_pitch_dispatch(&mut commands, &dispatch_stopped);
-                if let Some(sender) = cancel_sender.take() { let _ = sender.send(()); }
+                stop_pitch_dispatch(&mut assignments, &dispatch_stopped);
+                cancellation.request(CancellationReason::Interrupted);
             }
             exited = workers.next(), if live_workers > 0 => {
                 if let Some(exited) = exited {
@@ -3706,19 +3680,19 @@ async fn run_batch_with_drivers(
                     tracing::debug!(stage = "pitch_worker", code = "worker_joined", worker = exited.worker, "исполнитель завершился");
                     if let Err(error) = exited.result {
                         retain_pitch_run_error(&mut stop_error, error);
-                        stop_pitch_dispatch(&mut commands, &dispatch_stopped);
+                        stop_pitch_dispatch(&mut assignments, &dispatch_stopped);
                     }
                 }
             }
             _ = heartbeat.tick() => {
-                let result = if active.iter().all(Option::is_none) {
+                let result = if assignments.in_flight() == 0 {
                     emit_pitch_coordinator_progress(&mut progress, &mut progress_enabled,
                         "heartbeat", PitchProgressContext::default(), None, None, None)
                 } else {
                     let mut result = Ok(());
-                        for (index, job) in active.iter().enumerate() {
-                            if let Some(job) = job {
-                                let mut context = contexts[index].clone();
+                        for (worker, job) in assignments.active_jobs() {
+                            {
+                                let mut context = contexts[worker - 1].clone();
                                 let context_matches_job = context.identity.as_ref()
                                     == Some(&job.token.identity)
                                     && context.attempt == Some(job.attempt);
@@ -3742,7 +3716,7 @@ async fn run_batch_with_drivers(
                 };
                 if let Err(error) = result {
                     retain_pitch_run_error(&mut stop_error, error);
-                    stop_pitch_dispatch(&mut commands, &dispatch_stopped);
+                    stop_pitch_dispatch(&mut assignments, &dispatch_stopped);
                 }
             }
         }
@@ -3751,10 +3725,10 @@ async fn run_batch_with_drivers(
     // временных деревьев дождались выполнения.
     let result = if let Some(error) = stop_error {
         Err(error)
-    } else if !pending.is_empty() {
+    } else if assignments.has_pending() {
         // Невыданный хвост остаётся `pending` без синтетических ошибок и попыток.
         Err(pitch_recovery_exhausted(
-            if retired_workers.is_empty() {
+            if assignments.retired_workers().is_empty() {
                 "dispatch_incomplete"
             } else {
                 "session_recovery_exhausted"
@@ -3795,19 +3769,17 @@ async fn run_batch_with_drivers(
 /// Выводит исполнителя из рабочего пула: он больше не получает задач, а его
 /// результат и уже сохранённые контрольные точки остаются в силе.
 fn retire_pitch_worker(
-    commands: &mut [Option<mpsc::UnboundedSender<PitchAcquisitionJob>>],
-    retired_workers: &mut Vec<u32>,
+    assignments: &mut PitchAssignments,
     progress: &mut PitchProgressReporter<'_>,
     progress_enabled: &mut bool,
     index: usize,
     context: &PitchWorkerContext,
     consecutive_failures: u32,
 ) -> Result<(), AssetError> {
-    commands[index].take();
     let worker = index as u32 + 1;
-    if !retired_workers.contains(&worker) {
-        retired_workers.push(worker);
-    }
+    assignments
+        .retire(worker as usize)
+        .expect("номер исполнителя принадлежит пулу");
     tracing::warn!(
         stage = "pitch_runtime",
         code = "worker_retired",

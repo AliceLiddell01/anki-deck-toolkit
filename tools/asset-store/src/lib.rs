@@ -8,6 +8,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("asset-store пока поддерживает только Linux");
 
+mod acquisition_pool;
 pub mod batch;
 pub mod batch_runtime;
 pub mod browser_diagnostics;
