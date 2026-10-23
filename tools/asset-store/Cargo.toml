@@ -34,7 +34,7 @@ reference-generator = ["dep:resvg"]
 session-rotation-acceptance = []
 
 [dev-dependencies]
-gif = "0.14.2"
+gif = "=0.14.2"
 
 [lib]
 name = "asset_store"
