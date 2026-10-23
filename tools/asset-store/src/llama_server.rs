@@ -320,7 +320,27 @@ fn group_alive(group: Pid) -> bool {
 }
 
 /// Останавливает осиротевшие собственные процессы прежних запусков.
-fn stop_orphans(directory: &Path) -> Vec<OrphanStop> {
+async fn stop_orphans(directory: &Path) -> Vec<OrphanStop> {
+    stop_orphans_with(
+        directory,
+        |alias| async move { windows_process(&alias).await },
+        Duration::from_secs(15),
+    )
+    .await
+}
+
+/// Аренда удаляется только при доказанной остановке: для `windows_interop`
+/// исчезновение прокси WSL не доказывает исчезновения процесса Windows, поэтому
+/// он проверяется отдельно, как и при обычной остановке.
+async fn stop_orphans_with<F, Fut>(
+    directory: &Path,
+    windows_probe: F,
+    windows_grace: Duration,
+) -> Vec<OrphanStop>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<WindowsProcess>, String>>,
+{
     let leases = directory.join("leases");
     let Ok(entries) = fs::read_dir(&leases) else {
         return Vec::new();
@@ -338,34 +358,50 @@ fn stop_orphans(directory: &Path) -> Vec<OrphanStop> {
         let owned = process_start_ticks(lease.pid) == Some(lease.start_ticks)
             && process_command_line(lease.pid)
                 .is_some_and(|argv| argv.iter().any(|argument| argument == &lease.alias));
+        let mut group_gone = true;
         if owned && let Some(group) = Pid::from_raw(lease.pid) {
             let _ = kill_process_group(group, Signal::TERM);
             let deadline = Instant::now() + Duration::from_secs(10);
             while group_alive(group) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(100));
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
             if group_alive(group) {
                 let _ = kill_process_group(group, Signal::KILL);
-                std::thread::sleep(Duration::from_millis(300));
+                tokio::time::sleep(Duration::from_millis(300)).await;
             }
-            let gone = !group_alive(group);
+            group_gone = !group_alive(group);
+        }
+        let windows_gone = if lease.windows_interop {
+            let deadline = Instant::now() + windows_grace;
+            loop {
+                match windows_probe(lease.alias.clone()).await {
+                    Ok(None) => break true,
+                    Ok(Some(_)) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    // Живой процесс или отказ проверки — остановка не доказана.
+                    Ok(Some(_)) | Err(_) => break false,
+                }
+            }
+        } else {
+            true
+        };
+        let gone = group_gone && windows_gone;
+        if gone {
+            let _ = fs::remove_file(&path);
+        }
+        if owned || !gone {
             tracing::warn!(
                 stage = "inference_orphan",
                 pid = lease.pid,
                 stopped = gone,
-                "остановлен осиротевший llama-server прежнего запуска"
+                "осиротевший llama-server прежнего запуска"
             );
             stopped.push(OrphanStop {
                 pid: lease.pid,
                 alias: lease.alias.clone(),
                 stopped: gone,
             });
-            if gone {
-                let _ = fs::remove_file(&path);
-            }
-        } else {
-            // Процесс исчез или PID занят чужим: аренда устарела.
-            let _ = fs::remove_file(&path);
         }
     }
     stopped
@@ -568,7 +604,16 @@ impl ManagedServer {
             )
         })?;
         let lock = ManagerLock::acquire(&directory)?;
-        let orphans_stopped = stop_orphans(&directory);
+        let orphans_stopped = stop_orphans(&directory).await;
+        if let Some(orphan) = orphans_stopped.iter().find(|orphan| !orphan.stopped) {
+            return Err(InferenceFailure::new(
+                "orphan_server_alive",
+                format!(
+                    "осиротевший llama-server {} прежнего запуска не остановлен; аренда сохранена",
+                    orphan.alias
+                ),
+            ));
+        }
         let metadata = fs::metadata(&plan.binary).map_err(|_| {
             InferenceFailure::new(
                 "binary_not_found",
@@ -1099,8 +1144,8 @@ mod tests {
         assert_eq!(redacted[3], "<redacted>");
     }
 
-    #[test]
-    fn foreign_process_with_reused_pid_is_not_treated_as_orphan() {
+    #[tokio::test]
+    async fn foreign_process_with_reused_pid_is_not_treated_as_orphan() {
         let directory = crate::temp_workspace::TempWorkspace::create("llama-lease").unwrap();
         let leases = directory.path().join("leases");
         fs::create_dir_all(&leases).unwrap();
@@ -1115,7 +1160,57 @@ mod tests {
             created_unix_seconds: 0,
         };
         fs::write(leases.join("x.json"), serde_json::to_vec(&lease).unwrap()).unwrap();
-        assert!(stop_orphans(directory.path()).is_empty());
+        assert!(stop_orphans(directory.path()).await.is_empty());
         assert!(!leases.join("x.json").exists());
+    }
+
+    #[tokio::test]
+    async fn windows_lease_survives_until_the_windows_process_is_proven_gone() {
+        let directory = crate::temp_workspace::TempWorkspace::create("llama-lease-win").unwrap();
+        let leases = directory.path().join("leases");
+        fs::create_dir_all(&leases).unwrap();
+        // Прокси WSL уже исчез (PID не наш), процесс Windows мог остаться.
+        let lease = Lease {
+            pid: std::process::id() as i32,
+            start_ticks: 1,
+            alias: "anki-windows".into(),
+            port: 1,
+            windows_interop: true,
+            created_unix_seconds: 0,
+        };
+        let path = leases.join("w.json");
+        fs::write(&path, serde_json::to_vec(&lease).unwrap()).unwrap();
+        let alive = || async {
+            Ok(Some(WindowsProcess {
+                pid: 7,
+                working_set_bytes: None,
+            }))
+        };
+        let orphans = stop_orphans_with(directory.path(), |_| alive(), Duration::ZERO).await;
+        assert_eq!(orphans.len(), 1);
+        assert!(!orphans[0].stopped);
+        assert_eq!(orphans[0].alias, "anki-windows");
+        assert!(path.exists(), "живой процесс Windows сохраняет аренду");
+
+        let failed = stop_orphans_with(
+            directory.path(),
+            |_| async { Err::<Option<WindowsProcess>, String>("powershell_unavailable".into()) },
+            Duration::ZERO,
+        )
+        .await;
+        assert!(!failed[0].stopped);
+        assert!(path.exists(), "отказ проверки не доказывает исчезновение");
+
+        let gone = stop_orphans_with(
+            directory.path(),
+            |alias| async move {
+                assert_eq!(alias, "anki-windows");
+                Ok(None)
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert!(gone.is_empty(), "устаревшая аренда снимается без сообщения");
+        assert!(!path.exists());
     }
 }

@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 9155548fcaa7c074d8d3527982453ae3c44712fa -->
+<!-- i18n-source-git-blob: 34ccc5608d64e99adb90939bc0b2b7f02d668d82 -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -675,7 +675,7 @@ Settings are assembled from layers; each later layer replaces keys of the earlie
 3. `--inference-config FILE` — an explicit file in the same format;
 4. `--inference-set KEY=VALUE` and the shortcuts `--backend`, `--model`, `--endpoint`, `--allow-remote`, `--timeout-seconds` for the selected task's profile.
 
-The schema is strict (`schema_version = 1`): an unknown key, wrong type, out-of-range value or reference to a missing profile yields `inference_config_invalid` before any model starts. Configuration has three levels:
+The schema is strict (`schema_version = 1`): an unknown key, wrong type, out-of-range value or reference to a missing profile yields `inference_config_invalid` (exit code `3`) before any model starts, and any other `schema_version` yields `unsupported_schema_version` (exit code `4`). Configuration has three levels:
 
 - `[backends.<name>]` — how inference runs: `kind = "llama_server"` (managed `mode = "managed"` or external `mode = "external"`) or `kind = "ollama"`;
 - `[models.<profile>]` — the selected `backend`, plus `llama_server` and `ollama` subtables with weights, projector, context, CPU threads, batch/ubatch, parallel slots, GPU layer placement, `flash_attention`, `reasoning`, `keep_alive_seconds`;
@@ -722,7 +722,7 @@ With `mode = "managed"` one operation starts its own process, proves its readine
 
 `gpu_layers = "auto"` chooses layer placement from the free video memory at launch time. If another process holds it — for example, Ollama keeping a model for its `keep_alive` — most layers go to the CPU and answers become several times slower until the next launch. With `windows_interop`, `inference check` shows the Windows process working set, and the answer `timings` show generation speed.
 
-One heavy model is loaded at a time (`max_loaded_models = 1`): a second launch gets `managed_server_busy` instead of loading in parallel, and switching profiles stops the previous process before the next one starts. Stopping sends SIGTERM to the group, then SIGKILL after `shutdown_timeout_seconds`; afterwards an empty group, a released port and, for Windows, the disappearance of the Windows process are checked. Only a proven stop removes the lease file in `$XDG_CACHE_HOME/anki-deck-toolkit/inference/` (otherwise `~/.cache/…`). The lease of a process left over after a crash is checked by PID, start time and the alias in its command line; the next run stops such a process and never touches foreign ones. Ctrl+C interrupts the current request, stops the server and returns `interrupted` with code `130`; records already saved remain. If the stop cannot be proven, the command returns code `3` and `inference_server_stop_unproven`.
+One heavy model is loaded at a time (`max_loaded_models = 1`): a second launch gets `managed_server_busy` instead of loading in parallel, and switching profiles stops the previous process before the next one starts. Stopping sends SIGTERM to the group, then SIGKILL after `shutdown_timeout_seconds`; afterwards an empty group, a released port and, for Windows, the disappearance of the Windows process are checked. Only a proven stop removes the lease file in `$XDG_CACHE_HOME/anki-deck-toolkit/inference/` (otherwise `~/.cache/…`). The lease of a process left over after a crash is checked by PID, start time and the alias in its command line; the next run stops such a process and never touches foreign ones. With `windows_interop`, the lease is removed only once the Windows process is gone: if it is still alive or the check fails, the lease is kept and the launch is refused with `orphan_server_alive`. Ctrl+C interrupts the current request, stops the server and returns `interrupted` with code `130`; records already saved remain. If the stop cannot be proven, the command returns code `3` and `inference_server_stop_unproven`.
 
 `mode = "external"` connects to an already running server at `endpoint`; the user starts and stops it. If the profile sets `model`, the weights path from `/props` must match; otherwise `reported-path:<path>` is recorded as identity. Weights SHA-256 is not computed in this mode.
 

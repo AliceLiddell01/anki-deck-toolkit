@@ -632,9 +632,9 @@ mod tests {
         std::fs::create_dir_all(&unrelated).unwrap();
         let images = vec![image.clone(), link.clone(), plain.clone()];
         let protected = protected_decks_roots(&unrelated, &images);
-        for path in [&image, &link] {
+        for (label, path) in [("decks", &image), ("symlink", &link)] {
             let error = read_probe_image(path, &protected).unwrap_err();
-            assert!(error.starts_with("boundary_violation"), "{path:?}: {error}");
+            assert!(error.starts_with("boundary_violation"), "{label}");
         }
         assert_eq!(read_probe_image(&plain, &protected).unwrap(), b"GIF89a");
     }

@@ -335,7 +335,11 @@ pub(crate) fn scan(
             report.stop_unproven = failure.stop_unproven();
             report.inference = Some(session_report);
             if failure.is_interrupted() {
-                return Err(failure.into_asset_error());
+                return Err(crate::inference::with_session_evidence(
+                    failure.into_asset_error(),
+                    report.stop_unproven,
+                    report.inference.as_ref(),
+                ));
             }
             (None, unavailable, Some(failure.code))
         }

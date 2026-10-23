@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 9155548fcaa7c074d8d3527982453ae3c44712fa -->
+<!-- i18n-source-git-blob: 34ccc5608d64e99adb90939bc0b2b7f02d668d82 -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -677,7 +677,7 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch review-appl
 3. `--inference-config FILE` —— 同格式的显式文件；
 4. `--inference-set KEY=VALUE` 以及针对所选任务配置档的快捷参数 `--backend`、`--model`、`--endpoint`、`--allow-remote`、`--timeout-seconds`。
 
-模式是严格的（`schema_version = 1`）：未知键、错误类型、超出范围的值或指向不存在配置档的引用，都会在启动模型之前返回 `inference_config_invalid`。配置分为三层：
+模式是严格的（`schema_version = 1`）：未知键、错误类型、超出范围的值或指向不存在配置档的引用，都会在启动模型之前返回 `inference_config_invalid`（退出码 `3`），其他 `schema_version` 值返回 `unsupported_schema_version`（退出码 `4`）。配置分为三层：
 
 - `[backends.<名称>]` —— 推理运行方式：`kind = "llama_server"`（托管 `mode = "managed"` 或外部 `mode = "external"`）或 `kind = "ollama"`；
 - `[models.<配置档>]` —— 选定的 `backend`，以及 `llama_server` 和 `ollama` 子表中的权重、projector、上下文、CPU 线程、batch/ubatch、并行槽、GPU 层放置、`flash_attention`、`reasoning`、`keep_alive_seconds`；
@@ -724,7 +724,7 @@ cargo run --quiet --locked --bin pitch-assets -- --output json inference probe \
 
 `gpu_layers = "auto"` 按启动时的空闲显存决定各层放置。如果显存被其他进程占用——例如 Ollama 在 `keep_alive` 期间保留模型——大部分层会放到 CPU 上，直到下一次启动前答复都会慢数倍。启用 `windows_interop` 时，`inference check` 显示 Windows 进程工作集，答复的 `timings` 显示生成速度。
 
-同一时间只加载一个重型模型（`max_loaded_models = 1`）：第二次启动得到 `managed_server_busy` 而不是并行加载，切换配置档会在启动下一个进程之前停止前一个。停止时向进程组发送 SIGTERM，超过 `shutdown_timeout_seconds` 后发送 SIGKILL；随后检查进程组为空、端口已释放，以及（Windows 情况下）Windows 进程已消失。只有被证明的停止才会删除 `$XDG_CACHE_HOME/anki-deck-toolkit/inference/`（否则为 `~/.cache/…`）中的 lease 文件。崩溃后遗留进程的 lease 按 PID、启动时间和命令行中的别名核对；下一次运行会停止这样的进程，绝不触碰他人的进程。Ctrl+C 中断当前请求、停止服务器并以退出码 `130` 返回 `interrupted`；已保存的记录保留。如果无法证明已停止，命令返回退出码 `3` 和 `inference_server_stop_unproven`。
+同一时间只加载一个重型模型（`max_loaded_models = 1`）：第二次启动得到 `managed_server_busy` 而不是并行加载，切换配置档会在启动下一个进程之前停止前一个。停止时向进程组发送 SIGTERM，超过 `shutdown_timeout_seconds` 后发送 SIGKILL；随后检查进程组为空、端口已释放，以及（Windows 情况下）Windows 进程已消失。只有被证明的停止才会删除 `$XDG_CACHE_HOME/anki-deck-toolkit/inference/`（否则为 `~/.cache/…`）中的 lease 文件。崩溃后遗留进程的 lease 按 PID、启动时间和命令行中的别名核对；下一次运行会停止这样的进程，绝不触碰他人的进程。对于 `windows_interop`，只有在 Windows 进程消失后才会删除 lease：如果它仍在运行或检查失败，lease 会保留，启动以 `orphan_server_alive` 被拒绝。Ctrl+C 中断当前请求、停止服务器并以退出码 `130` 返回 `interrupted`；已保存的记录保留。如果无法证明已停止，命令返回退出码 `3` 和 `inference_server_stop_unproven`。
 
 `mode = "external"` 连接到 `endpoint` 上已经运行的服务器；由用户启动和停止。如果配置档设置了 `model`，`/props` 中的权重路径必须一致；否则记录 `reported-path:<路径>` 作为身份。此模式下不计算权重 SHA-256。
 
