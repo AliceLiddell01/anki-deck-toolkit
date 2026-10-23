@@ -134,6 +134,20 @@ pub struct BatchCandidate {
     pub automated: ValidationRecord,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acquisition: Option<Box<crate::yarxi::AcquisitionEvidence>>,
+    /// Кандидат взят из локального каталога командой `batch import`, а не получен с Yarxi.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_source: Option<LocalSourceEvidence>,
+}
+
+/// Происхождение кандидата из локального файла. Имя файла лишь указывает, для
+/// какой идентичности его прочитали; доказательством соответствия символу оно
+/// не является — решение принимает валидатор по пикселям или человек.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalSourceEvidence {
+    pub provider: String,
+    pub provider_version: String,
+    pub file_name: String,
 }
 
 impl BatchCandidate {
@@ -1498,6 +1512,7 @@ impl BatchRuntime {
             technically_valid,
             automated,
             acquisition: None,
+            local_source: None,
         })
     }
 

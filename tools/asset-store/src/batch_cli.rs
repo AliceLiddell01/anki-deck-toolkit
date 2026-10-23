@@ -49,6 +49,16 @@ pub enum BatchCommand {
         #[arg(long, value_name = "N")]
         acceptance_rotate_after_items: Option<NonZeroUsize>,
     },
+    /// Берёт кандидатов текущей границы обхода из локального каталога
+    /// `<символ>.gif` или `<символ>.png` вместо получения с Yarxi. Браузер и сеть
+    /// не используются; имя файла не доказывает соответствие символу.
+    Import {
+        #[arg(long)]
+        batch_id: String,
+        /// Каталог вне `decks/` с файлами, названными точным символом идентичности.
+        #[arg(long)]
+        source_dir: std::path::PathBuf,
+    },
     /// Возвращает состояние и свидетельства, не запускает получение или публикацию.
     Status {
         #[arg(long)]
@@ -146,6 +156,7 @@ impl BatchCommand {
         match self {
             Self::Start { .. } => "batch_start",
             Self::Run { .. } => "batch_run",
+            Self::Import { .. } => "batch_import",
             Self::Status { .. } => "batch_status",
             Self::Review { .. } => "batch_review",
             Self::Revalidate { .. } => "batch_revalidate",
@@ -163,6 +174,7 @@ impl BatchCommand {
         match self {
             Self::Start { batch_id, .. } => batch_id.as_deref(),
             Self::Run { batch_id, .. }
+            | Self::Import { batch_id, .. }
             | Self::Status { batch_id }
             | Self::Review { batch_id }
             | Self::Revalidate { batch_id }
@@ -1139,6 +1151,7 @@ fn localized_operation(operation: &str) -> &str {
     match operation {
         "batch_start" => "создание пакета",
         "batch_run" => "обработка пакета",
+        "batch_import" => "импорт из локального каталога",
         "batch_status" => "просмотр состояния пакета",
         "batch_review" => "создание страницы проверки",
         "batch_review_export" => "экспорт файла решений",
@@ -1457,6 +1470,25 @@ fn execute_command_with_snapshots_and_progress(
                     operation, summary, state, changed, issues, artifact, outcome,
                 ),
                 if resolved { 0 } else { 3 },
+            ))
+        }
+        BatchCommand::Import {
+            batch_id,
+            source_dir,
+        } => {
+            let (state, changed, issues) =
+                import_local_sources(store, batch_id, source_dir, reader)?;
+            let outcome = if state.is_resolved() {
+                "resolved"
+            } else if state.review_queue().is_empty() {
+                "partial_progress"
+            } else {
+                "awaiting_human"
+            };
+            let code = if state.is_resolved() { 0 } else { 3 };
+            Ok((
+                batch_response(operation, summary, state, changed, issues, None, outcome),
+                code,
             ))
         }
         BatchCommand::Status { batch_id }
@@ -3010,6 +3042,139 @@ fn validated_candidate(
     Ok(BatchAttemptInput::Candidate { candidate })
 }
 
+const LOCAL_SOURCE_PROVIDER: &str = "local-directory";
+const LOCAL_SOURCE_PROVIDER_VERSION: &str = "local-directory-v1";
+
+/// Один проход текущей границы обхода по локальному каталогу. Каждый результат
+/// сохраняется отдельно, поэтому прерванный импорт продолжается следующим вызовом
+/// с оставшихся символов; публикация идёт тем же путём владельца, что и `run`.
+fn import_local_sources(
+    store: &AssetStore,
+    batch_id: &str,
+    source_dir: &std::path::Path,
+    reader: &mut impl OwnerSnapshotReader,
+) -> Result<(KanjiBatch, bool, Vec<BatchIssue>), AssetError> {
+    let mut issues = Vec::new();
+    let mut runtime = BatchRuntime::open(store.root(), batch_id)?;
+    let mut state = load_required(&mut runtime)?;
+    check_current_validator(&state)?;
+    let initial_revision = state.revision;
+    let mut snapshot = reader.capture(store);
+    reconcile_owner_trust(&snapshot, &mut state, &mut issues)?;
+    runtime.save(&state)?;
+    snapshot.checked()?;
+    publish_pending(store, &mut runtime, &mut state, &mut issues, &mut snapshot)?;
+    reuse_existing(&snapshot, &mut state)?;
+    runtime.save(&state)?;
+    for identity in state.next_round() {
+        let input = match read_local_source(source_dir, &identity) {
+            Ok((bytes, file_name)) => {
+                match validated_local_candidate(&runtime, &identity, &bytes, file_name) {
+                    Ok(input) => input,
+                    Err(error) if error.code.exit_code() != 4 => {
+                        issues.push(issue(&identity, &error));
+                        failure(error.code.as_str(), &error.message)
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err((code, message)) => failure(code, &message),
+        };
+        state.record_attempt(&identity, input)?;
+        runtime.save(&state)?;
+    }
+    let mut snapshot = reader.capture(store);
+    reconcile_owner_trust(&snapshot, &mut state, &mut issues)?;
+    runtime.save(&state)?;
+    snapshot.checked()?;
+    reuse_existing(&snapshot, &mut state)?;
+    publish_pending(store, &mut runtime, &mut state, &mut issues, &mut snapshot)?;
+    runtime.save(&state)?;
+    let changed = state.revision != initial_revision;
+    Ok((state, changed, issues))
+}
+
+/// Ровно один обычный файл `<символ>.gif` или `<символ>.png` без symlink;
+/// чтение ограничено пределом владельца.
+fn read_local_source(
+    source_dir: &std::path::Path,
+    identity: &AssetIdentity,
+) -> Result<(Vec<u8>, String), (&'static str, String)> {
+    let mut found = Vec::new();
+    for extension in ["gif", "png"] {
+        let file_name = format!("{}.{extension}", identity.key);
+        match crate::store::open_source_file(&source_dir.join(&file_name)) {
+            Ok(file) => found.push((file, file_name)),
+            Err(error) if error.code == ErrorCode::SourceMissing => {}
+            Err(error) => return Err(("local_source_unreadable", error.message)),
+        }
+    }
+    if found.len() > 1 {
+        return Err((
+            "local_source_ambiguous",
+            "в каталоге есть и GIF, и PNG для одного символа".into(),
+        ));
+    }
+    let Some((file, file_name)) = found.pop() else {
+        return Err((
+            "local_source_missing",
+            format!("в каталоге нет файла {0}.gif или {0}.png", identity.key),
+        ));
+    };
+    let mut bytes = Vec::new();
+    file.take(crate::kanji_validator::MAX_MEDIA_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ("local_source_unreadable", error.to_string()))?;
+    if bytes.len() > crate::kanji_validator::MAX_MEDIA_BYTES {
+        return Err((
+            "media_too_large",
+            "размер файла превышает предел изображения кандзи".into(),
+        ));
+    }
+    if bytes.is_empty() {
+        return Err(("media_empty", "файл пуст".into()));
+    }
+    Ok((bytes, file_name))
+}
+
+fn validated_local_candidate(
+    runtime: &BatchRuntime,
+    identity: &AssetIdentity,
+    bytes: &[u8],
+    file_name: String,
+) -> Result<BatchAttemptInput, AssetError> {
+    let expected_format = if file_name.ends_with(".gif") {
+        DetectedFormat::Gif
+    } else {
+        DetectedFormat::Png
+    };
+    if DetectedFormat::from_signature(bytes) != expected_format {
+        return Ok(failure(
+            "media_format_mismatch",
+            "сигнатура байтов не совпадает с расширением локального файла",
+        ));
+    }
+    let record = candidate_asset_record(identity, bytes, None)?;
+    let validator = KanjiImageValidator::new();
+    let decision = validator
+        .validate(&record, &mut Cursor::new(bytes))
+        .map_err(|failure| AssetError::new(ErrorCode::ValidatorFailure, failure.message))?;
+    let automated = ValidationRecord {
+        status: decision.status,
+        validator: validator.identity(),
+        content_sha256: sha256_hex(bytes),
+        evidence: decision.evidence,
+    };
+    let technically_valid = validate_image_decode(bytes).is_ok();
+    let mut candidate = runtime.persist_candidate(bytes, automated, technically_valid)?;
+    candidate.local_source = Some(crate::batch::LocalSourceEvidence {
+        provider: LOCAL_SOURCE_PROVIDER.into(),
+        provider_version: LOCAL_SOURCE_PROVIDER_VERSION.into(),
+        file_name,
+    });
+    Ok(BatchAttemptInput::Candidate { candidate })
+}
+
 fn reuse_existing(snapshot: &OwnerSnapshot, state: &mut KanjiBatch) -> Result<(), AssetError> {
     snapshot.checked()?;
     for item in state.items.clone() {
@@ -3503,11 +3668,12 @@ fn verified_request(
 
 fn candidate_provenance(candidate: &BatchCandidate) -> Provenance {
     Provenance {
-        source_kind: candidate
-            .acquisition
-            .as_ref()
-            .map_or("kanji_batch_runtime", |evidence| evidence.provider.as_str())
-            .into(),
+        source_kind: match (&candidate.acquisition, &candidate.local_source) {
+            (Some(evidence), _) => evidence.provider.as_str(),
+            (None, Some(local)) => local.provider.as_str(),
+            (None, None) => "kanji_batch_runtime",
+        }
+        .into(),
         source_name: match candidate.format {
             DetectedFormat::Gif => "batch-candidate.gif",
             _ => "batch-candidate.png",
@@ -3521,6 +3687,10 @@ fn candidate_metadata(identity: &AssetIdentity, candidate: &BatchCandidate) -> s
     if let Some(evidence) = &candidate.acquisition {
         metadata["yarxi"] = serde_json::to_value(evidence)
             .expect("типизированные свидетельства получения сериализуются");
+    }
+    if let Some(local) = &candidate.local_source {
+        metadata["local_source"] = serde_json::to_value(local)
+            .expect("типизированные свидетельства локального источника сериализуются");
     }
     metadata
 }

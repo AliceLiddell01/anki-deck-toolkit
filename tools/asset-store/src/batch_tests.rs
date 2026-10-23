@@ -138,6 +138,7 @@ fn candidate_with_validator(
         technically_valid,
         automated: record_with_validator(&bytes, status, 0.005, 0.010, validator),
         acquisition: None,
+        local_source: None,
     }
 }
 

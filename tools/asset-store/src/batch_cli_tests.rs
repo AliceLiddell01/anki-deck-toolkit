@@ -4226,3 +4226,186 @@ fn legacy_rejected_candidate_never_votes_or_publishes_as_aggregate() {
         "отклонённые байты не должны попасть в канонический корпус"
     );
 }
+
+fn import(fixture: &Fixture, id: &str, source_dir: &std::path::Path) -> (BatchResponse, u8) {
+    execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Import {
+            batch_id: id.into(),
+            source_dir: source_dir.to_path_buf(),
+        },
+        false,
+    )
+    .unwrap()
+}
+
+fn source_snapshot(
+    directory: &std::path::Path,
+) -> BTreeMap<String, (String, std::time::SystemTime)> {
+    fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let bytes = fs::read(entry.path()).unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                (
+                    sha256_hex(&bytes),
+                    entry.metadata().unwrap().modified().unwrap(),
+                ),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn local_import_publishes_only_verified_pixels_and_keeps_sources_read_only() {
+    let fixture = Fixture::new();
+    let source = fixture.directory().join("local-source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("元.png"), glyph('元')).unwrap();
+    // Имя файла обещает 犬, а пиксели — другой символ: имя не доказательство.
+    fs::write(source.join("犬.png"), glyph('大')).unwrap();
+    let before = source_snapshot(&source);
+    fixture.start("local", &['元', '犬', '水']);
+
+    let (response, code) = import(&fixture, "local", &source);
+
+    assert_eq!(code, 3);
+    assert_eq!(source_snapshot(&source), before);
+    let state = fixture.load("local");
+    let item = |value| {
+        state
+            .items
+            .iter()
+            .find(|item| item.identity == identity(value))
+            .unwrap()
+    };
+    assert_eq!(item('元').status, BatchItemStatus::AutoVerified);
+    assert!(item('元').is_ready());
+    let candidate = current_candidate(item('元')).unwrap();
+    assert_eq!(
+        candidate
+            .local_source
+            .as_ref()
+            .map(|source| source.file_name.as_str()),
+        Some("元.png")
+    );
+    assert!(candidate.acquisition.is_none());
+    assert_eq!(item('犬').status, BatchItemStatus::AwaitingHuman);
+    assert!(item('犬').published_sha256.is_none());
+    assert!(matches!(
+        &item('水').attempts[0].result,
+        BatchAttemptInput::Failed { code, .. } if code == "local_source_missing"
+    ));
+    assert_eq!(item('水').status, BatchItemStatus::Unresolved);
+    assert_eq!(response.outcome, "awaiting_human");
+
+    let published = read_kanji_verified(
+        fixture.store.root(),
+        &[identity('元')],
+        &KanjiImageValidator::validator_identity(),
+    )
+    .unwrap();
+    assert_eq!(published[0].bytes, glyph('元'));
+    let manifest = fixture.store.verify_integrity().unwrap();
+    let record = manifest
+        .iter()
+        .find(|record| record.identity == identity('元'))
+        .unwrap();
+    assert_eq!(record.provenance.source_kind, "local-directory");
+    assert_eq!(
+        record.domain_metadata.as_ref().unwrap()["local_source"]["file_name"],
+        "元.png"
+    );
+    assert!(
+        read_kanji_verified(
+            fixture.store.root(),
+            &[identity('犬')],
+            &KanjiImageValidator::validator_identity(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn local_import_resumes_only_unrecorded_identities_and_rejects_ambiguous_sources() {
+    let fixture = Fixture::new();
+    let source = fixture.directory().join("local-source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("元.png"), glyph('元')).unwrap();
+    fs::write(source.join("木.png"), glyph('木')).unwrap();
+    fs::write(source.join("木.gif"), glyph('木')).unwrap();
+    // Сигнатура PNG под расширением GIF — технический отказ, а не кандидат.
+    fs::write(source.join("本.gif"), glyph('本')).unwrap();
+    fixture.start("resume", &['元', '木', '本', '水']);
+
+    import(&fixture, "resume", &source);
+    let first = fixture.load("resume");
+    let attempts = |state: &KanjiBatch, value| {
+        state
+            .items
+            .iter()
+            .find(|item| item.identity == identity(value))
+            .unwrap()
+            .attempts
+            .clone()
+    };
+    let failure_code = |state: &KanjiBatch, value| match &attempts(state, value)[0].result {
+        BatchAttemptInput::Failed { code, .. } => code.clone(),
+        BatchAttemptInput::Candidate { .. } => panic!("ожидался технический отказ"),
+    };
+    assert_eq!(failure_code(&first, '木'), "local_source_ambiguous");
+    assert_eq!(failure_code(&first, '本'), "media_format_mismatch");
+    assert_eq!(failure_code(&first, '水'), "local_source_missing");
+
+    // Пользователь исправил каталог; повтор не трогает уже записанный 元.
+    fs::remove_file(source.join("木.gif")).unwrap();
+    fs::remove_file(source.join("本.gif")).unwrap();
+    fs::write(source.join("本.png"), glyph('本')).unwrap();
+    fs::remove_file(source.join("元.png")).unwrap();
+    let (_, code) = import(&fixture, "resume", &source);
+    let second = fixture.load("resume");
+
+    assert_eq!(attempts(&second, '元'), attempts(&first, '元'));
+    assert_eq!(attempts(&second, '木').len(), 2);
+    assert_eq!(attempts(&second, '本').len(), 2);
+    assert_eq!(attempts(&second, '水').len(), 2);
+    for value in ['元', '木', '本'] {
+        assert!(
+            second
+                .items
+                .iter()
+                .find(|item| item.identity == identity(value))
+                .unwrap()
+                .is_ready()
+        );
+    }
+    assert_eq!(code, 3, "水 всё ещё без источника");
+}
+
+#[test]
+fn local_import_requires_an_existing_batch_and_valid_id() {
+    let fixture = Fixture::new();
+    let source = fixture.directory().join("local-source");
+    fs::create_dir(&source).unwrap();
+    let error = execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Import {
+            batch_id: "absent".into(),
+            source_dir: source.clone(),
+        },
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::MissingAssetFile);
+    assert!(
+        prevalidate(&BatchCommand::Import {
+            batch_id: "../escape".into(),
+            source_dir: source,
+        })
+        .is_err()
+    );
+}

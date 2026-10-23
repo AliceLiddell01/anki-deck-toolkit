@@ -508,3 +508,60 @@ fn default_store_resolves_symlinked_repository_root_with_parent_components() {
         expected.display().to_string()
     );
 }
+
+#[test]
+fn identify_reads_sources_without_a_store_and_respects_the_decks_boundary() {
+    let temp = TempDir::new();
+    let outside = temp.path().join("archive");
+    fs::create_dir_all(&outside).unwrap();
+    let broken = outside.join("0_1.gif");
+    fs::write(&broken, b"GIF89a\x01\x00").unwrap();
+    let protected = temp.path().join("repository/decks/media/0_2.gif");
+    fs::create_dir_all(protected.parent().unwrap()).unwrap();
+    fs::write(&protected, b"GIF89a").unwrap();
+    let before = fs::read(&broken).unwrap();
+
+    let output = cli(
+        &temp,
+        &[
+            "identify",
+            broken.to_str().unwrap(),
+            protected.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(3));
+    let value = json(&output);
+    assert_eq!(value["operation"], "identify");
+    assert_eq!(value["items"][0]["sha256"], sha256_hex(&before));
+    assert_eq!(value["items"][0]["identification"]["status"], "corrupt");
+    assert_eq!(value["items"][1]["error"]["code"], "boundary_violation");
+    assert!(value["items"][1].get("sha256").is_none());
+    assert_eq!(value["counts"]["corrupt"], 1);
+    assert_eq!(value["counts"]["error"], 1);
+    assert_eq!(fs::read(&broken).unwrap(), before);
+    assert!(!temp.path().join("owned-store").exists());
+}
+
+#[test]
+fn batch_import_rejects_a_source_directory_under_decks_before_opening_the_store() {
+    let temp = TempDir::new();
+    let protected = temp.path().join("repository/decks/media");
+    fs::create_dir_all(&protected).unwrap();
+
+    let output = cli(
+        &temp,
+        &[
+            "batch",
+            "import",
+            "--batch-id",
+            "local",
+            "--source-dir",
+            protected.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(json(&output)["error"]["code"], "boundary_violation");
+    assert!(!temp.path().join("owned-store").exists());
+}

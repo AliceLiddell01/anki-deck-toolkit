@@ -733,6 +733,176 @@ fn compare_against_catalog(
     )
 }
 
+/// Версия процедуры ранжирования без заданной идентичности. Меняется вместе с
+/// правилом выбора статуса, а версия каталогов и порогов — через версию валидатора.
+pub const IDENTIFY_METHOD_VERSION: &str = "kanji-identify-rank-v1";
+pub const MAX_IDENTIFY_CANDIDATES: usize = 20;
+
+/// Итог ранжирования: предложение, а не доказанная идентичность.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentificationStatus {
+    /// Первый кандидат проходит зарегистрированные пороги `VERIFIED` против всех
+    /// остальных символов каталогов. Это предложение для штатной проверки, а не
+    /// второе независимое подтверждение.
+    Proposed,
+    /// Первый кандидат близок к эталону, но отрыв от следующего символа меньше порога.
+    Ambiguous,
+    /// Ни один эталон не достигает порога расстояния.
+    Unknown,
+    /// Байты не декодируются как непустое изображение PNG/GIF в пределах владельца.
+    Corrupt,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RankedCharacter {
+    pub character: String,
+    pub codepoint: String,
+    pub distance: f32,
+    pub kanjivg_distance: Option<f32>,
+    pub noto_font_distance: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct IdentificationReport {
+    pub method_version: &'static str,
+    pub validator: ValidatorIdentity,
+    pub status: IdentificationStatus,
+    pub reason: String,
+    pub proposed: Option<String>,
+    /// Отрыв второго кандидата от первого; `None`, если кандидатов меньше двух.
+    pub margin: Option<f32>,
+    pub candidates: Vec<RankedCharacter>,
+    pub raster: Option<serde_json::Value>,
+}
+
+/// Ранжирует все символы закреплённых каталогов по тому же расстоянию, что и
+/// валидатор: для каждого символа берётся меньшая из дистанций KanjiVG и
+/// (для тёмной плитки) Noto Serif JP. Имя файла и происхождение не используются.
+pub fn identify_media(bytes: &[u8], top: usize) -> IdentificationReport {
+    let top = top.clamp(1, MAX_IDENTIFY_CANDIDATES);
+    let corrupt = |reason: String| IdentificationReport {
+        method_version: IDENTIFY_METHOD_VERSION,
+        validator: KanjiImageValidator::validator_identity(),
+        status: IdentificationStatus::Corrupt,
+        reason,
+        proposed: None,
+        margin: None,
+        candidates: Vec::new(),
+        raster: None,
+    };
+    if bytes.len() > MAX_MEDIA_BYTES {
+        return corrupt(format!(
+            "размер изображения превышает предел декодирования {MAX_MEDIA_BYTES} байт"
+        ));
+    }
+    let raster = match decode_media(bytes) {
+        Ok(raster) => raster,
+        Err(reason) => return corrupt(reason),
+    };
+    let catalog = match REFERENCE_CATALOG.get_or_init(load_reference_catalog) {
+        Ok(catalog) => catalog,
+        Err(reason) => return corrupt(format!("reference_unavailable: {reason}")),
+    };
+    let font_catalog = if raster.foreground_polarity == ForegroundPolarity::LightOnDark {
+        match NOTO_FONT_REFERENCE_CATALOG.get_or_init(load_noto_font_reference_catalog) {
+            Ok(catalog) => Some(catalog),
+            Err(reason) => return corrupt(format!("font_reference_unavailable: {reason}")),
+        }
+    } else {
+        None
+    };
+    let candidate_distances = distance_transform(&raster.mask);
+    let measure = |template: &ReferenceTemplate| {
+        symmetric_distance_quantized(
+            &raster.mask,
+            &candidate_distances,
+            &template.mask,
+            &template.distances_sixteenths,
+        )
+    };
+    let mut scores: BTreeMap<char, (Option<f32>, Option<f32>)> = BTreeMap::new();
+    for (&character, template) in catalog {
+        scores.entry(character).or_default().0 = Some(measure(template));
+    }
+    if let Some(font_catalog) = font_catalog {
+        for (&character, template) in font_catalog {
+            scores.entry(character).or_default().1 = Some(measure(template));
+        }
+    }
+    let mut ranked = scores
+        .into_iter()
+        .map(|(character, (kanjivg, font))| {
+            let distance = match (kanjivg, font) {
+                (Some(kanjivg), Some(font)) => kanjivg.min(font),
+                (Some(value), None) | (None, Some(value)) => value,
+                (None, None) => f32::INFINITY,
+            };
+            RankedCharacter {
+                character: character.to_string(),
+                codepoint: format!("U+{:04X}", u32::from(character)),
+                distance,
+                kanjivg_distance: kanjivg,
+                noto_font_distance: font,
+            }
+        })
+        .collect::<Vec<_>>();
+    // Детерминированный порядок: расстояние, затем кодовая точка.
+    ranked.sort_by(|left, right| {
+        left.distance
+            .total_cmp(&right.distance)
+            .then_with(|| left.character.cmp(&right.character))
+    });
+    let margin = ranked
+        .get(1)
+        .map(|second| second.distance - ranked[0].distance);
+    let best = ranked.first().map(|best| best.distance);
+    let (status, reason) = match (best, margin) {
+        (Some(distance), Some(margin))
+            if classify_distance(distance, distance + margin, margin)
+                == SemanticStatus::Verified =>
+        {
+            (
+                IdentificationStatus::Proposed,
+                "первый эталон проходит зарегистрированные пороги расстояния и отрыва".to_owned(),
+            )
+        }
+        (Some(distance), _) if distance <= VERIFIED_MAX_DISTANCE => (
+            IdentificationStatus::Ambiguous,
+            "отрыв первого эталона от следующего меньше зарегистрированного порога".to_owned(),
+        ),
+        _ => (
+            IdentificationStatus::Unknown,
+            "ни один эталон не достигает зарегистрированного порога расстояния".to_owned(),
+        ),
+    };
+    let proposed = (status == IdentificationStatus::Proposed).then(|| ranked[0].character.clone());
+    ranked.truncate(top);
+    IdentificationReport {
+        method_version: IDENTIFY_METHOD_VERSION,
+        validator: KanjiImageValidator::validator_identity(),
+        status,
+        reason,
+        proposed,
+        margin,
+        candidates: ranked,
+        raster: Some(json!({
+            "format": raster.format,
+            "dimensions": [raster.width, raster.height],
+            "frame_count": raster.frame_count,
+            "representative_frame": raster.representative_frame,
+            "foreground_pixels": raster.foreground_pixels,
+            "background_luma": raster.background_luma,
+            "foreground_polarity": raster.foreground_polarity.as_str(),
+            "excluded_border_components": raster.excluded_border_components,
+            "reference_version": KANJIVG_REFERENCE_VERSION,
+            "font_reference_version": font_catalog.map(|_| NOTO_FONT_REFERENCE_VERSION),
+            "max_distance": VERIFIED_MAX_DISTANCE,
+            "minimum_margin": VERIFIED_MIN_MARGIN,
+        })),
+    }
+}
+
 fn symmetric_distance_quantized(
     candidate: &Mask,
     candidate_distances: &[f32],
@@ -1697,5 +1867,78 @@ mod tests {
                 "символа {missing} нет в cmap исходного шрифта, эталона быть не должно"
             );
         }
+    }
+
+    fn validator_status(bytes: &[u8], expected: char) -> SemanticStatus {
+        let asset = AssetRecord {
+            identity: crate::model::AssetIdentity::new("kanji", expected.to_string()).unwrap(),
+            storage_path: format!("assets/png/{expected}.png"),
+            consumer_filename: format!("{expected}.png"),
+            sha256: crate::hashing::sha256_hex(bytes),
+            byte_length: bytes.len() as u64,
+            format: DetectedFormat::from_signature(bytes),
+            provenance: crate::model::Provenance {
+                source_kind: "test".into(),
+                source_name: "test".into(),
+            },
+            lifecycle: crate::model::LifecycleState::Pending,
+            validation: None,
+            human_attestation: None,
+            domain_metadata: None,
+        };
+        KanjiImageValidator::new()
+            .validate(&asset, &mut Cursor::new(bytes))
+            .unwrap()
+            .status
+    }
+
+    #[test]
+    fn identify_ranks_by_pixels_and_proposes_only_what_the_validator_verifies() {
+        for character in ['元', '木', '漢', '語', '亜'] {
+            let mask = reference(character);
+            for bytes in [png_for(&mask), gif_for(vec![[0; MASK_BYTES], mask, mask])] {
+                let report = identify_media(&bytes, 5);
+                assert_eq!(
+                    report,
+                    identify_media(&bytes, 5),
+                    "ранжирование детерминировано"
+                );
+                assert_eq!(report.candidates.len(), 5);
+                assert!(
+                    report
+                        .candidates
+                        .windows(2)
+                        .all(|pair| pair[0].distance <= pair[1].distance)
+                );
+                let best = report.candidates[0].character.chars().next().unwrap();
+                assert_eq!(best, character);
+                assert_eq!(
+                    report.status == IdentificationStatus::Proposed,
+                    validator_status(&bytes, best) == SemanticStatus::Verified,
+                    "предложение совпадает с решением валидатора для {character}"
+                );
+                assert_eq!(
+                    report.proposed.is_some(),
+                    report.status == IdentificationStatus::Proposed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn identify_reports_corrupt_bytes_and_bounds_candidate_count() {
+        let corrupt = identify_media(b"GIF89a\x01\x00", 5);
+        assert_eq!(corrupt.status, IdentificationStatus::Corrupt);
+        assert!(corrupt.candidates.is_empty() && corrupt.proposed.is_none());
+        let empty = identify_media(&png_for(&[0; MASK_BYTES]), 5);
+        assert_eq!(empty.status, IdentificationStatus::Corrupt);
+        let oversized = identify_media(&vec![0; MAX_MEDIA_BYTES + 1], 5);
+        assert_eq!(oversized.status, IdentificationStatus::Corrupt);
+        assert_eq!(
+            identify_media(&png_for(&reference('元')), 99)
+                .candidates
+                .len(),
+            MAX_IDENTIFY_CANDIDATES
+        );
     }
 }

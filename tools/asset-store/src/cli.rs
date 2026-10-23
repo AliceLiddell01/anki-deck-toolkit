@@ -82,6 +82,16 @@ pub enum Command {
         #[arg(long)]
         replace_expected_sha256: Option<String>,
     },
+    /// Ранжирует символы закреплённых каталогов по пикселям локальных PNG/GIF
+    /// без заданной идентичности; хранилище не открывается и не меняется.
+    Identify {
+        /// Число выводимых кандидатов на файл (1–20).
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(1..=20))]
+        top: u8,
+        /// Один или несколько локальных файлов вне `decks/`.
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
+    },
     /// Проверяет целостность и выводит текущие записи manifest.
     List,
     /// Показывает детерминированный набор целей без записи.
@@ -276,6 +286,22 @@ pub fn execute(mut cli: Cli) -> CliOutput {
             protected_roots.insert(protected_root);
         }
     }
+    if let Command::Batch {
+        command: BatchCommand::Import { source_dir, .. },
+    } = &cli.command
+    {
+        for protected_root in discover_decks_roots(source_dir) {
+            protected_roots.insert(protected_root);
+        }
+    }
+    if let Command::Identify { top, files } = &cli.command {
+        for file in files {
+            for protected_root in discover_decks_roots(file) {
+                protected_roots.insert(protected_root);
+            }
+        }
+        return render_identify(identify_files(files, *top, &protected_roots), cli.output);
+    }
     let prevalidated = match &cli.command {
         Command::Ingest {
             character, file, ..
@@ -301,6 +327,12 @@ pub fn execute(mut cli: Cli) -> CliOutput {
             .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message)),
         Command::Batch { command } => batch_cli::prevalidate(command)
             .and_then(|()| batch_cli::prevalidate_output(command, cli.output))
+            .and_then(|()| match command {
+                BatchCommand::Import { source_dir, .. } => {
+                    validate_source_directory(source_dir, &protected_roots)
+                }
+                _ => Ok(()),
+            })
             .map(|_| (None, None)),
         Command::Validate { .. } => Ok((None, None)),
         _ => Ok((None, None)),
@@ -334,6 +366,7 @@ pub fn execute(mut cli: Cli) -> CliOutput {
             | Command::Journal { .. }
             | Command::Batch {
                 command: BatchCommand::Run { .. }
+                    | BatchCommand::Import { .. }
                     | BatchCommand::Status { .. }
                     | BatchCommand::Review { .. }
                     | BatchCommand::Revalidate { .. }
@@ -398,6 +431,144 @@ pub fn execute(mut cli: Cli) -> CliOutput {
             false,
         ),
     }
+}
+
+/// Ответ `identify`: по одной записи на каждый указанный путь в исходном порядке.
+fn identify_files(
+    files: &[PathBuf],
+    top: u8,
+    protected_roots: &BTreeSet<PathBuf>,
+) -> (serde_json::Value, u8) {
+    use std::io::Read;
+    let mut counts = std::collections::BTreeMap::<&'static str, usize>::new();
+    let mut items = Vec::with_capacity(files.len());
+    for path in files {
+        let read = validate_explicit_source(path, protected_roots).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(crate::kanji_validator::MAX_MEDIA_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| AssetError::io("не удалось прочитать исходный файл", error))?;
+            Ok(bytes)
+        });
+        match read {
+            Ok(bytes) => {
+                let report = crate::kanji_validator::identify_media(&bytes, usize::from(top));
+                let status = match report.status {
+                    crate::kanji_validator::IdentificationStatus::Proposed => "proposed",
+                    crate::kanji_validator::IdentificationStatus::Ambiguous => "ambiguous",
+                    crate::kanji_validator::IdentificationStatus::Unknown => "unknown",
+                    crate::kanji_validator::IdentificationStatus::Corrupt => "corrupt",
+                };
+                *counts.entry(status).or_default() += 1;
+                items.push(serde_json::json!({
+                    "path": path.display().to_string(),
+                    "sha256": sha256_hex(&bytes),
+                    "byte_length": bytes.len(),
+                    "identification": report,
+                }));
+            }
+            Err(error) => {
+                *counts.entry("error").or_default() += 1;
+                items.push(serde_json::json!({
+                    "path": path.display().to_string(),
+                    "error": {"code": error.code.as_str(), "message": error.message},
+                }));
+            }
+        }
+    }
+    let failed = counts.contains_key("error");
+    (
+        serde_json::json!({
+            "schema_version": 1,
+            "operation": "identify",
+            "outcome": if failed { "completed_with_errors" } else { "completed" },
+            "method_version": crate::kanji_validator::IDENTIFY_METHOD_VERSION,
+            "validator": KanjiImageValidator::validator_identity(),
+            "counts": counts,
+            "items": items,
+        }),
+        if failed { 3 } else { 0 },
+    )
+}
+
+fn render_identify((value, exit_code): (serde_json::Value, u8), format: OutputFormat) -> CliOutput {
+    let stdout = match format {
+        OutputFormat::Json => format!(
+            "{}\n",
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
+        ),
+        OutputFormat::Human => {
+            let mut text = format!("identify: {}\n", value["outcome"].as_str().unwrap_or(""));
+            for item in value["items"].as_array().into_iter().flatten() {
+                let path = item["path"].as_str().unwrap_or("");
+                if let Some(error) = item.get("error") {
+                    text.push_str(&format!(
+                        "  {path}: ошибка {}\n",
+                        error["code"].as_str().unwrap_or("")
+                    ));
+                    continue;
+                }
+                let report = &item["identification"];
+                let candidates = report["candidates"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|candidate| {
+                        format!(
+                            "{}={:.4}",
+                            candidate["character"].as_str().unwrap_or("?"),
+                            candidate["distance"].as_f64().unwrap_or(f64::NAN)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                text.push_str(&format!(
+                    "  {path}: {} {candidates}\n",
+                    report["status"].as_str().unwrap_or("")
+                ));
+            }
+            text
+        }
+    };
+    CliOutput {
+        stdout,
+        stderr: String::new(),
+        exit_code,
+    }
+}
+
+/// Каталог локального импорта не может лежать внутри `decks/` ни лексически,
+/// ни после разрешения symlink.
+fn validate_source_directory(
+    path: &std::path::Path,
+    protected_roots: &BTreeSet<PathBuf>,
+) -> Result<(), AssetError> {
+    let lexical_source = normalize_absolute_path(path)?;
+    let canonical_source = std::fs::canonicalize(path).map_err(|error| {
+        AssetError::new(
+            ErrorCode::SourceMissing,
+            format!("каталог локального импорта недоступен: {error}"),
+        )
+    })?;
+    if !canonical_source.is_dir() {
+        return Err(AssetError::new(
+            ErrorCode::SourceNotRegular,
+            "источник локального импорта должен быть каталогом",
+        ));
+    }
+    for protected_root in protected_roots {
+        let lexical_root = normalize_absolute_path(protected_root)?;
+        let canonical_root = std::fs::canonicalize(protected_root).ok();
+        if lexical_source.starts_with(&lexical_root)
+            || canonical_root.is_some_and(|root| canonical_source.starts_with(root))
+        {
+            return Err(AssetError::new(
+                ErrorCode::BoundaryViolation,
+                "CLI kanji не читает исходные файлы из защищённого дерева decks",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_explicit_source(
@@ -518,6 +689,7 @@ impl Command {
         match self {
             Self::Init => "init",
             Self::Ingest { .. } => "ingest",
+            Self::Identify { .. } => "identify",
             Self::List => "list",
             Self::Plan { .. } => "plan",
             Self::Ensure { .. } => "ensure",
@@ -673,6 +845,7 @@ fn execute_with_store(
         )),
         Command::Journal { command } => execute_journal(store, store_summary, command),
         Command::Inference { .. } => unreachable!("inference исполняется без хранилища"),
+        Command::Identify { .. } => unreachable!("identify исполняется без хранилища"),
         Command::Validate { mode } => {
             let selection_mode: SelectionMode = mode.into();
             let validator = KanjiImageValidator::new();

@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 4bb9664bedd154f8b56e7a9dce9f1a142f39aca1 -->
+<!-- i18n-source-git-blob: e4831e09940d81405c8fced9e0b2a18bc32173e4 -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -570,6 +570,50 @@ cargo run --locked --bin kanji-assets -- --output json batch retry \
 JSON output includes `schema_version`, `operation`, `store`, `mode`, `assets`, `changed`, `conflicts`, `blockers`, and `outcome`. Errors include stable `error.code`, `category`, `message`, and `details`. For `ensure`, every asset has an `item_outcome`, preventing independent successes from hiding neighboring failures.
 
 `ingest` reads exactly one explicitly selected source file **outside `decks/`** and creates a `pending` candidate. Format and hash are determined from bytes. For compare-and-swap replacement, provide `--replace-expected-sha256 <current-hash>`.
+
+### Local archive without Yarxi: `identify` and `batch import`
+
+For already saved local GIF/PNG files whose names do not prove the character,
+two steps run without a browser or network.
+
+```bash
+# Rank catalog characters by pixels; the store is neither opened nor changed.
+cargo run --locked --bin kanji-assets -- --output json identify --top 10 ./archive/0_1.gif
+
+# Take batch candidates from a <character>.gif|png directory instead of Yarxi.
+cargo run --locked --bin kanji-assets -- --output json batch start --batch-id local 亜
+cargo run --locked --bin kanji-assets -- --output json batch import \
+  --batch-id local --source-dir ./staged
+```
+
+`identify FILE...` reads files outside `decks/` within the owner limits (8 MiB,
+the same decoder and representative-frame selection as the validator) and for
+each returns the full SHA-256, raster details and up to 20 nearest characters
+with their template distance. The distance is the one `KanjiImageValidator`
+uses: KanjiVG, plus Noto Serif JP for a dark tile. Status
+(`kanji-identify-rank-v1`): `proposed` — the first character passes the
+registered `VERIFIED` thresholds against all others, `ambiguous` — distance is
+within the threshold but the margin is smaller, `unknown` — the threshold is not
+reached, `corrupt` — the bytes do not decode. This is a proposal, not proof:
+validating a character chosen this way with the same validator is not a second
+independent confirmation. A read error for one file yields an entry with
+`error` and exit code `3`; the other files are still processed.
+
+`batch import --batch-id ID --source-dir DIR` walks the batch's current frontier
+and for each identity looks for exactly one regular `<character>.gif` or
+`<character>.png` file without symlinks. The directory may not be inside
+`decks/`; files are only read. Bytes are checked by the same validator as Yarxi
+acquisition: `VERIFIED` is published by the owner, other technically valid
+candidates become `awaiting_human` and continue through `batch ocr`,
+`review-export` and human decisions. A missing file (`local_source_missing`), a
+GIF and PNG pair (`local_source_ambiguous`), a signature that contradicts the
+extension (`media_format_mismatch`), and an empty or oversized file are saved as
+technical attempts limited to the same five rounds. Each result is saved
+separately, so an interrupted import continues on the next call without
+reprocessing recorded characters. The candidate provenance is `local_source`
+(`provider: local-directory`, file name); in the manifest it appears as
+`source_kind: local-directory` and `domain_metadata.local_source`. The file name
+only states under which identity the file was read.
 
 ### Kanji batch processing
 
