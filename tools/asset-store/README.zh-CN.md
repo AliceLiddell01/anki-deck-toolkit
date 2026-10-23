@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 402c34cdf49c22f369a965db5d43787e9140906d -->
+<!-- i18n-source-git-blob: 90d89556401bcdabd815f995ef5a55696860d633 -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -733,7 +733,7 @@ cargo run --quiet --locked --bin kanji-assets -- --output json inference orphans
 
 lease 文件 `leases/<alias>.json` 位于 `$XDG_CACHE_HOME/anki-deck-toolkit/inference/`（否则为 `~/.cache/…`），在进程启动后立即写入并同步到磁盘。如果写入失败，进程会被停止，启动以 `lease_write_failed` 被拒绝：崩溃后下一次运行无法找到的服务器不会被使用。只有被证明的停止才会删除 lease。崩溃后遗留进程的 lease 按 PID、启动时间和命令行中的别名核对；下一次运行会停止这样的进程，绝不触碰他人的进程。对于 `windows_interop`，只有在证明 Windows 进程已消失后才会删除 lease。在此之前，任何托管启动（包括原生配置档）都会被拒绝：之前的模型可能仍占用内存和显存，而同一时间只允许一个重型模型。代码区分以下状态：`orphan_server_alive`——进程仍然存活（已知时，消息和 `failure.orphans` 给出 Windows PID）；`orphan_server_unverified`——无法检查 Windows 进程（`powershell_unavailable`、`windows_probe_timeout`、`windows_probe_exit:*`）。两种情况下消息都给出 lease 路径。
 
-恢复：`inference orphans` 显示每个 lease 及其状态（`process_alive`、`windows_process_alive`、`windows_probe_failed`、`stale`）、PID 和文件路径，不做任何修改；`inference orphans --stop` 重新停止自己的进程，只删除已被证明释放的 lease（没有存活进程时退出码 `0`，否则 `3`）。如果无法检查 Windows，请恢复 WSL interop（必须能从 WSL 启动 `powershell.exe`）后重试该命令。不要手动删除 lease：没有它，就再也没有人能找到遗留的 Windows 进程。
+恢复：`inference orphans` 显示每个 lease 及其状态（`process_alive`、`windows_process_alive`、`windows_probe_failed`、`stale`、`invalid`；`--stop` 之后还有 `stopped`）、PID 和文件路径，不做任何修改；`inference orphans --stop` 重新停止自己的进程，只删除已被证明释放的 lease（没有存活进程时退出码 `0`，否则 `3`）。不可读的 lease（`invalid`）即使使用 `--stop` 也不会被删除，并会以 `orphan_server_alive` 拒绝启动：进程是否存活未知，请手动检查该文件和 `llama-server` 进程。如果无法检查 Windows，请恢复 WSL interop（必须能从 WSL 启动 `powershell.exe`）后重试该命令。不要手动删除 lease：没有它，就再也没有人能找到遗留的 Windows 进程。
 
 Ctrl+C 中断当前请求、停止服务器并以退出码 `130` 返回 `interrupted`；已保存的记录保留。退出码 `130` 优先，但停止未被证明这一事实不会丢失：`error.details`（对 `check`/`probe` 而言是答复本身）保留含 `stop` 信息的 `inference`、`stop_unproven` 和阻塞项 `inference_server_stop_unproven`。没有中断时，停止未被证明返回退出码 `3` 和同一阻塞项。
 

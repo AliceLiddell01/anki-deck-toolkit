@@ -1915,10 +1915,12 @@ Windows проверить не удалось (`powershell_unavailable`, `windo
 `windows_probe_exit:*`). В обоих случаях сообщение называет путь lease.
 
 Восстановление: `inference orphans` показывает каждую аренду, её состояние
-(`process_alive`, `windows_process_alive`, `windows_probe_failed`, `stale`),
-PID и путь файла, ничего не меняя; `inference orphans --stop` повторяет остановку
+(`process_alive`, `windows_process_alive`, `windows_probe_failed`, `stale`,
+`invalid`; после `--stop` — ещё `stopped`), PID и путь файла, ничего не меняя; `inference orphans --stop` повторяет остановку
 собственных процессов и снимает только доказанно освобождённые аренды (код `0`,
-если живых не осталось, иначе `3`). Если проверка Windows недоступна, восстановите
+если живых не осталось, иначе `3`). Нечитаемая аренда (`invalid`) не удаляется
+даже при `--stop` и отклоняет запуск как `orphan_server_alive`: жив ли процесс,
+неизвестно, поэтому проверьте файл и процессы `llama-server` вручную. Если проверка Windows недоступна, восстановите
 WSL interop (`powershell.exe` должен запускаться из WSL) и повторите команду. Не
 удаляйте lease вручную: без него остаток процесса Windows больше никто не найдёт.
 
