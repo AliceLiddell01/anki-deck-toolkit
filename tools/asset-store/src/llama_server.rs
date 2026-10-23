@@ -241,6 +241,9 @@ impl OrphanStop {
                 ": проверить процесс Windows не удалось ({})",
                 self.probe_error.as_deref().unwrap_or("?")
             )),
+            "invalid" => text.push_str(
+                ": файл аренды не читается; проверьте его и процессы llama-server вручную",
+            ),
             other => text.push_str(&format!(": {other}")),
         }
         text
@@ -468,21 +471,19 @@ async fn orphans_with<W: WindowsProcesses>(
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         let Some(lease) = lease else {
-            if stop {
-                let _ = fs::remove_file(&path);
-            } else {
-                reported.push(OrphanStop {
-                    pid: 0,
-                    alias: String::new(),
-                    port: 0,
-                    windows_interop: false,
-                    lease: path.display().to_string(),
-                    stopped: false,
-                    state: "invalid".into(),
-                    windows_pid: None,
-                    probe_error: None,
-                });
-            }
+            // Нечитаемая аренда не доказывает остановку процесса: она остаётся
+            // на месте и при `stop`, а запуск отклоняется через `orphan_failure`.
+            reported.push(OrphanStop {
+                pid: 0,
+                alias: String::new(),
+                port: 0,
+                windows_interop: false,
+                lease: path.display().to_string(),
+                stopped: false,
+                state: "invalid".into(),
+                windows_pid: None,
+                probe_error: None,
+            });
             continue;
         };
         let mut orphan = OrphanStop {
@@ -1547,6 +1548,25 @@ mod tests {
         let path = leases.join(name);
         fs::write(&path, serde_json::to_vec(&lease).unwrap()).unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn unreadable_lease_is_kept_and_blocks_the_start_even_with_stop() {
+        let directory = crate::temp_workspace::TempWorkspace::create("llama-lease-bad").unwrap();
+        let leases = directory.path().join("leases");
+        fs::create_dir_all(&leases).unwrap();
+        let path = leases.join("bad.json");
+        fs::write(&path, b"{ not a lease").unwrap();
+
+        let windows = FakeWindows::new(vec![]);
+        for stop in [false, true] {
+            let orphans = orphans_with(directory.path(), &windows, Duration::ZERO, stop).await;
+            assert_eq!(orphans.len(), 1);
+            assert_eq!(orphans[0].state, "invalid");
+            assert!(!orphans[0].stopped);
+            assert!(path.exists(), "нечитаемая аренда не удаляется");
+            assert!(orphan_failure(&orphans).is_some());
+        }
     }
 
     #[tokio::test]

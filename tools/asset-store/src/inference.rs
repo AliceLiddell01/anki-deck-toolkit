@@ -679,8 +679,13 @@ fn weights_sha256(path: &Path) -> Result<String, InferenceFailure> {
         canonical.display(),
         metadata.len()
     );
-    let memo_path = crate::llama_server::state_directory()
-        .map(|directory| directory.join("weights-sha256.json"));
+    // Модульные тесты не пишут в реальный кэш пользователя.
+    let memo_directory = if cfg!(test) {
+        None
+    } else {
+        crate::llama_server::state_directory()
+    };
+    let memo_path = memo_directory.map(|directory| directory.join("weights-sha256.json"));
     let mut memo: BTreeMap<String, String> = memo_path
         .as_ref()
         .and_then(|path| std::fs::read(path).ok())
@@ -708,7 +713,12 @@ fn weights_sha256(path: &Path) -> Result<String, InferenceFailure> {
             && std::fs::create_dir_all(parent).is_ok()
             && let Ok(bytes) = serde_json::to_vec(&memo)
         {
-            let temporary = memo_path.with_extension(format!("tmp{}", std::process::id()));
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let temporary = memo_path.with_extension(format!(
+                "tmp{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             if std::fs::write(&temporary, bytes).is_ok() {
                 let _ = std::fs::rename(&temporary, &memo_path);
             }
