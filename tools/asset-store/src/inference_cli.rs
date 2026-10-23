@@ -344,10 +344,36 @@ fn interpret_probe(task: TaskId, content: &str) -> Result<Value, String> {
     }
 }
 
-fn read_probe_image(path: &Path, protected: Option<&Path>) -> Result<Vec<u8>, String> {
+/// Канонические каталоги `decks/` среди предков корня рабочей копии, текущего
+/// каталога и каждого изображения (в указанном и каноническом виде): граница
+/// не зависит от того, найдена ли рабочая копия по `repository_root`.
+fn protected_decks_roots(repository_root: &Path, images: &[PathBuf]) -> Vec<PathBuf> {
+    let mut starts = vec![repository_root.to_path_buf()];
+    starts.extend(std::env::current_dir().ok());
+    for image in images {
+        starts.extend(std::path::absolute(image).ok());
+        starts.extend(std::fs::canonicalize(image).ok());
+    }
+    let mut roots = std::collections::BTreeSet::new();
+    for start in starts
+        .iter()
+        .filter_map(|start| std::path::absolute(start).ok())
+    {
+        for ancestor in start.ancestors() {
+            if let Ok(decks) = std::fs::canonicalize(ancestor.join("decks"))
+                && decks.is_dir()
+            {
+                roots.insert(decks);
+            }
+        }
+    }
+    roots.into_iter().collect()
+}
+
+fn read_probe_image(path: &Path, protected: &[PathBuf]) -> Result<Vec<u8>, String> {
     let canonical =
         std::fs::canonicalize(path).map_err(|error| format!("image_unreadable: {error}"))?;
-    if protected.is_some_and(|decks| canonical.starts_with(decks)) {
+    if protected.iter().any(|decks| canonical.starts_with(decks)) {
         return Err("boundary_violation: изображения из decks/ не читаются".into());
     }
     let metadata =
@@ -371,12 +397,11 @@ async fn probe(
     }
     let resolved = inference.resolve(task)?;
     resolved.require_ready()?;
-    let protected = crate::inference_config::find_checkout(&inference.repository_root)
-        .and_then(|root| std::fs::canonicalize(root.join("decks")).ok());
+    let protected = protected_decks_roots(&inference.repository_root, images);
     // Все входы читаются и проверяются до запуска модели.
     let mut prepared = Vec::with_capacity(images.len());
     for path in images {
-        let entry = read_probe_image(path, protected.as_deref()).and_then(|bytes| {
+        let entry = read_probe_image(path, &protected).and_then(|bytes| {
             let source = sha256_hex(&bytes);
             prepare_probe(task, &bytes).map(|(png, details)| (source, png, details))
         });
@@ -538,4 +563,36 @@ pub(crate) fn human_summary(value: &Value) -> String {
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::temp_workspace::TempWorkspace;
+
+    #[test]
+    fn probe_rejects_decks_images_outside_the_configured_checkout() {
+        let workspace = TempWorkspace::create("inference-probe-boundary").unwrap();
+        let checkout = workspace.path().join("other-checkout");
+        let media = checkout.join("decks/output/Words/media");
+        std::fs::create_dir_all(&media).unwrap();
+        let image = media.join("kanji.gif");
+        std::fs::write(&image, b"GIF89a").unwrap();
+        let outside = workspace.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = outside.join("link.gif");
+        std::os::unix::fs::symlink(&image, &link).unwrap();
+        let plain = outside.join("plain.gif");
+        std::fs::write(&plain, b"GIF89a").unwrap();
+        // `repository_root` указывает вне рабочей копии с изображениями.
+        let unrelated = workspace.path().join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let images = vec![image.clone(), link.clone(), plain.clone()];
+        let protected = protected_decks_roots(&unrelated, &images);
+        for path in [&image, &link] {
+            let error = read_probe_image(path, &protected).unwrap_err();
+            assert!(error.starts_with("boundary_violation"), "{path:?}: {error}");
+        }
+        assert_eq!(read_probe_image(&plain, &protected).unwrap(), b"GIF89a");
+    }
 }

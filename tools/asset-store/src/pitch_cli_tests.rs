@@ -5955,11 +5955,11 @@ async fn batch_llm_review_without_targets_reports_owner_reconciliation_change() 
         .unwrap();
     drop(owner_store);
 
-    let llm_review = || {
+    let llm_review = |output| {
         execute(cli(
             store_root.to_path_buf(),
             root.to_path_buf(),
-            OutputFormat::Json,
+            output,
             PitchCommand::Batch {
                 command: PitchBatchCommand::LlmReview {
                     batch_id: "llm-review-owner-change".into(),
@@ -5972,17 +5972,34 @@ async fn batch_llm_review_without_targets_reports_owner_reconciliation_change() 
         ))
     };
     // Целей для модели нет, но сверка с владельцем сохранена в состоянии пакета.
-    let output = llm_review().await;
+    let output = llm_review(OutputFormat::Json).await;
     assert_eq!(output.exit_code, 0, "{}", output.stderr);
     let response: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
     assert_eq!(response["changed"], true);
     assert_eq!(response["llm_review"]["saved"], 0);
     assert_eq!(response["items"][0]["status"], "existing_verified");
 
-    let repeated = llm_review().await;
+    let repeated = llm_review(OutputFormat::Json).await;
     assert_eq!(repeated.exit_code, 0, "{}", repeated.stderr);
     let response: serde_json::Value = serde_json::from_str(&repeated.stdout).unwrap();
     assert_eq!(response["changed"], false);
+
+    let human = llm_review(OutputFormat::Human).await;
+    assert_eq!(human.exit_code, 0, "{}", human.stderr);
+    assert!(
+        human.stdout.contains(
+            "Операция: LLM-проверка сохранённых кандидатов; результат: предложения LLM сохранены"
+        ),
+        "{}",
+        human.stdout
+    );
+    assert!(
+        human
+            .stdout
+            .contains("LLM-проверка: целей 0, сохранено 0, из кэша 0, запросов 0, устарело 0"),
+        "{}",
+        human.stdout
+    );
 }
 
 #[tokio::test]

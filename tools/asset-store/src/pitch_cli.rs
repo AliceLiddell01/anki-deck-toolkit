@@ -1083,6 +1083,25 @@ fn render_response(response: Response, output: OutputFormat, exit_code: u8) -> P
                     applied.owner_rejections
                 ));
             }
+            if let Some(report) = &response.llm_review {
+                stdout.push_str(&format!(
+                    "LLM-проверка: целей {}, сохранено {}, из кэша {}, запросов {}, устарело {}\n",
+                    report.targets,
+                    report.saved,
+                    report.cache_hits,
+                    report.requests,
+                    report.stale_discarded
+                ));
+                for failure in &report.failures {
+                    stdout.push_str(&format!(
+                        "  Отказ LLM для {}: {}\n",
+                        failure.surface, failure.code
+                    ));
+                }
+                if report.stop_unproven {
+                    stdout.push_str("  Остановка сервера inference не доказана\n");
+                }
+            }
             if let Some(journal) = &response.journal {
                 stdout.push_str(&report_text(journal));
             }
@@ -1181,6 +1200,7 @@ fn human_operation_name(operation: &str) -> &str {
         "batch_retry_technical" => "пакетный повтор технических сбоев",
         "batch_reacquire" => "повторное получение",
         "batch_reject" => "отклонение кандидата",
+        "batch_llm_review" => "LLM-проверка сохранённых кандидатов",
         "journal_list" => "список журнала",
         "journal_check" => "проверка журнала",
         "journal_reconcile" => "сверка журнала",
@@ -1199,6 +1219,7 @@ fn human_outcome_name(outcome: &str) -> &str {
         "pending" => "ожидает обработки",
         "review_ready" => "материалы проверки готовы",
         "review_applied" => "решения проверки применены",
+        "llm_suggestions_saved" => "предложения LLM сохранены",
         "updated" => "обновлён",
         "checked" => "проверен",
         "problems_found" => "найдены проблемы",
