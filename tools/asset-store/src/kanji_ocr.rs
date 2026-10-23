@@ -332,6 +332,7 @@ pub(crate) fn scan(
         }
         Err(error) => {
             let (failure, session_report) = *error;
+            report.stop_unproven = failure.stop_unproven();
             report.inference = Some(session_report);
             if failure.is_interrupted() {
                 return Err(failure.into_asset_error());

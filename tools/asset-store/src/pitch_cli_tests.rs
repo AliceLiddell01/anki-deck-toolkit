@@ -5924,6 +5924,68 @@ async fn batch_retry_technical_empty_selection_reports_owner_reconciliation_chan
 }
 
 #[tokio::test]
+async fn batch_llm_review_without_targets_reports_owner_reconciliation_change() {
+    let workspace = temp_root();
+    let root = workspace.path();
+    let store = store_at(root);
+    let store_root = store.root().to_path_buf();
+    offline_pitch_batch(&store, "llm-review-owner-change", &["幽霊"]);
+    drop(store);
+    let owner_store = AssetStore::open_existing_with_policy(
+        StoreOptions::new(&store_root),
+        PitchAccentDomainPolicy,
+    )
+    .unwrap();
+    owner_store
+        .ingest_verified(
+            VerifiedIngestRequest {
+                identity: AssetIdentity::new("pitch_accent", "幽霊").unwrap(),
+                bytes: png(),
+                provenance: Provenance {
+                    source_kind: "jpdb_browser_capture".into(),
+                    source_name: "jpdb-vocabulary-123.png".into(),
+                },
+                domain_metadata: Some(
+                    serde_json::to_value(metadata("幽霊", "ゆうれい", 123)).unwrap(),
+                ),
+                replace_expected_sha256: None,
+            },
+            &PitchAccentImageValidator,
+        )
+        .unwrap();
+    drop(owner_store);
+
+    let llm_review = || {
+        execute(cli(
+            store_root.to_path_buf(),
+            root.to_path_buf(),
+            OutputFormat::Json,
+            PitchCommand::Batch {
+                command: PitchBatchCommand::LlmReview {
+                    batch_id: "llm-review-owner-change".into(),
+                    options: crate::pitch_llm_review::LlmReviewOptions {
+                        inference: crate::inference_cli::InferenceArgs::default(),
+                        rescan: false,
+                    },
+                },
+            },
+        ))
+    };
+    // Целей для модели нет, но сверка с владельцем сохранена в состоянии пакета.
+    let output = llm_review().await;
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    let response: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(response["changed"], true);
+    assert_eq!(response["llm_review"]["saved"], 0);
+    assert_eq!(response["items"][0]["status"], "existing_verified");
+
+    let repeated = llm_review().await;
+    assert_eq!(repeated.exit_code, 0, "{}", repeated.stderr);
+    let response: serde_json::Value = serde_json::from_str(&repeated.stdout).unwrap();
+    assert_eq!(response["changed"], false);
+}
+
+#[tokio::test]
 async fn review_export_and_apply_bind_decisions_to_snapshot_across_separate_processes() {
     let workspace = temp_root();
     let root = workspace.path();

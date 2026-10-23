@@ -1819,7 +1819,9 @@ async fn execute_batch(
                     let mut response = batch_response(
                         "batch_llm_review",
                         "llm_suggestions_saved",
-                        store_changed || report.saved > 0,
+                        store_changed
+                            || report.saved > 0
+                            || batch_state_changed_since(store, &batch_id, before_revision),
                         Some(summary),
                         &batch,
                         blockers,

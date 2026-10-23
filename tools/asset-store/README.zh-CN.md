@@ -683,7 +683,7 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch review-appl
 - `[models.<配置档>]` —— 选定的 `backend`，以及 `llama_server` 和 `ollama` 子表中的权重、projector、上下文、CPU 线程、batch/ubatch、并行槽、GPU 层放置、`flash_attention`、`reasoning`、`keep_alive`；
 - `[tasks.kanji_ocr]`、`[tasks.jpdb_pitch_review]` —— 模型配置档、提示词文件、`temperature`、`max_output_tokens`、`structured_output`、`timeout_seconds`、`seed`。
 
-提示词是单独的文本文件，无需重新编译即可修改。JSON 答复格式、其校验和信任规则属于代码，不放入提示词。相对路径相对于设置它的文件所在目录解析；CLI 层相对于当前目录。空字符串表示“未配置”。没有环境变量或 shell 替换。默认未设置任何模型：任务返回类型化拒绝 `inference_unavailable`，原因为 `backend_not_configured`、`model_not_configured` 或 `projector_not_configured`，其他命令照常工作。工具从不下载模型，也不访问云服务。
+提示词是单独的文本文件，无需重新编译即可修改。JSON 答复格式、其校验和信任规则属于代码，不放入提示词。相对路径相对于设置它的文件所在目录解析；CLI 层相对于当前目录。前缀 `~/` 展开为主目录，Windows 路径 `C:\…` 和 `C:/…` 转换为 `/mnt/c/…`（WSL 标准磁盘挂载）。空字符串表示“未配置”。没有其他替换，包括环境变量或 shell。默认未设置任何模型：任务返回类型化拒绝 `inference_unavailable`，原因为 `backend_not_configured`、`model_not_configured` 或 `projector_not_configured`，其他命令照常工作。工具从不下载模型，也不访问云服务。
 
 从 WSL 启动 Windows 版 llama.cpp：`llama-server.exe` 进程使用 Windows 的 CPU、GPU 和内存，并像 Windows 版 Ollama 一样监听 loopback。设置 `windows_interop = true`；模型和 projector 的 `/mnt/<盘符>/…` 路径以 `<盘符>:\…` 形式传给服务器，不在已挂载 Windows 磁盘上的路径会以 `path_not_visible_to_windows` 拒绝。
 
@@ -716,13 +716,13 @@ cargo run --quiet --locked --bin pitch-assets -- --output json inference probe \
   --inference-set tasks.jpdb_pitch_review.max_output_tokens=512
 ```
 
-`inference show` 从不输出提示词内容或访问密钥。`check` 返回 `ready`，附带后端与模型身份、就绪耗时、进程 PID 与内存以及停止证明。`probe` 拒绝读取工作副本 `decks/` 下的文件，单张图片限制为 8 MiB，并输出最多 2000 个字符的原始答复。退出码：`0` 成功，`3` 模型不可用或推理拒绝，`130` 被信号中断。
+`inference show` 从不输出提示词内容或访问密钥。`check` 返回 `ready`，附带后端与模型身份、就绪耗时、进程 PID 以及停止证明；启用 `windows_interop` 时还附带 Windows 进程的 PID 与内存（原生 `llama-server` 不报告内存）。`probe` 拒绝读取工作副本 `decks/` 下的文件，单张图片限制为 8 MiB，并输出最多 2000 个字符的原始答复。退出码：`0` 成功，`3` 模型不可用或推理拒绝，`130` 被信号中断。
 
 #### 托管 `llama-server`
 
 在 `mode = "managed"` 下，一次操作启动自己的进程，证明其就绪与身份，执行请求并将其停止。服务器不经 shell 启动，使用显式参数、随机 `--alias` 和 `--api-key`；不继承父进程的 `LLAMA_ARG_*` 变量。就绪意味着 `/health` 成功且 `/props` 一致：别名、权重路径和视觉支持。所选端口上的他人进程返回 `foreign_server`，无视觉能力的模型返回 `model_does_not_support_vision`，其他权重返回 `model_mismatch`。端口 `0` 表示 Linux 动态范围之外的随机空闲端口；被占用的显式端口返回 `port_in_use`。启动失败按服务器输出区分：`projector_load_failed`、`model_load_failed`、`invalid_server_arguments`、`server_exited_during_startup`、`startup_timeout`、`model_file_missing`。
 
-`gpu_layers = "auto"` 按启动时的空闲显存决定各层放置。如果显存被其他进程占用——例如 Ollama 在 `keep_alive` 期间保留模型——大部分层会放到 CPU 上，直到下一次启动前答复都会慢数倍。`inference check` 显示进程工作集，答复的 `timings` 显示生成速度。
+`gpu_layers = "auto"` 按启动时的空闲显存决定各层放置。如果显存被其他进程占用——例如 Ollama 在 `keep_alive` 期间保留模型——大部分层会放到 CPU 上，直到下一次启动前答复都会慢数倍。启用 `windows_interop` 时，`inference check` 显示 Windows 进程工作集，答复的 `timings` 显示生成速度。
 
 同一时间只加载一个重型模型（`max_loaded_models = 1`）：第二次启动得到 `managed_server_busy` 而不是并行加载，切换配置档会在启动下一个进程之前停止前一个。停止时向进程组发送 SIGTERM，超过 `shutdown_timeout_seconds` 后发送 SIGKILL；随后检查进程组为空、端口已释放，以及（Windows 情况下）Windows 进程已消失。只有被证明的停止才会删除 `$XDG_CACHE_HOME/anki-deck-toolkit/inference/`（否则为 `~/.cache/…`）中的 lease 文件。崩溃后遗留进程的 lease 按 PID、启动时间和命令行中的别名核对；下一次运行会停止这样的进程，绝不触碰他人的进程。Ctrl+C 中断当前请求、停止服务器并以退出码 `130` 返回 `interrupted`；已保存的记录保留。如果无法证明已停止，命令返回退出码 `3` 和 `inference_server_stop_unproven`。
 

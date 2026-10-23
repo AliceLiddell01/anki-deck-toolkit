@@ -86,6 +86,11 @@ impl InferenceFailure {
         self.code == "interrupted"
     }
 
+    /// Сервер был запущен, но его остановка после отказа не доказана.
+    pub(crate) fn stop_unproven(&self) -> bool {
+        self.stop.as_ref().is_some_and(|stop| !stop.proven)
+    }
+
     pub(crate) fn into_asset_error(self) -> AssetError {
         let code = if self.is_interrupted() {
             ErrorCode::Interrupted
@@ -1241,6 +1246,24 @@ mod tests {
     use crate::inference_config::{ConfigSources, LoadedConfig};
     use crate::inference_test_support::{MockLlama, external_config};
     use crate::temp_workspace::TempWorkspace;
+
+    #[test]
+    fn failed_start_with_unproven_stop_is_reported_as_stop_unproven() {
+        let failure = InferenceFailure::new("startup_timeout", "сервер не ответил");
+        assert!(!failure.stop_unproven(), "сервер не запускался");
+        let proven = StopReport {
+            method: "terminated".into(),
+            group_empty: true,
+            port_released: true,
+            ..StopReport::default()
+        };
+        assert!(!failure.clone().with_stop(proven.clone()).stop_unproven());
+        let unproven = StopReport {
+            port_released: false,
+            ..proven
+        };
+        assert!(failure.with_stop(unproven).stop_unproven());
+    }
 
     fn task_for(url: &str, extra: &[&str]) -> (TempWorkspace, ResolvedTask) {
         let temp = TempWorkspace::create("inference-transport").unwrap();
