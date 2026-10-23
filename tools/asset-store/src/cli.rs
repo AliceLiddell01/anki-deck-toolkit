@@ -1212,15 +1212,11 @@ fn render_inference(
     output: crate::inference_cli::InferenceOutput,
     format: OutputFormat,
 ) -> CliOutput {
+    let (stdout, stderr) =
+        crate::inference_cli::render(&output, matches!(format, OutputFormat::Json));
     CliOutput {
-        stdout: match format {
-            OutputFormat::Json => format!(
-                "{}\n",
-                serde_json::to_string_pretty(&output.value).unwrap_or_else(|_| "{}".into())
-            ),
-            OutputFormat::Human => crate::inference_cli::human_summary(&output.value),
-        },
-        stderr: String::new(),
+        stdout,
+        stderr,
         exit_code: output.exit_code,
     }
 }

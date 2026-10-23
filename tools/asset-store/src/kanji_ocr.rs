@@ -359,11 +359,15 @@ pub(crate) fn scan(
     match outcome {
         Ok(true) => Err(AssetError::with_details(
             ErrorCode::Interrupted,
-            "OCR прерван сигналом; сохранённые предложения не изменены",
+            "OCR прерван сигналом; уже сохранённые предложения остаются в журнале",
             json!({"saved": report.saved, "inference": report.inference}),
         )),
         Ok(false) => Ok(report),
-        Err(error) => Err(error),
+        Err(error) => Err(crate::inference::with_session_evidence(
+            error,
+            report.stop_unproven,
+            report.inference.as_ref(),
+        )),
     }
 }
 

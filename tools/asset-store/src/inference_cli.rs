@@ -501,6 +501,21 @@ async fn probe(
 }
 
 /// Человекочитаемая сводка ответа команды `inference`.
+/// Пара `(stdout, stderr)` для обоих CLI: человекочитаемая ошибка, как и у
+/// остальных команд, идёт в `stderr`, а `stdout` остаётся пустым.
+pub(crate) fn render(output: &InferenceOutput, json: bool) -> (String, String) {
+    if json {
+        let text = serde_json::to_string_pretty(&output.value).unwrap_or_else(|_| "{}".into());
+        return (format!("{text}\n"), String::new());
+    }
+    let summary = human_summary(&output.value);
+    if output.value.get("error").is_some() {
+        (String::new(), summary)
+    } else {
+        (summary, String::new())
+    }
+}
+
 pub(crate) fn human_summary(value: &Value) -> String {
     let mut text = format!(
         "{}: {}\n",
@@ -569,6 +584,34 @@ pub(crate) fn human_summary(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::temp_workspace::TempWorkspace;
+
+    #[test]
+    fn human_error_goes_to_stderr_and_success_to_stdout() {
+        let failed = InferenceOutput {
+            exit_code: 3,
+            value: json!({
+                "operation": "inference_check",
+                "outcome": "failed",
+                "error": {"code": "inference_config_invalid", "message": "неизвестный ключ"},
+            }),
+        };
+        let (stdout, stderr) = render(&failed, false);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("ошибка inference_config_invalid: неизвестный ключ"));
+        let (stdout, stderr) = render(&failed, true);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout).unwrap()["outcome"],
+            "failed"
+        );
+        let ready = InferenceOutput {
+            exit_code: 0,
+            value: json!({"operation": "inference_check", "outcome": "ready"}),
+        };
+        let (stdout, stderr) = render(&ready, false);
+        assert_eq!(stdout, "inference_check: ready\n");
+        assert!(stderr.is_empty());
+    }
 
     #[test]
     fn probe_rejects_decks_images_outside_the_configured_checkout() {

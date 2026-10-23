@@ -680,7 +680,7 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch review-appl
 模式是严格的（`schema_version = 1`）：未知键、错误类型、超出范围的值或指向不存在配置档的引用，都会在启动模型之前返回 `inference_config_invalid`。配置分为三层：
 
 - `[backends.<名称>]` —— 推理运行方式：`kind = "llama_server"`（托管 `mode = "managed"` 或外部 `mode = "external"`）或 `kind = "ollama"`；
-- `[models.<配置档>]` —— 选定的 `backend`，以及 `llama_server` 和 `ollama` 子表中的权重、projector、上下文、CPU 线程、batch/ubatch、并行槽、GPU 层放置、`flash_attention`、`reasoning`、`keep_alive`；
+- `[models.<配置档>]` —— 选定的 `backend`，以及 `llama_server` 和 `ollama` 子表中的权重、projector、上下文、CPU 线程、batch/ubatch、并行槽、GPU 层放置、`flash_attention`、`reasoning`、`keep_alive_seconds`；
 - `[tasks.kanji_ocr]`、`[tasks.jpdb_pitch_review]` —— 模型配置档、提示词文件、`temperature`、`max_output_tokens`、`structured_output`、`timeout_seconds`、`seed`。
 
 提示词是单独的文本文件，无需重新编译即可修改。JSON 答复格式、其校验和信任规则属于代码，不放入提示词。相对路径相对于设置它的文件所在目录解析；CLI 层相对于当前目录。前缀 `~/` 展开为主目录，Windows 路径 `C:\…` 和 `C:/…` 转换为 `/mnt/c/…`（WSL 标准磁盘挂载）。空字符串表示“未配置”。没有其他替换，包括环境变量或 shell。默认未设置任何模型：任务返回类型化拒绝 `inference_unavailable`，原因为 `backend_not_configured`、`model_not_configured` 或 `projector_not_configured`，其他命令照常工作。工具从不下载模型，也不访问云服务。

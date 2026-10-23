@@ -1783,7 +1783,7 @@ Linux-редактор или короткое размещение хранил
   `mode = "managed"` или внешний `mode = "external"`) либо `kind = "ollama"`;
 - `[models.<профиль>]` — выбранный `backend`, а в подтаблицах `llama_server` и
   `ollama` — веса, projector, контекст, потоки CPU, batch/ubatch, параллельные
-  слоты, размещение слоёв на GPU, `flash_attention`, `reasoning`, `keep_alive`;
+  слоты, размещение слоёв на GPU, `flash_attention`, `reasoning`, `keep_alive_seconds`;
 - `[tasks.kanji_ocr]`, `[tasks.jpdb_pitch_review]` — профиль модели, файл промпта,
   `temperature`, `max_output_tokens`, `structured_output`, `timeout_seconds`, `seed`.
 

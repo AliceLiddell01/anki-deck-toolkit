@@ -479,11 +479,17 @@ pub(crate) async fn run(
         report.stop_unproven = finished.stop.as_ref().is_some_and(|stop| !stop.proven());
         report.inference = Some(finished);
     }
-    outcome?;
+    outcome.map_err(|error| {
+        crate::inference::with_session_evidence(
+            error,
+            report.stop_unproven,
+            report.inference.as_ref(),
+        )
+    })?;
     if report.interrupted {
         return Err(AssetError::with_details(
             ErrorCode::Interrupted,
-            "LLM-проверка прервана сигналом; сохранённые предложения не изменены",
+            "LLM-проверка прервана сигналом; уже сохранённые предложения остаются в журнале",
             json!({"saved": report.saved, "inference": report.inference}),
         ));
     }

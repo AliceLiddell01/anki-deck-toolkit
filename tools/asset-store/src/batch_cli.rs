@@ -925,14 +925,17 @@ fn execute_with_progress_and_interaction(
                 diagnostic_log,
             },
         ),
-        Err(error) => super::render_error(
-            command.operation().into(),
-            None,
-            error,
-            summary,
-            output,
-            store.did_mutate_on_open(),
-        ),
+        Err(error) => {
+            let changed = store.did_mutate_on_open() || error.saved_before_failure();
+            super::render_error(
+                command.operation().into(),
+                None,
+                error,
+                summary,
+                output,
+                changed,
+            )
+        }
     }
 }
 

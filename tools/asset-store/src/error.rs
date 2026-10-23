@@ -114,6 +114,13 @@ pub struct AssetError {
 }
 
 impl AssetError {
+    /// Ошибка прерванного обхода сообщает, что часть предложений уже записана.
+    pub(crate) fn saved_before_failure(&self) -> bool {
+        self.details["saved"]
+            .as_u64()
+            .is_some_and(|saved| saved > 0)
+    }
+
     /// Создаёт доменную ошибку.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {

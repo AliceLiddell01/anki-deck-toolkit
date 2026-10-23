@@ -405,15 +405,11 @@ pub async fn execute(mut cli: PitchCli) -> PitchCliOutput {
         PitchCommand::Inference { command } => {
             command.set_repository_root(&cli.repository_root);
             let output = crate::inference_cli::execute(command);
+            let (stdout, stderr) =
+                crate::inference_cli::render(&output, matches!(cli.output, OutputFormat::Json));
             return PitchCliOutput {
-                stdout: match cli.output {
-                    OutputFormat::Json => format!(
-                        "{}\n",
-                        serde_json::to_string_pretty(&output.value).unwrap_or_else(|_| "{}".into())
-                    ),
-                    OutputFormat::Human => crate::inference_cli::human_summary(&output.value),
-                },
-                stderr: String::new(),
+                stdout,
+                stderr,
                 exit_code: output.exit_code,
             };
         }
@@ -1851,15 +1847,20 @@ async fn execute_batch(
                     response.llm_review = Some(report);
                     render_response(response, output, exit_code)
                 }
-                Err(error) => render_batch_error(
-                    store,
-                    summary,
-                    &batch_id,
-                    "batch_llm_review",
-                    error,
-                    output,
-                    store_changed || batch_state_changed_since(store, &batch_id, before_revision),
-                ),
+                Err(error) => {
+                    let saved = error.saved_before_failure();
+                    render_batch_error(
+                        store,
+                        summary,
+                        &batch_id,
+                        "batch_llm_review",
+                        error,
+                        output,
+                        store_changed
+                            || saved
+                            || batch_state_changed_since(store, &batch_id, before_revision),
+                    )
+                }
             }
         }
         PitchBatchCommand::ReviewApply {

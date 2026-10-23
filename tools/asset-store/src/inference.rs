@@ -372,6 +372,31 @@ pub(crate) struct ModelResponse {
     pub timings: RunTimings,
 }
 
+/// Добавляет к ошибке обхода отчёт завершённой сессии и признак недоказанной
+/// остановки сервера, сохраняя код и сообщение исходной ошибки.
+pub(crate) fn with_session_evidence(
+    mut error: AssetError,
+    stop_unproven: bool,
+    session: Option<&SessionReport>,
+) -> AssetError {
+    let Some(session) = session else {
+        return error;
+    };
+    let mut details = match std::mem::take(&mut error.details) {
+        Value::Object(details) => details,
+        Value::Null => serde_json::Map::new(),
+        other => serde_json::Map::from_iter([("cause".to_owned(), other)]),
+    };
+    details
+        .entry("inference")
+        .or_insert_with(|| serde_json::to_value(session).unwrap_or(Value::Null));
+    details
+        .entry("stop_unproven")
+        .or_insert(Value::Bool(stop_unproven));
+    error.details = Value::Object(details);
+    error
+}
+
 /// Сведения о сессии для отчёта команды.
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct SessionReport {
@@ -1246,6 +1271,39 @@ mod tests {
     use crate::inference_config::{ConfigSources, LoadedConfig};
     use crate::inference_test_support::{MockLlama, external_config};
     use crate::temp_workspace::TempWorkspace;
+
+    #[test]
+    fn traversal_error_keeps_code_and_message_and_gains_session_evidence() {
+        let session = SessionReport {
+            requests: 2,
+            ..SessionReport::default()
+        };
+        let error = AssetError::with_details(
+            ErrorCode::IoFailure,
+            "запись журнала не удалась",
+            json!({"path": "ocr/suggestions.json"}),
+        );
+        let enriched = with_session_evidence(error, true, Some(&session));
+        assert_eq!(enriched.code, ErrorCode::IoFailure);
+        assert_eq!(enriched.message, "запись журнала не удалась");
+        assert_eq!(enriched.details["path"], "ocr/suggestions.json");
+        assert_eq!(enriched.details["stop_unproven"], true);
+        assert_eq!(enriched.details["inference"]["requests"], 2);
+        // Без сессии ошибка не меняется.
+        let plain = with_session_evidence(AssetError::new(ErrorCode::IoFailure, "x"), true, None);
+        assert_eq!(plain.details, json!({}));
+    }
+
+    #[test]
+    fn interrupted_traversal_reports_saved_suggestions() {
+        let saved = |count: u64| {
+            AssetError::with_details(ErrorCode::Interrupted, "x", json!({"saved": count}))
+                .saved_before_failure()
+        };
+        assert!(saved(3));
+        assert!(!saved(0));
+        assert!(!AssetError::new(ErrorCode::Interrupted, "x").saved_before_failure());
+    }
 
     #[test]
     fn failed_start_with_unproven_stop_is_reported_as_stop_unproven() {

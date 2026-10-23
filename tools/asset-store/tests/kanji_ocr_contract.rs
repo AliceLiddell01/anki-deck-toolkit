@@ -1306,6 +1306,18 @@ fn managed_llama_server_is_started_verified_used_and_stopped_by_batch_ocr() {
     assert_eq!(fixture.state(), before);
 }
 
+/// Ждёт, пока поддельный сервер начнёт слушать порт; иначе останавливает его.
+fn wait_for_port(port: u16, server: &mut std::process::Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        if std::time::Instant::now() > deadline {
+            let _ = server.kill();
+            panic!("поддельный сервер не начал слушать порт {port}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn managed_startup_failures_are_typed_and_leave_no_owned_process() {
     let fixture = Fixture::new();
@@ -1395,9 +1407,7 @@ fn orphaned_server_from_a_killed_run_is_stopped_by_the_next_owner() {
         .spawn()
         .unwrap();
     let pid = orphan.id() as i32;
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_port(port, &mut orphan);
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
     let ticks: u64 = stat
         .rsplit_once(')')
@@ -1506,9 +1516,7 @@ fn external_llama_server_is_used_but_never_stopped() {
         .env(fake_llama::CONTENT, json!({"observed": "保"}).to_string())
         .spawn()
         .unwrap();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_port(port, &mut external);
     fs::write(
         &managed.config,
         format!("[backends.llama]\nmode = \"external\"\nendpoint = \"http://127.0.0.1:{port}\"\n"),
