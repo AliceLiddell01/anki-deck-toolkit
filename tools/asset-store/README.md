@@ -1800,7 +1800,11 @@ Windows `C:\…` и `C:/…` — в `/mnt/c/…` (стандартное мон�
 Программа не скачивает модели и не обращается к облачным сервисам.
 
 Llama.cpp из Windows, запущенный из WSL: процесс `llama-server.exe` использует
-CPU, GPU и память Windows и слушает loopback, как Ollama для Windows. Задайте
+CPU, GPU и память Windows и слушает loopback, как Ollama для Windows. Это
+работает только при mirrored-сети WSL (`networkingMode=mirrored`): в режиме NAT
+loopback Windows из WSL недоступен, и запуск закончится `startup_timeout`;
+`host = "::1"` в сочетании с `windows_interop` отклоняется при проверке
+конфигурации (WSL не пробрасывает IPv6 loopback). Задайте
 `windows_interop = true`; пути `/mnt/<диск>/…` к модели и projector передаются
 серверу как `<ДИСК>:\…`, а путь вне смонтированного диска Windows отклоняется
 как `path_not_visible_to_windows`.

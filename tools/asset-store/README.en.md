@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 63a78b9c745785e3b48e625a6e9120f636f7b7bf -->
+<!-- i18n-source-git-blob: 402c34cdf49c22f369a965db5d43787e9140906d -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -683,7 +683,7 @@ The schema is strict (`schema_version = 1`): an unknown key, wrong type, out-of-
 
 The prompt is a separate text file and can change without rebuilding. The JSON answer format, its validation and trust rules belong to code and are not part of the prompt. A relative path resolves against the directory of the file that set it; for the CLI layer, against the current directory. A `~/` prefix expands to the home directory, and Windows paths `C:\…` and `C:/…` become `/mnt/c/…` (the standard WSL drive mount). An empty string means "not configured". There is no other substitution, including environment variables or shell. By default no models are set: a task returns the typed `inference_unavailable` refusal with reason `backend_not_configured`, `model_not_configured` or `projector_not_configured`, while all other commands keep working. The tool never downloads models or contacts cloud services.
 
-Windows llama.cpp launched from WSL: the `llama-server.exe` process uses Windows CPU, GPU and memory and listens on loopback, just like Ollama for Windows. Set `windows_interop = true`; `/mnt/<drive>/…` model and projector paths are passed to the server as `<DRIVE>:\…`, and a path outside a mounted Windows drive is rejected as `path_not_visible_to_windows`.
+Windows llama.cpp launched from WSL: the `llama-server.exe` process uses Windows CPU, GPU and memory and listens on loopback, just like Ollama for Windows. This works only with WSL mirrored networking (`networkingMode=mirrored`): in NAT mode the Windows loopback is unreachable from WSL and startup ends with `startup_timeout`; `host = "::1"` together with `windows_interop` is rejected during configuration validation (WSL does not forward the IPv6 loopback). Set `windows_interop = true`; `/mnt/<drive>/…` model and projector paths are passed to the server as `<DRIVE>:\…`, and a path outside a mounted Windows drive is rejected as `path_not_visible_to_windows`.
 
 ```toml
 # tools/asset-store/config/inference.local.toml

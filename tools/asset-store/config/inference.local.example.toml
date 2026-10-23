@@ -8,8 +8,10 @@
 
 # --- Вариант 1: llama.cpp из Windows, запускаемый из WSL ---
 # Процесс `llama-server.exe` и его CPU/GPU/память принадлежат Windows, связь идёт
-# по loopback, как у Ollama для Windows. Модель и projector должны лежать на
-# диске Windows (`/mnt/<диск>/…`), иначе Windows их не увидит.
+# по loopback, как у Ollama для Windows; нужна mirrored-сеть WSL
+# (`networkingMode=mirrored`), в режиме NAT запуск завершится `startup_timeout`.
+# Модель и projector должны лежать на диске Windows (`/mnt/<диск>/…`), иначе
+# Windows их не увидит.
 [backends.llama]
 binary = "/mnt/c/Tools/llama.cpp/llama-server.exe"
 windows_interop = true

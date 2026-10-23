@@ -214,6 +214,10 @@ fn unknown_keys_types_ranges_and_references_are_rejected_before_any_model_starts
             "endpoint",
         ),
         ("[backends.llama]\nhost = \"0.0.0.0\"\n", "loopback"),
+        (
+            "[backends.llama]\nwindows_interop = true\nhost = \"::1\"\n",
+            "IPv4 loopback",
+        ),
         ("[backends.llama]\nkind = \"vllm\"\n", "unknown variant"),
         (
             "[backends.ollama]\nendpoint = \"http://192.168.1.2:11434\"\n",

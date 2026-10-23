@@ -1128,6 +1128,11 @@ fn validate_llama_backend(name: &str, raw: &RawLlamaBackend) -> Result<(), Asset
                     "{prefix}.host: управляемый сервер слушает только loopback"
                 )));
             }
+            if raw.windows_interop && host.is_ipv6() {
+                return Err(config_error(format!(
+                    "{prefix}.host: при windows_interop нужен IPv4 loopback (WSL не пробрасывает ::1)"
+                )));
+            }
             if raw.port != 0 && raw.port < 1024 {
                 return Err(config_error(format!(
                     "{prefix}.port: 0 (автовыбор) или 1024..=65535"

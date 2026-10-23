@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 63a78b9c745785e3b48e625a6e9120f636f7b7bf -->
+<!-- i18n-source-git-blob: 402c34cdf49c22f369a965db5d43787e9140906d -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -685,7 +685,7 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch review-appl
 
 提示词是单独的文本文件，无需重新编译即可修改。JSON 答复格式、其校验和信任规则属于代码，不放入提示词。相对路径相对于设置它的文件所在目录解析；CLI 层相对于当前目录。前缀 `~/` 展开为主目录，Windows 路径 `C:\…` 和 `C:/…` 转换为 `/mnt/c/…`（WSL 标准磁盘挂载）。空字符串表示“未配置”。没有其他替换，包括环境变量或 shell。默认未设置任何模型：任务返回类型化拒绝 `inference_unavailable`，原因为 `backend_not_configured`、`model_not_configured` 或 `projector_not_configured`，其他命令照常工作。工具从不下载模型，也不访问云服务。
 
-从 WSL 启动 Windows 版 llama.cpp：`llama-server.exe` 进程使用 Windows 的 CPU、GPU 和内存，并像 Windows 版 Ollama 一样监听 loopback。设置 `windows_interop = true`；模型和 projector 的 `/mnt/<盘符>/…` 路径以 `<盘符>:\…` 形式传给服务器，不在已挂载 Windows 磁盘上的路径会以 `path_not_visible_to_windows` 拒绝。
+从 WSL 启动 Windows 版 llama.cpp：`llama-server.exe` 进程使用 Windows 的 CPU、GPU 和内存，并像 Windows 版 Ollama 一样监听 loopback。这仅在 WSL 镜像网络（`networkingMode=mirrored`）下可用：NAT 模式下 WSL 无法访问 Windows 的 loopback，启动会以 `startup_timeout` 结束；`windows_interop` 与 `host = "::1"` 的组合会在配置校验时被拒绝（WSL 不转发 IPv6 loopback）。设置 `windows_interop = true`；模型和 projector 的 `/mnt/<盘符>/…` 路径以 `<盘符>:\…` 形式传给服务器，不在已挂载 Windows 磁盘上的路径会以 `path_not_visible_to_windows` 拒绝。
 
 ```toml
 # tools/asset-store/config/inference.local.toml

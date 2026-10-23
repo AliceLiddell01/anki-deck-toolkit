@@ -1006,6 +1006,13 @@ fn render_batch_response(
                     issue.identity, issue.code, issue.message
                 ));
             }
+            if response
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "inference_server_stop_unproven")
+            {
+                text.push_str("Остановка сервера inference не доказана\n");
+            }
             CliOutput {
                 stdout: text,
                 stderr: String::new(),

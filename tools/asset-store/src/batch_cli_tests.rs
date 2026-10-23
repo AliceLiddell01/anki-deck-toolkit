@@ -449,6 +449,18 @@ fn ocr_and_match_confirmation_localize_human_output_without_changing_json_ids() 
     );
     assert!(human.stdout.contains("Идентификатор снимка проверки: "));
     assert!(!human.stdout.contains("Review ID:"));
+    assert!(!human.stdout.contains("не доказана"));
+
+    let mut unproven = make_ocr_response();
+    unproven
+        .blockers
+        .push("inference_server_stop_unproven".into());
+    let human = render_batch_response(unproven, OutputFormat::Human, 3, None);
+    assert!(
+        human
+            .stdout
+            .contains("Остановка сервера inference не доказана")
+    );
 
     let json = render_batch_response(make_ocr_response(), OutputFormat::Json, 0, None);
     let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
