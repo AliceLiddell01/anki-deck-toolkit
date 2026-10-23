@@ -13,7 +13,7 @@ resolver = "3"
 # Минимальная поддерживаемая версия Rust (MSRV) для всех участников рабочей области.
 # Канонический владелец MSRV: rust-toolchain.toml повторяет её для rustup,
 # а CI проверяет совпадение двух TOML и всех участников workspace.
-rust-version = "1.99.0"
+rust-version = "1.99.1"
 edition = "2024"
 license = "MIT"
 
