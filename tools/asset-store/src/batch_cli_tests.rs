@@ -449,6 +449,18 @@ fn ocr_and_match_confirmation_localize_human_output_without_changing_json_ids() 
     );
     assert!(human.stdout.contains("Идентификатор снимка проверки: "));
     assert!(!human.stdout.contains("Review ID:"));
+    assert!(!human.stdout.contains("не доказана"));
+
+    let mut unproven = make_ocr_response();
+    unproven
+        .blockers
+        .push("inference_server_stop_unproven".into());
+    let human = render_batch_response(unproven, OutputFormat::Human, 3, None);
+    assert!(
+        human
+            .stdout
+            .contains("Остановка сервера inference не доказана")
+    );
 
     let json = render_batch_response(make_ocr_response(), OutputFormat::Json, 0, None);
     let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
@@ -1416,6 +1428,44 @@ fn progress_jsonl_is_separate_from_the_single_final_json_response() {
     let final_json: serde_json::Value = serde_json::from_str(&final_output.stdout).unwrap();
     assert_eq!(final_json["operation"], "batch_status");
     assert_eq!(final_json["batch_id"], "progress-contract");
+}
+
+#[test]
+fn ocr_error_after_saved_owner_reuse_reports_durable_change() {
+    let mut fixture = Fixture::new();
+    fixture.start("ocr-owner", &['元']);
+    publish_reference(&fixture, "reference");
+    fixture.store = AssetStore::open_kanji(StoreOptions::new(fixture.store.root())).unwrap();
+    assert!(!fixture.store.did_mutate_on_open());
+    let revision = fixture.load("ocr-owner").revision;
+    let command = BatchCommand::Ocr {
+        batch_id: "ocr-owner".into(),
+        options: crate::kanji_ocr::OcrOptions {
+            inference: crate::inference_cli::InferenceArgs {
+                inference_set: vec!["tasks.kanji_ocr.unknown_key=1".into()],
+                ..Default::default()
+            },
+            rescan: false,
+        },
+    };
+    let output = execute_with_progress(
+        &fixture.store,
+        fixture.summary(),
+        &command,
+        OutputFormat::Json,
+        false,
+        &mut CapturedProgress::default(),
+    );
+    let response: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(
+        response["error"]["code"], "inference_config_invalid",
+        "{response}"
+    );
+    // Сверка с владельцем сохранена до отказа конфигурации inference.
+    let state = fixture.load("ocr-owner");
+    assert_ne!(state.revision, revision);
+    assert_eq!(state.items[0].status, BatchItemStatus::ExistingVerified);
+    assert_eq!(response["changed"], true);
 }
 
 #[test]

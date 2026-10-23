@@ -785,7 +785,10 @@ fn execute_with_progress_and_interaction(
             Err(error) => log_creation_error = Some(error),
         }
     }
-    let initial_revision = if matches!(command, BatchCommand::Run { .. }) {
+    // `ocr` сохраняет сверку с владельцем до обращения к модели, поэтому его
+    // ошибка, как и у `run`, сравнивается с ревизией до команды.
+    let initial_revision = if matches!(command, BatchCommand::Run { .. } | BatchCommand::Ocr { .. })
+    {
         command
             .id()
             .and_then(|batch_id| saved_batch(store, batch_id).ok())
@@ -925,14 +928,24 @@ fn execute_with_progress_and_interaction(
                 diagnostic_log,
             },
         ),
-        Err(error) => super::render_error(
-            command.operation().into(),
-            None,
-            error,
-            summary,
-            output,
-            store.did_mutate_on_open(),
-        ),
+        Err(error) => {
+            let revision_changed = matches!(command, BatchCommand::Ocr { .. })
+                && command
+                    .id()
+                    .and_then(|batch_id| saved_batch(store, batch_id).ok())
+                    .map(|batch| batch.revision)
+                    != initial_revision;
+            let changed =
+                store.did_mutate_on_open() || error.saved_before_failure() || revision_changed;
+            super::render_error(
+                command.operation().into(),
+                None,
+                error,
+                summary,
+                output,
+                changed,
+            )
+        }
     }
 }
 
@@ -992,6 +1005,13 @@ fn render_batch_response(
                     "{}: {}: {}\n",
                     issue.identity, issue.code, issue.message
                 ));
+            }
+            if response
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "inference_server_stop_unproven")
+            {
+                text.push_str("Остановка сервера inference не доказана\n");
             }
             CliOutput {
                 stdout: text,
@@ -1541,7 +1561,11 @@ fn execute_command_with_snapshots_and_progress(
                 },
             ));
             let artifact = runtime.write_review(&state)?.display().to_string();
-            let code = if issues.is_empty() { 0 } else { 3 };
+            let code = if issues.is_empty() && !report.stop_unproven {
+                0
+            } else {
+                3
+            };
             let changed = state.revision != initial_revision || report.saved > 0;
             let mut response = batch_response(
                 operation,
@@ -1552,6 +1576,11 @@ fn execute_command_with_snapshots_and_progress(
                 Some(artifact),
                 "ocr_suggestions_saved",
             );
+            if report.stop_unproven {
+                response
+                    .blockers
+                    .push("inference_server_stop_unproven".into());
+            }
             response.ocr_summary = Some(report);
             Ok((response, code))
         }

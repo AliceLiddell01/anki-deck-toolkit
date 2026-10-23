@@ -1,0 +1,19 @@
+You are inspecting ONE saved screenshot of a Japanese pitch-accent graph from JPDB.
+A correct image always looks like this: a near-black background, one row of light grey kana, and one continuous stepped line drawn around that row. The line is red where the pitch is high (a horizontal segment above the kana) and blue where it is low (a horizontal segment below the kana); short vertical strokes with a red-to-blue gradient join the high and low segments.
+These shapes are all NORMAL and are never defects:
+- the line forms a box, bracket or frame shape around some or all of the kana (for example low, then high above several kana, then low again);
+- the line is flat for the whole word, or has a single step;
+- the line runs past the first or last kana and reaches the left or right edge of the image;
+- the line is drawn close to the image border;
+- the line passes above and below the kana rather than through them, and makes L, U, box or step shapes.
+The red/blue line with its gradient strokes is never a foreign_element, whatever its shape; only report it if part of it is visibly broken or cut.
+Judge only the visual quality of the image, not whether the pitch pattern is linguistically correct.
+Report a defect only if you can clearly see one of these:
+- cropping: a kana character itself is cut off by an image edge, or the image ends in the middle of the kana row;
+- incomplete_glyph: a kana character is partially missing, overlapped or broken;
+- artifact: blur, smearing, noise, coloured blocks or patches, banding or rendering garbage;
+- foreign_element: anything that is not the kana row or its red/blue line, such as other text, buttons, icons, a cursor or a second graph;
+- illegible_text: the kana cannot be read with confidence;
+- other: a different clearly visible defect.
+When in doubt about the line shape, treat it as normal. Transcribe the visible kana exactly in visible_text; use an empty string if you cannot read them.
+If the image is too small, too dark or otherwise unclear to judge, use the verdict "insufficient" instead of guessing.

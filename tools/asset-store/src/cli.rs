@@ -114,6 +114,11 @@ pub enum Command {
         #[command(subcommand)]
         command: JournalCommand,
     },
+    /// Конфигурация и диагностика локального inference (общая с `pitch-assets`).
+    Inference {
+        #[command(subcommand)]
+        command: crate::inference_cli::InferenceCommand,
+    },
 }
 
 /// Человекочитаемый или машиночитаемый вывод.
@@ -242,8 +247,18 @@ pub struct CliOutput {
 }
 
 /// Выполняет команду и рендерит стабильный stdout.
-pub fn execute(cli: Cli) -> CliOutput {
+pub fn execute(mut cli: Cli) -> CliOutput {
     let operation = cli.command.operation_name().to_owned();
+    match &mut cli.command {
+        Command::Inference { command } => {
+            command.set_repository_root(&cli.repository_root);
+            return render_inference(crate::inference_cli::execute(command), cli.output);
+        }
+        Command::Batch {
+            command: BatchCommand::Ocr { options, .. },
+        } => options.inference.repository_root = cli.repository_root.clone(),
+        _ => {}
+    }
     let store_path = cli
         .store
         .clone()
@@ -509,6 +524,7 @@ impl Command {
             Self::Validate { .. } => "validate",
             Self::Journal { command } => command.operation_name(),
             Self::Batch { command } => command.operation(),
+            Self::Inference { command } => command.operation(),
         }
     }
 }
@@ -656,6 +672,7 @@ fn execute_with_store(
             "команда batch должна выполняться через отдельный адаптер CLI",
         )),
         Command::Journal { command } => execute_journal(store, store_summary, command),
+        Command::Inference { .. } => unreachable!("inference исполняется без хранилища"),
         Command::Validate { mode } => {
             let selection_mode: SelectionMode = mode.into();
             let validator = KanjiImageValidator::new();
@@ -1188,6 +1205,19 @@ fn render_error(
             stderr: format!("{}: {}\n", response.outcome, error.message),
             exit_code: error.exit_code(),
         },
+    }
+}
+
+fn render_inference(
+    output: crate::inference_cli::InferenceOutput,
+    format: OutputFormat,
+) -> CliOutput {
+    let (stdout, stderr) =
+        crate::inference_cli::render(&output, matches!(format, OutputFormat::Json));
+    CliOutput {
+        stdout,
+        stderr,
+        exit_code: output.exit_code,
     }
 }
 

@@ -100,6 +100,8 @@ impl Fixture {
             "ocr",
             "--batch-id",
             "ocr",
+            "--backend",
+            "ollama",
             "--model",
             "fixture:vision",
             "--endpoint",
@@ -229,6 +231,7 @@ impl Mock {
                     let response=match path.as_str() {
                         "/api/tags" => json!({"models":if state.installed {vec![json!({"name":"fixture:vision","digest":state.digest})]} else {vec![]}}).to_string(),
                         "/api/show" => json!({"capabilities":if state.vision {vec!["vision"]}else{vec!["completion"]}}).to_string(),
+                        "/api/version" => json!({"version":"0.0.0-fixture"}).to_string(),
                         "/api/chat" => state.chat.clone(), other=>panic!("неожиданный endpoint {other}"),
                     };
                     (
@@ -315,8 +318,9 @@ fn blind_saved_sha_cache_review_and_explicit_group_confirmation_use_public_cli()
     assert_eq!(request["model"], "fixture:vision");
     assert_eq!(
         request["options"],
-        json!({"temperature":0,"num_predict":128,"num_ctx":4096})
+        json!({"temperature":0.0,"num_predict":128,"num_ctx":4096})
     );
+    assert_eq!(request["keep_alive"], "300s");
     assert_eq!(request["format"]["additionalProperties"], false);
     assert_eq!(request["format"]["required"], json!(["observed"]));
     assert!(!request.to_string().contains('𠀀'));
@@ -467,6 +471,8 @@ fn invalid_unknown_truncated_network_http_and_nonvision_responses_keep_candidate
         "ocr",
         "--batch-id",
         "ocr",
+        "--backend",
+        "ollama",
         "--model",
         "absent",
         "--endpoint",
@@ -541,7 +547,7 @@ fn unavailable_model_digest_does_not_reuse_a_failure_from_another_environment() 
         .values()
         .next()
         .unwrap();
-    assert_eq!(first["config"]["model_digest"], "unavailable");
+    assert_eq!(first["config"]["model"]["weights"], "unavailable");
     assert_eq!(first["failure"], "model_not_installed_or_digest_missing");
     assert_eq!(mock.chats(), 0);
 
@@ -555,7 +561,7 @@ fn unavailable_model_digest_does_not_reuse_a_failure_from_another_environment() 
     let records = second["records"].as_object().unwrap();
     assert_eq!(records.len(), 1);
     let second = records.values().next().unwrap();
-    assert_eq!(second["config"]["model_digest"], "unavailable");
+    assert_eq!(second["config"]["model"]["weights"], "unavailable");
     assert_eq!(second["failure"], "model_does_not_support_vision");
     assert_eq!(mock.chats(), 0);
 }
@@ -593,6 +599,8 @@ fn confirmed_canonical_resources_need_zero_provider_or_browser_requests() {
         "ocr",
         "--batch-id",
         "reuse",
+        "--backend",
+        "ollama",
         "--model",
         "fixture:vision",
         "--endpoint",
@@ -761,6 +769,8 @@ fn interrupted_process_resumes_completed_cache_and_discards_stale_network_result
                 "ocr",
                 "--batch-id",
                 "ocr",
+                "--backend",
+                "ollama",
                 "--model",
                 "fixture:vision",
                 "--endpoint",
@@ -847,6 +857,8 @@ fn stale_provider_failure_is_not_reported_or_saved_after_candidate_changes() {
             "ocr",
             "--batch-id",
             "ocr",
+            "--backend",
+            "ollama",
             "--model",
             "fixture:vision",
             "--endpoint",
@@ -1020,6 +1032,8 @@ fn model_replacement_during_inference_is_saved_as_failure_and_can_resume() {
             "ocr",
             "--batch-id",
             "ocr",
+            "--backend",
+            "ollama",
             "--model",
             "fixture:vision",
             "--endpoint",
@@ -1099,4 +1113,502 @@ fn real_cli_headless_and_json_review_never_launch_the_configured_program() {
             .join("editor-that-must-not-run.launched")
             .exists()
     );
+}
+
+// --- Управляемый llama-server: настоящий процесс-подделка, публичный CLI ---
+
+use crate::fake_llama;
+
+struct Managed {
+    script: std::path::PathBuf,
+    config: std::path::PathBuf,
+    log: std::path::PathBuf,
+    cache: std::path::PathBuf,
+    model: std::path::PathBuf,
+}
+
+impl Managed {
+    fn new(fixture: &Fixture, extra: &str) -> Self {
+        let root = fixture.temp.path().join("llama");
+        fs::create_dir_all(&root).unwrap();
+        let script = fake_llama::write_script(&root);
+        let model = root.join("model.gguf");
+        let projector = root.join("mmproj.gguf");
+        fs::write(&model, b"fake weights v1").unwrap();
+        fs::write(&projector, b"fake projector").unwrap();
+        let config = root.join("inference.toml");
+        fs::write(
+            &config,
+            format!(
+                "[backends.llama]\nbinary = \"{}\"\nstartup_timeout_seconds = 20\nshutdown_timeout_seconds = 5\n\
+                 [models.kanji_vision.llama_server]\nmodel = \"{}\"\nprojector = \"{}\"\n{extra}",
+                script.display(),
+                model.display(),
+                projector.display()
+            ),
+        )
+        .unwrap();
+        Self {
+            script,
+            config,
+            log: root.join("events.jsonl"),
+            cache: root.join("cache"),
+            model,
+        }
+    }
+
+    fn command(&self, fixture: &Fixture, mode: &str, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kanji-assets"));
+        command
+            .arg("--store")
+            .arg(fixture.store.root())
+            .arg("--repository-root")
+            .arg(fixture.temp.path().join("repository"))
+            .args(["--output", "json"])
+            .args(args)
+            .arg("--inference-config")
+            .arg(&self.config)
+            .env("XDG_CACHE_HOME", &self.cache)
+            .env(fake_llama::MODE, mode)
+            .env(fake_llama::LOG, &self.log)
+            .env(fake_llama::CONTENT, json!({"observed": "𠀀"}).to_string());
+        command
+    }
+
+    fn run(&self, fixture: &Fixture, mode: &str, args: &[&str]) -> Output {
+        self.command(fixture, mode, args).output().unwrap()
+    }
+
+    /// `inference orphans` без конфигурации задачи: команда её не принимает.
+    fn orphans(&self, fixture: &Fixture, extra: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_kanji-assets"))
+            .arg("--store")
+            .arg(fixture.store.root())
+            .args(["--output", "json", "inference", "orphans"])
+            .args(extra)
+            .env("XDG_CACHE_HOME", &self.cache)
+            .output()
+            .unwrap()
+    }
+
+    fn ocr(&self, fixture: &Fixture, extra: &[&str]) -> Output {
+        let mut args = vec!["batch", "ocr", "--batch-id", "ocr"];
+        args.extend_from_slice(extra);
+        self.run(fixture, "ok", &args)
+    }
+
+    fn check(&self, fixture: &Fixture, mode: &str) -> Value {
+        let output = self.run(
+            fixture,
+            mode,
+            &["inference", "check", "--task", "kanji-ocr"],
+        );
+        value(&output)
+    }
+
+    fn started_pids(&self) -> Vec<i64> {
+        fake_llama::events(&self.log)
+            .iter()
+            .filter(|event| event["event"] == "start")
+            .map(|event| event["pid"].as_i64().unwrap())
+            .collect()
+    }
+
+    fn chats(&self) -> Vec<Value> {
+        fake_llama::events(&self.log)
+            .into_iter()
+            .filter(|event| event["event"] == "chat")
+            .map(|event| event["body"].clone())
+            .collect()
+    }
+
+    fn leases(&self) -> usize {
+        fs::read_dir(self.cache.join("anki-deck-toolkit/inference/leases"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+}
+
+#[test]
+fn managed_llama_server_is_started_verified_used_and_stopped_by_batch_ocr() {
+    let fixture = Fixture::new();
+    fixture.batch(&['𠀀'], &png());
+    let before = fixture.state();
+    let managed = Managed::new(&fixture, "");
+    let output = managed.ocr(&fixture, &[]);
+    assert_ok(&output);
+    let response = value(&output);
+    let stop = &response["ocr_summary"]["inference"]["stop"];
+    assert_eq!(stop["method"], "terminated");
+    assert_eq!(stop["group_empty"], true);
+    assert_eq!(stop["port_released"], true);
+    assert_eq!(stop["lease_removed"], true);
+    assert_eq!(fixture.state(), before);
+    let pids = managed.started_pids();
+    assert_eq!(pids.len(), 1);
+    assert!(!fake_llama::process_alive(pids[0]));
+    assert_eq!(managed.leases(), 0);
+    let ledger = fixture.ledger();
+    let record = ledger["records"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(record["observed"], "𠀀");
+    assert_eq!(record["config"]["backend"]["kind"], "llama_server");
+    assert_eq!(record["config"]["backend"]["mode"], "managed");
+    assert_eq!(record["config"]["backend"]["version"], "b0-fake");
+    assert_eq!(
+        record["config"]["model"]["weights"],
+        format!("sha256:{}", sha256_hex(b"fake weights v1"))
+    );
+    assert_eq!(
+        record["config"]["model"]["projector"],
+        format!("sha256:{}", sha256_hex(b"fake projector"))
+    );
+    // Слепой запрос: без ожидаемого символа и имени файла, с ключом и alias запуска.
+    let chat = &managed.chats()[0];
+    assert!(chat["model"].as_str().unwrap().starts_with("anki-"));
+    assert!(!chat.to_string().contains('𠀀'));
+    assert!(!chat.to_string().contains("input.png"));
+    let start = &fake_llama::events(&managed.log)[0];
+    let args: Vec<String> = serde_json::from_value(start["args"].clone()).unwrap();
+    for flag in [
+        "--model",
+        "--mmproj",
+        "--alias",
+        "--api-key",
+        "--ctx-size",
+        "--no-webui",
+    ] {
+        assert!(args.iter().any(|arg| arg == flag), "нет {flag}");
+    }
+
+    // Повтор: модель запускается для подтверждения идентичности, но запроса нет.
+    assert_ok(&managed.ocr(&fixture, &[]));
+    assert_eq!(managed.chats().len(), 1);
+    // Любой параметр, влияющий на ответ, даёт новую идентичность и новый запрос.
+    assert_ok(&managed.ocr(
+        &fixture,
+        &["--inference-set", "tasks.kanji_ocr.temperature=0.3"],
+    ));
+    assert_eq!(managed.chats().len(), 2);
+    fs::write(&managed.model, b"fake weights v2").unwrap();
+    assert_ok(&managed.ocr(&fixture, &[]));
+    assert_eq!(managed.chats().len(), 3);
+    let prompt = fixture.temp.path().join("prompt.txt");
+    fs::write(&prompt, "Read the kanji.").unwrap();
+    assert_ok(&managed.ocr(
+        &fixture,
+        &[
+            "--inference-set",
+            &format!("tasks.kanji_ocr.prompt={}", prompt.display()),
+        ],
+    ));
+    assert_eq!(managed.chats().len(), 4);
+    assert!(managed.chats()[3].to_string().contains("Read the kanji."));
+    assert_eq!(fixture.ledger()["records"].as_object().unwrap().len(), 4);
+    assert!(
+        managed
+            .started_pids()
+            .iter()
+            .all(|pid| !fake_llama::process_alive(*pid))
+    );
+    assert_eq!(fixture.state(), before);
+}
+
+/// Ждёт, пока поддельный сервер начнёт слушать порт; иначе останавливает его.
+fn wait_for_port(port: u16, server: &mut std::process::Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        if std::time::Instant::now() > deadline {
+            let _ = server.kill();
+            panic!("поддельный сервер не начал слушать порт {port}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn managed_startup_failures_are_typed_and_leave_no_owned_process() {
+    let fixture = Fixture::new();
+    for (mode, extra, code) in [
+        ("exit_mmproj", "", "projector_load_failed"),
+        ("exit_model", "", "model_load_failed"),
+        ("foreign", "", "foreign_server"),
+        ("no_vision", "", "model_does_not_support_vision"),
+        (
+            "hang",
+            "[backends.llama]\nstartup_timeout_seconds = 2\n",
+            "startup_timeout",
+        ),
+    ] {
+        let managed = Managed::new(&fixture, "");
+        if !extra.is_empty() {
+            let text = fs::read_to_string(&managed.config).unwrap();
+            fs::write(
+                &managed.config,
+                text.replace(
+                    "startup_timeout_seconds = 20",
+                    "startup_timeout_seconds = 2",
+                ),
+            )
+            .unwrap();
+        }
+        let _ = fs::remove_file(&managed.log);
+        let response = managed.check(&fixture, mode);
+        assert_eq!(response["outcome"], "unavailable", "{mode}");
+        assert_eq!(response["failure"]["code"], code, "{mode}: {response}");
+        assert_eq!(response["failure"]["stop"]["proven"], true, "{mode}");
+        for pid in managed.started_pids() {
+            assert!(!fake_llama::process_alive(pid), "{mode}: процесс жив");
+        }
+        assert_eq!(managed.leases(), 0, "{mode}");
+    }
+    // Отсутствующие веса и занятый явный порт отклоняются до запуска процесса.
+    let managed = Managed::new(&fixture, "");
+    let _ = fs::remove_file(&managed.log);
+    fs::remove_file(&managed.model).unwrap();
+    assert_eq!(
+        managed.check(&fixture, "ok")["failure"]["code"],
+        "model_file_missing"
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let managed = Managed::new(&fixture, "");
+    let _ = fs::remove_file(&managed.log);
+    let text = fs::read_to_string(&managed.config).unwrap();
+    fs::write(
+        &managed.config,
+        text.replace(
+            "startup_timeout_seconds = 20",
+            &format!("startup_timeout_seconds = 20\nport = {port}"),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        managed.check(&fixture, "ok")["failure"]["code"],
+        "port_in_use"
+    );
+    assert!(managed.started_pids().is_empty());
+    // Неподключённая модель — типизированный отказ; обычные операции работают.
+    fixture.batch(&['𠀀'], &png());
+    let output = fixture.cli(&["batch", "ocr", "--batch-id", "ocr"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(value(&output)["error"]["code"], "inference_unavailable");
+    assert_ok(&fixture.cli(&["batch", "status", "--batch-id", "ocr"]));
+    assert_ok(&fixture.cli(&["batch", "review-export", "--batch-id", "ocr"]));
+}
+
+#[test]
+fn orphaned_server_from_a_killed_run_is_stopped_by_the_next_owner() {
+    use std::os::unix::process::CommandExt;
+    let fixture = Fixture::new();
+    let managed = Managed::new(&fixture, "");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let alias = "anki-0123456789abcdef0123456789abcdef";
+    let mut orphan = Command::new(&managed.script)
+        .args(["--model", "/orphan.gguf", "--host", "127.0.0.1", "--port"])
+        .arg(port.to_string())
+        .args(["--alias", alias])
+        .env(fake_llama::LOG, &managed.log)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = orphan.id() as i32;
+    wait_for_port(port, &mut orphan);
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let ticks: u64 = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let leases = managed.cache.join("anki-deck-toolkit/inference/leases");
+    fs::create_dir_all(&leases).unwrap();
+    fs::write(
+        leases.join(format!("{alias}.json")),
+        json!({"pid": pid, "start_ticks": ticks, "alias": alias, "port": port,
+               "windows_interop": false, "created_unix_seconds": 0})
+        .to_string(),
+    )
+    .unwrap();
+    // Осмотр не трогает процесс и аренду, но называет их.
+    let inspected = managed.orphans(&fixture, &[]);
+    assert_eq!(inspected.status.code(), Some(3));
+    let inspected = value(&inspected);
+    assert_eq!(inspected["outcome"], "orphans_remaining");
+    assert_eq!(inspected["orphans"][0]["state"], "process_alive");
+    assert_eq!(inspected["orphans"][0]["pid"], pid);
+    assert!(
+        inspected["orphans"][0]["lease"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("{alias}.json"))
+    );
+    assert!(orphan.try_wait().unwrap().is_none());
+    assert_eq!(managed.leases(), 1);
+    let response = managed.check(&fixture, "ok");
+    assert_eq!(response["outcome"], "ready", "{response}");
+    let stopped = &response["session"]["server"]["orphans_stopped"][0];
+    assert_eq!(stopped["pid"], pid);
+    assert_eq!(stopped["stopped"], true);
+    assert_eq!(stopped["state"], "stopped");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while orphan.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = orphan.kill();
+            panic!("осиротевший сервер не остановлен");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(managed.leases(), 0);
+    let clean = managed.orphans(&fixture, &["--stop"]);
+    assert_eq!(clean.status.code(), Some(0));
+    assert_eq!(value(&clean)["outcome"], "clean");
+}
+
+#[test]
+fn server_without_a_durable_lease_is_stopped_instead_of_used() {
+    let fixture = Fixture::new();
+    let managed = Managed::new(&fixture, "");
+    let state = managed.cache.join("anki-deck-toolkit/inference");
+    fs::create_dir_all(&state).unwrap();
+    // Аренду некуда записать: на месте каталога аренд лежит файл.
+    fs::write(state.join("leases"), b"not a directory").unwrap();
+    let response = managed.check(&fixture, "ok");
+    assert_eq!(response["outcome"], "unavailable", "{response}");
+    assert_eq!(response["failure"]["code"], "lease_write_failed");
+    assert_eq!(response["failure"]["stop"]["proven"], true);
+    assert_eq!(response["stop_unproven"], false);
+    let pids = managed.started_pids();
+    for pid in &pids {
+        assert!(!fake_llama::process_alive(*pid), "процесс без аренды жив");
+    }
+    assert!(
+        managed.chats().is_empty(),
+        "сервер без аренды не используется"
+    );
+}
+
+#[test]
+fn ctrl_c_during_inference_stops_the_owned_server_and_saves_nothing_partial() {
+    let fixture = Fixture::new();
+    fixture.batch(&['𠀀'], &png());
+    let before = fixture.state();
+    let managed = Managed::new(&fixture, "");
+    let mut child = managed
+        .command(&fixture, "slow", &["batch", "ocr", "--batch-id", "ocr"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while managed.chats().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "запрос к модели не начался"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(child.id() as i32).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let status = child.wait().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(status.code(), Some(130));
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let response: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(response["error"]["code"], "interrupted");
+    // Сведения об остановке и её доказанность сохранены и при Ctrl+C.
+    let details = &response["error"]["details"];
+    assert_eq!(details["stop_unproven"], false);
+    assert_eq!(details["inference"]["stop"]["group_empty"], true);
+    assert_eq!(details["saved"], 0);
+    for pid in managed.started_pids() {
+        assert!(!fake_llama::process_alive(pid));
+    }
+    assert_eq!(managed.leases(), 0);
+    assert_eq!(fixture.state(), before);
+    assert!(
+        !fixture
+            .store
+            .root()
+            .join(".runtime/batches/ocr/ocr/suggestions.json")
+            .exists()
+    );
+}
+
+#[test]
+fn external_llama_server_is_used_but_never_stopped() {
+    let fixture = Fixture::new();
+    fixture.batch(&['𠀀'], &png());
+    let managed = Managed::new(&fixture, "");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut external = Command::new(&managed.script)
+        .args([
+            "--model",
+            "/srv/external.gguf",
+            "--host",
+            "127.0.0.1",
+            "--port",
+        ])
+        .arg(port.to_string())
+        .args(["--alias", "shared-model"])
+        .env(fake_llama::LOG, &managed.log)
+        .env(fake_llama::CONTENT, json!({"observed": "保"}).to_string())
+        .spawn()
+        .unwrap();
+    wait_for_port(port, &mut external);
+    fs::write(
+        &managed.config,
+        format!("[backends.llama]\nmode = \"external\"\nendpoint = \"http://127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    let output = managed.ocr(&fixture, &[]);
+    assert_ok(&output);
+    let record = fixture.ledger()["records"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(record["config"]["backend"]["mode"], "external");
+    assert_eq!(
+        record["config"]["model"]["weights"],
+        "reported-path:/srv/external.gguf"
+    );
+    assert!(
+        value(&output)["ocr_summary"]["inference"]
+            .get("stop")
+            .is_none()
+    );
+    // Путь, лишь сообщённый внешним сервером, не доказывает неизменность
+    // весов: повтор не становится попаданием кэша и спрашивает модель снова.
+    assert_eq!(value(&output)["ocr_summary"]["cache_reuse_blocked"], true);
+    let chats = managed.chats().len();
+    let again = managed.ocr(&fixture, &[]);
+    assert_ok(&again);
+    assert_eq!(value(&again)["ocr_summary"]["cache_hits"], 0);
+    assert_eq!(managed.chats().len(), chats + 1);
+    assert!(fake_llama::process_alive(external.id() as i64));
+    external.kill().unwrap();
+    external.wait().unwrap();
 }

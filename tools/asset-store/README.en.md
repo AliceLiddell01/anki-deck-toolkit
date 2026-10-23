@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 3866874ededc90b48eb107a2da20c09b822f72d3 -->
+<!-- i18n-source-git-blob: 90d89556401bcdabd815f995ef5a55696860d633 -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -350,7 +350,7 @@ Only the first column is edited: on a candidate row, `y` means reviewed — the 
 
 Trust does not change: the domain stays `AUTOMATED_VERIFIED_ONLY`. `y` neither publishes nor modifies the owner record, so no human decision makes `UNCERTAIN`, `REJECTED`, `CORRUPT`, missing, or earlier v5 evidence usable. A dictionary-entry choice uses the same transition as `batch select`; the next `batch run` re-confirms it with a JPDB search. `r` uses the same transition as `batch reject`; if the rejected SHA matches the published owner record, it is quarantined via `AssetStore::attest` with a `trust_revoked` journal event, and a repeat writes no second event. The application summary is returned in `review_decisions`.
 
-Optional external checks (for example, a future language model) may only attach a hint to a row, bound to its identity and exact SHA, just as OCR does for `kanji-assets` today. A hint never becomes a decision: only the explicit first column decides, and it cannot bypass the domain's trust rules.
+Optional external checks — for example, a visual check by a local model (`batch llm-review`, see "Local inference") — may only attach a hint to a row, bound to its identity and exact SHA, just as OCR does for `kanji-assets`. A hint never becomes a decision: only the explicit first column decides, and it cannot bypass the domain's trust rules.
 
 ### Migrating from validator v5
 
@@ -662,24 +662,100 @@ No Windows, WSL or `notepad.exe` dependency is mandatory. If nothing can open fi
 
 Old `kanji-distinct-mean-v2` batches remain readable under their prior rules. Explicit `batch revalidate --batch-id ID` decodes/revalidates saved bytes with the current validator and atomically migrates to `kanji-single-candidate-v1`, without network or fake attempts. Old human approvals stay in `human_decisions`, tied to exact SHA. If identical bytes pass current technical validation and are not `Corrupt`, approval still determines `HumanVerified`; otherwise it is preserved only as history, effective state is recalculated, and publication flags are cleared. `ExistingVerified` remains subject to owner trust and is reconciled with the current canonical store. Old automatic verdicts do not transfer between validator versions. After state/version changes, export a new decision snapshot.
 
-### Optional blind Ollama OCR suggestions
+### Local inference: llama.cpp and Ollama
 
-`batch ocr` processes an **already saved** batch sequentially. Ordinary `start`, `run`, `status`, `review`, verified reads and all pitch-accent operations do not contact Ollama. The owner first checks canonical-store integrity and current trust, reusing verified assets. OCR is permitted **only** for current, technically valid `awaiting_human` candidates with validator-v6 `Uncertain`. `Verified`, `Rejected`, `Corrupt` and resolved entries do not even trigger Ollama discovery. No Yarxi refetch occurs.
+Two optional tasks use a local vision model: blind OCR of saved uncertain kanji candidates (`kanji_ocr`) and a visual check of saved JPDB PNGs (`jpdb_pitch_review`). Ordinary `start`, `run`, `status`, `review`, verified reads and publication never call a model. A model result is only a **suggestion** for a human: it never grants `AutoVerified` or `HumanVerified` and never changes a candidate, decision, trust or the v6 validator.
+
+#### Configuration
+
+Settings are assembled from layers; each later layer replaces keys of the earlier ones:
+
+1. `tools/asset-store/config/inference.toml` — versioned defaults, embedded in the binary and documenting every key with comments;
+2. `tools/asset-store/config/inference.local.toml` — a personal partial override for the checkout (ignored by Git; template: `inference.local.example.toml`);
+3. `--inference-config FILE` — an explicit file in the same format;
+4. `--inference-set KEY=VALUE` and the shortcuts `--backend`, `--model`, `--endpoint`, `--allow-remote`, `--timeout-seconds` for the selected task's profile.
+
+The schema is strict (`schema_version = 1`): an unknown key, wrong type, out-of-range value or reference to a missing profile yields `inference_config_invalid` (exit code `3`) before any model starts, and any other `schema_version` yields `unsupported_schema_version` (exit code `4`). Configuration has three levels:
+
+- `[backends.<name>]` — how inference runs: `kind = "llama_server"` (managed `mode = "managed"` or external `mode = "external"`) or `kind = "ollama"`;
+- `[models.<profile>]` — the selected `backend`, plus `llama_server` and `ollama` subtables with weights, projector, context, CPU threads, batch/ubatch, parallel slots, GPU layer placement, `flash_attention`, `reasoning`, `keep_alive_seconds`;
+- `[tasks.kanji_ocr]`, `[tasks.jpdb_pitch_review]` — model profile, prompt file, `temperature`, `max_output_tokens`, `structured_output`, `timeout_seconds`, `seed`.
+
+The prompt is a separate text file and can change without rebuilding. The JSON answer format, its validation and trust rules belong to code and are not part of the prompt. A relative path resolves against the directory of the file that set it; for the CLI layer, against the current directory. A `~/` prefix expands to the home directory, and Windows paths `C:\…` and `C:/…` become `/mnt/c/…` (the standard WSL drive mount). An empty string means "not configured". There is no other substitution, including environment variables or shell. By default no models are set: a task returns the typed `inference_unavailable` refusal with reason `backend_not_configured`, `model_not_configured` or `projector_not_configured`, while all other commands keep working. The tool never downloads models or contacts cloud services.
+
+Windows llama.cpp launched from WSL: the `llama-server.exe` process uses Windows CPU, GPU and memory and listens on loopback, just like Ollama for Windows. This works only with WSL mirrored networking (`networkingMode=mirrored`): in NAT mode the Windows loopback is unreachable from WSL and startup ends with `startup_timeout`; `host = "::1"` together with `windows_interop` is rejected during configuration validation (WSL does not forward the IPv6 loopback). Set `windows_interop = true`; `/mnt/<drive>/…` model and projector paths are passed to the server as `<DRIVE>:\…`, and a path outside a mounted Windows drive is rejected as `path_not_visible_to_windows`.
+
+```toml
+# tools/asset-store/config/inference.local.toml
+[backends.llama]
+binary = "/mnt/c/Tools/llama.cpp/llama-server.exe"
+windows_interop = true
+
+[models.kanji_vision.llama_server]
+model = "/mnt/c/Models/model.gguf"
+projector = "/mnt/c/Models/mmproj.gguf"
+
+[models.kanji_vision.ollama]
+model = "qwen3.5:9b-q4_K_M"
+```
+
+#### Diagnostics and probe requests
+
+```bash
+# Effective settings, the source of every key and task readiness; no model is started:
+cargo run --quiet --locked --bin kanji-assets -- inference show
+# Start and verify the task backend, then stop the owned server:
+cargo run --quiet --locked --bin kanji-assets -- --output json inference check --task kanji-ocr
+# One request on local images outside a batch; the store is not changed:
+cargo run --quiet --locked --bin kanji-assets -- --output json inference probe \
+  --task kanji-ocr --image /path/to/kanji.gif
+cargo run --quiet --locked --bin pitch-assets -- --output json inference probe \
+  --task jpdb-pitch-review --image /path/to/graph.png \
+  --inference-set tasks.jpdb_pitch_review.max_output_tokens=512
+# Leases of managed servers from earlier runs; --stop repeats stopping the owned processes:
+cargo run --quiet --locked --bin kanji-assets -- --output json inference orphans
+cargo run --quiet --locked --bin kanji-assets -- --output json inference orphans --stop
+```
+
+`inference show` never prints prompt contents or access keys. `check` returns `ready` with backend and model identity, readiness time, process PID and the stop proof; with `windows_interop`, also the Windows process PID and memory (memory is not reported for a native `llama-server`). `probe` refuses files under the checkout's `decks/`, limits an image to 8 MiB and prints up to 2000 characters of the raw answer. All inputs are checked before the model starts: if none is usable, the result is `no_valid_images` with each input's refusal and the model is not started; in a mixed set the usable inputs run and the others keep their refusals (`completed_with_failures`). Exit codes: `0` success, `3` model unavailable, inference refusal or unproven server stop, `130` interrupted by a signal. In human-readable mode the summary of any outcome with a nonzero code goes to `stderr` and a successful one to `stdout`; `--output json` always writes JSON to `stdout`. The `check` and `probe` JSON contains `stop_unproven` and `blockers`, and `check` also `cache_reusable` (see below).
+
+The common inference interface runs both text tasks and image tasks: the task's answer contract states whether an image is sent. Vision is confirmed in advance only for image tasks; a text request sends no image and needs no vision. The built-in tasks `kanji_ocr` and `jpdb_pitch_review` are image tasks; there is no built-in text task or CLI for one yet.
+
+#### Managed `llama-server`
+
+With `mode = "managed"` one operation starts its own process, proves its readiness and identity, runs requests and stops it. The server is launched without a shell, with explicit arguments, a random `--alias` and an `--api-key`; the parent's `LLAMA_ARG_*` variables are not inherited. Readiness means a successful `/health` and matching `/props`: alias, weights path and vision support. A foreign process on the chosen port yields `foreign_server`, a model without vision `model_does_not_support_vision`, other weights `model_mismatch`. Port `0` means a random free port in `10000`–`65535` excluding the actual Linux ephemeral range (`/proc/sys/net/ipv4/ip_local_port_range`) and, with `windows_interop`, also the Windows dynamic range `49152`–`65535`. If nothing remains for a native server, the kernel assigns the port; for a Windows process this is `port_unavailable` listing the ranges — set `port` explicitly. A busy explicit port yields `port_in_use`. Startup failures are distinguished by server output: `projector_load_failed`, `model_load_failed`, `invalid_server_arguments`, `server_exited_during_startup`, `startup_timeout`, `model_file_missing`.
+
+`gpu_layers = "auto"` chooses layer placement from the free video memory at launch time. If another process holds it — for example, Ollama keeping a model for its `keep_alive` — most layers go to the CPU and answers become several times slower until the next launch. With `windows_interop`, `inference check` shows the Windows process working set, and the answer `timings` show generation speed.
+
+One heavy model is loaded at a time (`max_loaded_models = 1`): a second launch gets `managed_server_busy` instead of loading in parallel, and switching profiles stops the previous process before the next one starts. Stopping sends SIGTERM to the group, then SIGKILL after `shutdown_timeout_seconds`; afterwards an empty group, a released port and, for Windows, the disappearance of the Windows process are checked. The Windows process is found by its own alias in the command line, not by the executable name: the binary may be named differently from `llama-server.exe`. If it has not disappeared after SIGTERM, it is terminated by PID only while its command line still contains that alias.
+
+The lease file `leases/<alias>.json` in `$XDG_CACHE_HOME/anki-deck-toolkit/inference/` (otherwise `~/.cache/…`) is written right after the process starts and synced to disk. If it cannot be written, the process is stopped and the launch is refused with `lease_write_failed`: a server the next run could not find after a crash is not used. Only a proven stop removes the lease. The lease of a process left over after a crash is checked by PID, start time and the alias in its command line; the next run stops such a process and never touches foreign ones. With `windows_interop`, the lease is removed only once the Windows process is proven gone. Until then every managed launch, including a native profile, is refused: the previous model may still hold memory and video memory, and only one heavy model is allowed at a time. The code distinguishes the states: `orphan_server_alive` — the process is still alive (the message and `failure.orphans` name the Windows PID when known), `orphan_server_unverified` — the Windows process could not be checked (`powershell_unavailable`, `windows_probe_timeout`, `windows_probe_exit:*`). In both cases the message names the lease path.
+
+Recovery: `inference orphans` shows every lease, its state (`process_alive`, `windows_process_alive`, `windows_probe_failed`, `stale`, `invalid`; after `--stop` also `stopped`), PID and file path without changing anything; `inference orphans --stop` repeats stopping the owned processes and removes only provably released leases (code `0` if nothing alive remains, otherwise `3`). An unreadable lease (`invalid`) is not deleted even with `--stop` and rejects the start as `orphan_server_alive`: whether the process is alive is unknown, so inspect the file and the `llama-server` processes by hand. If the Windows check is unavailable, restore WSL interop (`powershell.exe` must start from WSL) and repeat the command. Do not delete a lease by hand: without it nobody will find the leftover Windows process again.
+
+Ctrl+C interrupts the current request, stops the server and returns `interrupted` with code `130`; records already saved remain. Code `130` takes precedence, but an unproven stop is not lost: `error.details` (for `check`/`probe`, the response itself) keeps `inference` with the `stop` details, `stop_unproven` and the `inference_server_stop_unproven` blocker. Without an interruption an unproven stop yields code `3` and the same blocker.
+
+`mode = "external"` connects to an already running server at `endpoint`; the user starts and stops it. If the profile sets `model`, the weights path from `/props` must match, and SHA-256 is computed over the local file (`sha256:<hex>`). For a multi-gigabyte GGUF this takes noticeable time on the first run; afterwards the hash comes from the cache keyed by path, size and modification time. Without `model` only the path reported by the server is known: `reported-path:<path>`. The external server's API does not report a separate projector: with `vision = "projector"` it is recorded as `unverified:external`, and only `vision = "integrated"` in the profile declares that there is none.
+
+A saved OCR or JPDB-check result is reused without a request only if the model identity is verifiable: weights are `sha256:` or an Ollama digest, and the projector is absent or `sha256:`. For an external server this means `model` in the profile and `vision = "integrated"`; otherwise every run asks the model again, the report contains `cache_reuse_blocked: true`, and `inference check` reports `cache_reusable: false`. Comparing `/props` before and after a request proves the model unchanged only within one run, not between runs. Earlier records stay in the ledger with their provenance.
+
+The address is HTTP without credentials, path, query or fragment. **Anything other than literal loopback IPv4/IPv6** requires `allow_remote = true` or `--allow-remote`, an explicit consent to send images to that server. Proxies and redirects are disabled; a response is limited to 1 MiB and model text to 64 KiB. With WSL mirrored networking, Ollama on Windows is reachable as `http://127.0.0.1:11434`.
+
+#### Kanji OCR
+
+`batch ocr` processes an **already saved** batch sequentially. The owner first checks canonical-store integrity and current trust, reusing verified assets. OCR is permitted **only** for current, technically valid `awaiting_human` candidates with validator-v6 `Uncertain`. `Verified`, `Rejected`, `Corrupt` and resolved entries never start a model. No Yarxi refetch occurs.
 
 ```bash
 # The ordinary path, without OCR:
 cargo run --quiet --locked --bin kanji-assets -- batch start --batch-id my-kanji 漢 字
 cargo run --quiet --locked --bin kanji-assets -- batch run --batch-id my-kanji
 
-# Explicitly enable OCR for saved uncertain candidates:
-cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
-  --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' \
-  --endpoint 'http://127.0.0.1:11434' --timeout-seconds 120
+# OCR of saved uncertain candidates with the configured backend (llama.cpp by default):
+cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr --batch-id my-kanji
 
-# For a Windows host from WSL, set a reachable address instead of the example:
+# The same OCR through a local Ollama:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
-  --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' \
-  --endpoint 'http://192.168.1.2:11434' --allow-remote
+  --batch-id my-kanji --backend ollama --model 'qwen3.5:9b-q4_K_M' --timeout-seconds 120
 
 # Get the TSV and the index.html beside it; decisions start empty, '-' means an explicit skip:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch review-export --batch-id my-kanji
@@ -695,20 +771,31 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch review-appl
   --batch-id my-kanji --review-id NEW_REVIEW_SHA256
 # An explicit OCR re-run, including saved refusals:
 cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
-  --batch-id my-kanji --model 'qwen3.5:9b-q4_K_M' --rescan
+  --batch-id my-kanji --rescan
 ```
 
 After applying a matching group, create a new `review-export` for the remaining rows: their state has changed, and the previous snapshot still contains the rows already applied. `review-confirm-matches` uses the same full TSV, SHA, generation, copied-image verification and atomic `human_decisions` checks as `review-apply`. Only empty rows in the matching group receive new approvals; `-` explicitly skips a row. Already populated TSV decisions are applied too. `--confirm-reviewed` means the human actually examined images, acknowledging possible OCR misidentification. Neither generating nor opening a report approves anything. Row order is matches, mismatches, unknown/refused and no OCR. Additional TSV columns (`observed`, match flag, refusal, suggestion key) are protected metadata and cannot be edited. Old snapshots lacking these columns remain readable.
 
-The base URL must be HTTP, without credentials, path, query or fragment. **Anything other than literal loopback IPv4/IPv6** requires `--allow-remote`, including DNS names and private WSL hosts; this explicitly permits sending images to the selected server. Proxies and HTTP redirects are disabled. Users install Ollama/models and run their own server; the tool does neither. `/api/tags` pins the installed model digest; `/api/show` requires `vision` capability and rejects declared `remote_host` cloud models. Model/endpoint are configurable; `127.0.0.1` inside WSL does not automatically address the Windows host.
+The default prompt is `config/prompts/kanji_ocr.txt`; together with the answer-format instruction it reproduces the `structure-v1` instruction of the Structure study verbatim, and its SHA-256 is pinned by a test. The model receives only the prompt and a PNG: expected Unicode, paths, source filenames and article context are **not** sent. The answer is JSON with a sole string `observed`; exactly one supported Han/CJK character or `?` is accepted, without Unicode variant normalization. Extra fields, explanatory text, multi-character values, incomplete responses and a token-limit cut-off are recorded as refused suggestions.
 
-The `structure-v1` instruction is copied verbatim from the Structure study and its SHA-256 pinned by a test. `/api/chat` receives only universal instructions and base64 PNG: expected Unicode, paths, source filenames and article context are **not** sent. Generation uses `stream=false`, `think=false`, `temperature=0`, `num_predict=128`, `num_ctx=4096` and a JSON schema containing a sole string `observed`. Exactly one supported Han/CJK character or `?` is accepted, without Unicode variant normalization. Extra fields, explanatory text, multi-character values, incomplete responses or `done_reason=length` are recorded as refused suggestions.
+Preparation uses exact saved source bytes/SHA. A bounded v6 decoder chooses the full representative GIF frame, and a second bounded decode materializes that composited frame; PNG is fully decoded. Alpha is composited onto white; Rust `image` resizes 2× with Lanczos3 and encodes one PNG. This is independent Rust Lanczos3, **not** promised pixel-identical to historical PowerShell/System.Drawing. Source: at most 8 MiB, 2048-pixel sides, 512 GIF frames, 32 MiB decode; output at most 4096×4096 and 8 MiB.
 
-Preparation uses exact saved source bytes/SHA. A bounded v6 decoder chooses the full representative GIF frame, and a second bounded decode materializes that composited frame; PNG is fully decoded. Alpha is composited onto white; Rust `image` resizes 2× with Lanczos3 and encodes one PNG. This is independent Rust Lanczos3, **not** promised pixel-identical to historical PowerShell/System.Drawing. Source: at most 8 MiB, 2048-pixel sides, 512 GIF frames, 32 MiB decode; output at most 4096×4096 and 8 MiB. Network response max 1 MiB; request/response timeout `--timeout-seconds` is 1–600 (default 120). Only one model request at a time. Cancellation preserves prior atomic checkpoints; interrupted requests are retryable.
+Suggestions live **only** at `.runtime/batches/<id>/ocr/suggestions.json`. The cache key and provenance include identity, source SHA, task, answer contract, transformation version, the composed prompt SHA and its source, backend with its mode and version, model profile and name, weights file SHA-256 (the digest for Ollama), projector SHA-256, load and generation parameters. Changing any of them yields a new key: an old record is never presented as the result of another model or prompt. SHA-256 of large GGUF files is cached in the state directory by path, size and modification time. Checking the cache needs a prepared backend: the managed server is started, and a cache hit then makes **zero** model requests. Model identity is re-read before and after each request: a model change during a scan is stored as the `model_changed_during_scan` refusal. A backend preparation failure is stored for each candidate with weights `unavailable`; a later successful start has another key. A cache hit requires a verifiable model identity (see `mode = "external"`). Retrying a refusal with the same settings requires `--rescan`. The runtime lock is released while the model works; on return current SHA, generation and candidate are checked and stale results discarded.
 
-Suggestions live **only** at `.runtime/batches/<id>/ocr/suggestions.json`, with identity, original/prepared SHA, format/frame/dimensions, provider URL/model/digest, instruction version/SHA, transformation version, generation parameters, timeout, timestamp and refusal type. Cache binds to exact bytes/settings. A repeated explicit OCR performs model discovery again, then on cache hit makes **zero** `/api/chat` calls. Digest is checked before and after inference; changes are stored as `model_changed_during_scan` refusal without `observed`. Different SHA/model/digest/prompt/transform cannot reuse old results. Saved suggestions/HTML remain accessible offline. Failed discovery caches digest `unavailable`; successful later discovery has another key. Retrying a failed `/api/chat` with same settings requires `--rescan`. The runtime lock is released during network I/O; on return current SHA, generation and candidate are checked and stale results discarded.
+Records of the former Ollama-only path (`provider`, `endpoint`, `digest`, …) remain readable and are shown in `review-export` marked as the former Ollama-only path. Their keys differ from the new schema's keys, so they never become a cache hit for a new run.
 
-Command JSON includes `ocr_summary` (`saved`, `cache_hits`, `chat_requests`). A stored provider refusal returns code `3` and per-identity `issues` without modifying candidate or its automatic verdict. Store-boundary errors use normal `AssetError` codes. OCR **never** grants `AutoVerified` or `HumanVerified`, renames wrong Unicode, or serves as a trust validator. Updating an optional model does not re-evaluate confirmed canonical resources.
+Command JSON includes `ocr_summary` (`saved`, `cache_hits`, `chat_requests`) and an `inference` report with server identity, readiness time and stop proof. A stored model refusal returns code `3` and per-identity `issues` without modifying the candidate or its automatic verdict. Store-boundary errors use normal `AssetError` codes. Updating an optional model does not re-evaluate confirmed canonical resources.
+
+#### Visual check of JPDB PNGs
+
+```bash
+cargo run --quiet --locked --bin pitch-assets -- --output json batch llm-review --batch-id my-pitch
+cargo run --quiet --locked --bin pitch-assets -- --output json batch review-export --batch-id my-pitch
+```
+
+`batch llm-review` checks the saved PNGs of the current candidate rows of the review snapshot (`batch review-export`) without fetching from JPDB again. The model sees only the PNG, upscaled with Lanczos3 to about 448 px on the long side: the expected reading and surface are not sent. The answer is a `verdict` (`no_defect_observed`, `defect_observed`, `insufficient`), up to six observations with categories `cropping`, `incomplete_glyph`, `artifact`, `foreign_element`, `illegible_text`, `other`, and the read text `visible_text`. The model writes observations briefly in Russian (contract `jpdb-pitch-visual-v2`; records of the previous contract with English observations are read as they are). Code compares the read text with the expected reading after canonical Unicode composition (NFC: `か` + U+3099 equals `が`), folding katakana to hiragana and removing whitespace; compatibility normalization NFKC is not applied. Model strings are stored as received. An inconsistent or incomplete answer is stored as a refusal.
+
+Suggestions live in the batch's `llm-review/suggestions.json` and are bound to identity, SHA, generation, item revision, request fingerprint, attempt and full model and prompt provenance. In `review-export` a row gets two protected columns — `llm:<verdict>` (or `llm_failure:<code>`) and the suggestion key — and an "LLM (suggestion, not a decision)" summary in HTML. The decision is still only the explicit first column; the `AUTOMATED_VERIFIED_ONLY` rule, `VERIFIED` and publication do not change. If a row changes during a request, the result is discarded (`stale_discarded`). Code `3` means model refusals or an unproven stop.
 
 ## Verification
 

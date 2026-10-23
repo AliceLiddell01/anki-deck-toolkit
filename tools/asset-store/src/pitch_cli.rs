@@ -110,6 +110,11 @@ pub enum PitchCommand {
         #[command(subcommand)]
         command: JournalCommand,
     },
+    /// Конфигурация и диагностика локального inference (общая с `kanji-assets`).
+    Inference {
+        #[command(subcommand)]
+        command: crate::inference_cli::InferenceCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -202,6 +207,14 @@ pub enum PitchBatchCommand {
         surface: String,
         #[arg(long, required = true)]
         reason: String,
+    },
+    /// Необязательная визуальная проверка сохранённых PNG локальной моделью.
+    /// Результат — предложения в review; доверие и решения не меняются.
+    LlmReview {
+        #[arg(long, required = true)]
+        batch_id: String,
+        #[command(flatten)]
+        options: crate::pitch_llm_review::LlmReviewOptions,
     },
     /// Отмечает точно указанные визуально отклонённые байты; новые SHA не наследуют отказ.
     Reject {
@@ -371,6 +384,9 @@ struct Response {
     /// Машиночитаемая часть ответа команд `journal`.
     #[serde(skip_serializing_if = "Option::is_none")]
     journal: Option<JournalReport>,
+    /// Сводка `batch llm-review`: предложения модели, не решения.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    llm_review: Option<crate::pitch_llm_review::LlmReviewReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -383,8 +399,25 @@ struct ErrorSummary {
 const CLI_SCHEMA_VERSION: u32 = 1;
 
 /// Выполняет команду; в JSON-режиме машиночитаемый ответ идёт в `stdout`.
-pub async fn execute(cli: PitchCli) -> PitchCliOutput {
+pub async fn execute(mut cli: PitchCli) -> PitchCliOutput {
     let operation = operation_name(&cli.command).to_owned();
+    match &mut cli.command {
+        PitchCommand::Inference { command } => {
+            command.set_repository_root(&cli.repository_root);
+            let output = crate::inference_cli::execute(command);
+            let (stdout, stderr) =
+                crate::inference_cli::render(&output, matches!(cli.output, OutputFormat::Json));
+            return PitchCliOutput {
+                stdout,
+                stderr,
+                exit_code: output.exit_code,
+            };
+        }
+        PitchCommand::Batch {
+            command: PitchBatchCommand::LlmReview { options, .. },
+        } => options.inference.repository_root = cli.repository_root.clone(),
+        _ => {}
+    }
     let store_path = store_path(cli.store.as_deref(), &cli.repository_root);
     let prevalidated = prevalidate_command(&cli.command);
     let (plan, direct_items) = match prevalidated {
@@ -446,6 +479,7 @@ pub async fn execute(cli: PitchCli) -> PitchCliOutput {
         PitchCommand::Batch { command } => {
             execute_batch(&store, summary, command, plan, cli.output, store_changed).await
         }
+        PitchCommand::Inference { .. } => unreachable!("inference исполняется без хранилища"),
     }
 }
 
@@ -453,7 +487,9 @@ fn prevalidate_command(
     command: &PitchCommand,
 ) -> Result<(Option<PitchPlan>, Option<Vec<PitchPlanItem>>), AssetError> {
     match command {
-        PitchCommand::Corpus { .. } | PitchCommand::Journal { .. } => Ok((None, None)),
+        PitchCommand::Corpus { .. }
+        | PitchCommand::Journal { .. }
+        | PitchCommand::Inference { .. } => Ok((None, None)),
         PitchCommand::Ensure {
             plan,
             surface,
@@ -556,6 +592,11 @@ fn prevalidate_command(
             PitchBatchCommand::RetryTechnical { batch_id, reason } => {
                 crate::batch_runtime::validate_batch_id(batch_id)?;
                 validate_reason(reason)?;
+                Ok((None, None))
+            }
+            PitchBatchCommand::LlmReview { batch_id, options } => {
+                crate::batch_runtime::validate_batch_id(batch_id)?;
+                options.inference.validate_syntax()?;
                 Ok((None, None))
             }
             PitchBatchCommand::Run { batch_id, workers }
@@ -679,6 +720,7 @@ fn operation_name(command: &PitchCommand) -> &'static str {
         },
         PitchCommand::Ensure { .. } => "ensure",
         PitchCommand::Journal { command } => command.operation_name(),
+        PitchCommand::Inference { command } => command.operation(),
         PitchCommand::Batch { command } => match command {
             PitchBatchCommand::Start { .. } => "batch_start",
             PitchBatchCommand::Run { .. } => "batch_run",
@@ -692,6 +734,7 @@ fn operation_name(command: &PitchCommand) -> &'static str {
             PitchBatchCommand::RetryTechnical { .. } => "batch_retry_technical",
             PitchBatchCommand::Reacquire { .. } => "batch_reacquire",
             PitchBatchCommand::Reject { .. } => "batch_reject",
+            PitchBatchCommand::LlmReview { .. } => "batch_llm_review",
         },
     }
 }
@@ -902,6 +945,7 @@ fn check_corpus(
                 review_decisions: None,
                 error: None,
                 journal: None,
+                llm_review: None,
             },
             output,
             0,
@@ -946,6 +990,7 @@ fn list_corpus(
                 review_decisions: None,
                 error: None,
                 journal: None,
+                llm_review: None,
             },
             output,
             0,
@@ -1033,6 +1078,30 @@ fn render_response(response: Response, output: OutputFormat, exit_code: u8) -> P
                     applied.already_applied,
                     applied.owner_rejections
                 ));
+            }
+            if let Some(report) = &response.llm_review {
+                stdout.push_str(&format!(
+                    "LLM-проверка: целей {}, сохранено {}, из кэша {}, запросов {}, устарело {}\n",
+                    report.targets,
+                    report.saved,
+                    report.cache_hits,
+                    report.requests,
+                    report.stale_discarded
+                ));
+                for failure in &report.failures {
+                    stdout.push_str(&format!(
+                        "  Отказ LLM для {}: {}\n",
+                        failure.surface, failure.code
+                    ));
+                }
+                if report.stop_unproven {
+                    stdout.push_str("  Остановка сервера inference не доказана\n");
+                }
+                if report.cache_reuse_blocked {
+                    stdout.push_str(
+                        "  Сохранённые результаты не переиспользуются: идентичность модели не проверяема\n",
+                    );
+                }
             }
             if let Some(journal) = &response.journal {
                 stdout.push_str(&report_text(journal));
@@ -1132,6 +1201,7 @@ fn human_operation_name(operation: &str) -> &str {
         "batch_retry_technical" => "пакетный повтор технических сбоев",
         "batch_reacquire" => "повторное получение",
         "batch_reject" => "отклонение кандидата",
+        "batch_llm_review" => "LLM-проверка сохранённых кандидатов",
         "journal_list" => "список журнала",
         "journal_check" => "проверка журнала",
         "journal_reconcile" => "сверка журнала",
@@ -1150,6 +1220,7 @@ fn human_outcome_name(outcome: &str) -> &str {
         "pending" => "ожидает обработки",
         "review_ready" => "материалы проверки готовы",
         "review_applied" => "решения проверки применены",
+        "llm_suggestions_saved" => "предложения LLM сохранены",
         "updated" => "обновлён",
         "checked" => "проверен",
         "problems_found" => "найдены проблемы",
@@ -1290,6 +1361,7 @@ fn render_error(
                 details: error.details,
             }),
             journal: None,
+            llm_review: None,
         },
         output,
         exit_code,
@@ -1343,6 +1415,7 @@ fn render_batch_error(
             review_decisions: None,
             error: Some(error),
             journal: None,
+            llm_review: None,
         },
     };
     render_response(response, output, exit_code)
@@ -1467,7 +1540,8 @@ fn pitch_batch_id_of(command: &PitchBatchCommand) -> Option<&str> {
         | PitchBatchCommand::Retry { batch_id, .. }
         | PitchBatchCommand::RetryTechnical { batch_id, .. }
         | PitchBatchCommand::Reacquire { batch_id, .. }
-        | PitchBatchCommand::Reject { batch_id, .. } => Some(batch_id.as_str()),
+        | PitchBatchCommand::Reject { batch_id, .. }
+        | PitchBatchCommand::LlmReview { batch_id, .. } => Some(batch_id.as_str()),
     }
 }
 
@@ -1573,6 +1647,7 @@ fn execute_journal(
                 review_decisions: None,
                 error: None,
                 journal: Some(journal),
+                llm_review: None,
             },
             output,
             exit_code,
@@ -1748,6 +1823,49 @@ async fn execute_batch(
                     output,
                     store_changed || batch_state_changed_since(store, &batch_id, before_revision),
                 ),
+            }
+        }
+        PitchBatchCommand::LlmReview { batch_id, options } => {
+            let before_revision = batch_state_revision(store, &batch_id).unwrap_or(None);
+            match crate::pitch_llm_review::run(store, &batch_id, &options).await {
+                Ok((batch, report)) => {
+                    let mut blockers = batch_blockers(&batch);
+                    if report.stop_unproven {
+                        blockers.push("inference_server_stop_unproven".into());
+                    }
+                    let exit_code = if report.failures.is_empty() && !report.stop_unproven {
+                        0
+                    } else {
+                        3
+                    };
+                    let mut response = batch_response(
+                        "batch_llm_review",
+                        "llm_suggestions_saved",
+                        store_changed
+                            || report.saved > 0
+                            || batch_state_changed_since(store, &batch_id, before_revision),
+                        Some(summary),
+                        &batch,
+                        blockers,
+                        None,
+                    );
+                    response.llm_review = Some(report);
+                    render_response(response, output, exit_code)
+                }
+                Err(error) => {
+                    let saved = error.saved_before_failure();
+                    render_batch_error(
+                        store,
+                        summary,
+                        &batch_id,
+                        "batch_llm_review",
+                        error,
+                        output,
+                        store_changed
+                            || saved
+                            || batch_state_changed_since(store, &batch_id, before_revision),
+                    )
+                }
             }
         }
         PitchBatchCommand::ReviewApply {
@@ -4308,6 +4426,7 @@ fn batch_response(
         review_decisions: None,
         error: None,
         journal: None,
+        llm_review: None,
     }
 }
 

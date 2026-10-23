@@ -1387,6 +1387,20 @@ impl PitchAccentBatchRuntime {
         self.runtime.load()
     }
 
+    /// Освобождает блокировку пакета на время долгой внешней операции.
+    pub(crate) fn release_lock(&mut self) -> Result<(), AssetError> {
+        self.runtime.release_lock()
+    }
+
+    pub(crate) fn reacquire_lock(&mut self) -> Result<(), AssetError> {
+        self.runtime.reacquire_lock()
+    }
+
+    /// Повторная загрузка после `reacquire_lock`.
+    pub(crate) fn reload_cached(&mut self) -> Result<Option<PitchAccentBatch>, AssetError> {
+        self.runtime.reload_cached()
+    }
+
     pub fn save(&mut self, batch: &PitchAccentBatch) -> Result<(), AssetError> {
         self.runtime.save(batch)
     }

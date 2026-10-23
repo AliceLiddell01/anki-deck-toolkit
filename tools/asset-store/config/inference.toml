@@ -1,0 +1,141 @@
+# Базовая конфигурация локального inference для `kanji-assets` и `pitch-assets`.
+#
+# Файл версионируется и встраивается в бинарники при сборке: штатные значения
+# не зависят от текущего каталога. Менять его для своей машины не нужно —
+# личные значения задаются частичным переопределением
+# `tools/asset-store/config/inference.local.toml` (игнорируется Git; образец —
+# `inference.local.example.toml`) либо явными аргументами CLI. Порядок слоёв:
+# этот файл → локальный файл → `--inference-config` → `--inference-set`/флаги CLI.
+# Таблицы сливаются по ключам, значения последнего слоя заменяют прежние.
+#
+# Схема строгая: неизвестные ключи, неверные типы и диапазоны отклоняются до
+# запуска модели. Пустая строка в пути или имени модели означает «не настроено»:
+# задача вернёт типизированный отказ `inference_unavailable` с причиной
+# `backend_not_configured`, `model_not_configured` или `projector_not_configured`.
+schema_version = 1
+
+[runtime]
+# Сколько тяжёлых моделей держит одновременно управляемый сервер. Менеджер
+# загружает модели последовательно: смена профиля останавливает прежний
+# процесс до запуска следующего. Поддерживается только значение 1.
+max_loaded_models = 1
+
+# --- Backend: управляемый llama.cpp (`llama-server`) — значение по умолчанию ---
+[backends.llama]
+kind = "llama_server"
+# managed — программа сама запускает и останавливает свой процесс;
+# external — подключение к уже запущенному серверу, который программа не останавливает.
+mode = "managed"
+# Путь к исполняемому файлу `llama-server` (или `llama-server.exe`). Пусто —
+# backend не настроен. Ищется по пути, а не через PATH и не через shell.
+binary = ""
+# true — бинарник Windows запускается из WSL через interop: процесс и его
+# CPU/GPU/память принадлежат Windows, связь идёт по loopback, а пути к модели
+# и projector преобразуются из `/mnt/<диск>/…` в `<ДИСК>:\…`.
+windows_interop = false
+# Адрес прослушивания управляемого сервера: только литеральный loopback.
+host = "127.0.0.1"
+# 0 — свободный порт выбирается при каждом запуске.
+port = 0
+# Только для mode = "external": базовый URL работающего сервера.
+endpoint = ""
+# Разрешить адрес вне loopback (изображения будут переданы этому серверу).
+allow_remote = false
+connect_timeout_seconds = 10
+# Предел ожидания загрузки модели и доказанной готовности.
+startup_timeout_seconds = 300
+# Предел корректной остановки до принудительного завершения группы процессов.
+shutdown_timeout_seconds = 20
+
+# --- Backend: Ollama — альтернативный путь, выбирается в профиле модели ---
+[backends.ollama]
+kind = "ollama"
+endpoint = "http://127.0.0.1:11434"
+allow_remote = false
+connect_timeout_seconds = 10
+
+# --- Профили моделей: веса, vision-компоненты и потребление ресурсов ---
+# Профили Kanji и JPDB независимы: у каждой задачи своя модель и свои ресурсы.
+[models.kanji_vision]
+backend = "llama"
+
+[models.kanji_vision.llama_server]
+# Путь к GGUF с весами. Пусто — модель не настроена.
+model = ""
+# projector — отдельный mmproj-файл обязателен; integrated — vision встроен в
+# сам GGUF и projector не нужен. Задачам нужен vision, поэтому `none` недопустим.
+vision = "projector"
+# Путь к mmproj; обязателен при vision = "projector", запрещён иначе.
+projector = ""
+context_size = 4096
+# "auto" — llama.cpp подбирает размещение под свободную память; "all" — все слои
+# на GPU; число — точное количество слоёв. Это не жёсткий лимит VRAM:
+# фактическое потребление зависит также от контекста, projector и драйвера.
+gpu_layers = "auto"
+# 0 — число потоков CPU выбирает llama.cpp.
+threads = 0
+batch_size = 512
+ubatch_size = 512
+# Число параллельных слотов сервера; запросы задачи идут последовательно.
+parallel = 1
+# Размещать projector на GPU.
+projector_offload = true
+# "auto" | "on" | "off".
+flash_attention = "auto"
+# Рассуждения модели перед ответом: "off" экономит токены и время; "auto" —
+# по шаблону модели; "on" — включить.
+reasoning = "off"
+
+[models.kanji_vision.ollama]
+# Имя установленной локальной vision-модели Ollama; автоматической загрузки нет.
+model = ""
+context_size = 4096
+# Сколько секунд Ollama держит модель после запроса; 0 — выгрузить сразу.
+keep_alive_seconds = 300
+
+[models.jpdb_vision]
+backend = "llama"
+
+[models.jpdb_vision.llama_server]
+model = ""
+vision = "projector"
+projector = ""
+context_size = 4096
+gpu_layers = "auto"
+threads = 0
+batch_size = 512
+ubatch_size = 512
+parallel = 1
+projector_offload = true
+flash_attention = "auto"
+reasoning = "off"
+
+[models.jpdb_vision.ollama]
+model = ""
+context_size = 4096
+keep_alive_seconds = 300
+
+# --- Задачи: какая модель, какой промпт и какие параметры ответа ---
+# Формат JSON-ответа, его проверка и правила доверия принадлежат коду:
+# промпт описывает только предметную задачу.
+[tasks.kanji_ocr]
+model = "kanji_vision"
+# Относительный путь разрешается от каталога файла, который его задал.
+prompt = "prompts/kanji_ocr.txt"
+temperature = 0.0
+max_output_tokens = 128
+# json_schema — просить backend ограничить вывод схемой (помощь генерации;
+# проверка ответа всё равно явная); none — не передавать схему.
+structured_output = "json_schema"
+# Предел одного запроса к модели, секунды.
+timeout_seconds = 120
+# Необязательный фиксированный seed генерации:
+# seed = 0
+
+[tasks.jpdb_pitch_review]
+model = "jpdb_vision"
+prompt = "prompts/jpdb_pitch_review.txt"
+temperature = 0.0
+max_output_tokens = 384
+structured_output = "json_schema"
+timeout_seconds = 180

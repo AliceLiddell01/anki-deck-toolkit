@@ -1,0 +1,53 @@
+# Образец личного переопределения локального inference.
+#
+# Скопируйте файл в `tools/asset-store/config/inference.local.toml` (игнорируется
+# Git) и оставьте только нужные ключи: файл частичный и сливается поверх
+# версионируемого `inference.toml`. Пути и имена ниже — примеры, а не значения,
+# от которых что-то зависит. Абсолютные пути вида `/mnt/c/…` и `C:\…` допустимы;
+# относительный путь разрешается от каталога этого файла.
+
+# --- Вариант 1: llama.cpp из Windows, запускаемый из WSL ---
+# Процесс `llama-server.exe` и его CPU/GPU/память принадлежат Windows, связь идёт
+# по loopback, как у Ollama для Windows; нужна mirrored-сеть WSL
+# (`networkingMode=mirrored`), в режиме NAT запуск завершится `startup_timeout`.
+# Модель и projector должны лежать на диске Windows (`/mnt/<диск>/…`), иначе
+# Windows их не увидит.
+[backends.llama]
+binary = "/mnt/c/Tools/llama.cpp/llama-server.exe"
+windows_interop = true
+
+# --- Вариант 2: llama.cpp внутри Linux ---
+# [backends.llama]
+# binary = "/opt/llama.cpp/bin/llama-server"
+
+# --- Вариант 3: уже запущенный сервер, который программа не останавливает ---
+# [backends.llama]
+# mode = "external"
+# binary = ""
+# endpoint = "http://127.0.0.1:8080"
+
+# Модель распознавания кандзи: GGUF весов и соответствующий ему mmproj.
+[models.kanji_vision.llama_server]
+model = "/mnt/c/Models/Qwen3.5-9B-Q4_K_M.gguf"
+projector = "/mnt/c/Models/Qwen3.5-9B-mmproj-F16.gguf"
+
+# Та же задача через Ollama: включается `backend = "ollama"` здесь
+# или флагом `--backend ollama` у команды.
+[models.kanji_vision.ollama]
+model = "qwen3.5:9b-q4_K_M"
+
+# Модель визуальной проверки JPDB. Может быть той же, что для кандзи, или другой.
+[models.jpdb_vision.llama_server]
+model = "/mnt/c/Models/Qwen3.5-9B-Q4_K_M.gguf"
+projector = "/mnt/c/Models/Qwen3.5-9B-mmproj-F16.gguf"
+
+[models.jpdb_vision.ollama]
+model = "qwen3.5:9b-q4_K_M"
+
+# Переназначить задачу на другой профиль или поменять промпт и параметры
+# можно без пересборки:
+# [tasks.jpdb_pitch_review]
+# model = "kanji_vision"
+# prompt = "my-prompts/jpdb.txt"
+# max_output_tokens = 512
+# structured_output = "none"
