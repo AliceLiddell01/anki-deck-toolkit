@@ -280,11 +280,16 @@ impl InferenceProvenance {
     }
 }
 
+/// Сокращает значение до 16 символов (не байтов): путь модели может быть не ASCII.
 fn short(value: &str) -> String {
+    let prefix =
+        |text: &str| (text.chars().count() > 16).then(|| text.chars().take(16).collect::<String>());
     match value.split_once(':') {
-        Some((kind, hash)) if hash.len() > 16 => format!("{kind}:{}…", &hash[..16]),
-        _ if value.len() > 16 && !value.contains(':') => format!("{}…", &value[..16]),
-        _ => value.to_owned(),
+        Some((kind, hash)) => match prefix(hash) {
+            Some(head) => format!("{kind}:{head}…"),
+            None => value.to_owned(),
+        },
+        None => prefix(value).map_or_else(|| value.to_owned(), |head| format!("{head}…")),
     }
 }
 
@@ -1271,6 +1276,21 @@ mod tests {
     use crate::inference_config::{ConfigSources, LoadedConfig};
     use crate::inference_test_support::{MockLlama, external_config};
     use crate::temp_workspace::TempWorkspace;
+
+    #[test]
+    fn short_cuts_by_characters_and_keeps_the_prefix() {
+        assert_eq!(
+            short("reported-path:/mnt/c/Модели/model.gguf"),
+            "reported-path:/mnt/c/Модели/mo…"
+        );
+        assert_eq!(
+            short("sha256:0123456789abcdef0123"),
+            "sha256:0123456789abcdef…"
+        );
+        assert_eq!(short("sha256:short"), "sha256:short");
+        assert_eq!(short("ПутьБезПрефиксаДлинный"), "ПутьБезПрефиксаД…");
+        assert_eq!(short("unavailable"), "unavailable");
+    }
 
     #[test]
     fn traversal_error_keeps_code_and_message_and_gains_session_evidence() {

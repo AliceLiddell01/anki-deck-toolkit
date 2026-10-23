@@ -785,7 +785,10 @@ fn execute_with_progress_and_interaction(
             Err(error) => log_creation_error = Some(error),
         }
     }
-    let initial_revision = if matches!(command, BatchCommand::Run { .. }) {
+    // `ocr` сохраняет сверку с владельцем до обращения к модели, поэтому его
+    // ошибка, как и у `run`, сравнивается с ревизией до команды.
+    let initial_revision = if matches!(command, BatchCommand::Run { .. } | BatchCommand::Ocr { .. })
+    {
         command
             .id()
             .and_then(|batch_id| saved_batch(store, batch_id).ok())
@@ -926,7 +929,14 @@ fn execute_with_progress_and_interaction(
             },
         ),
         Err(error) => {
-            let changed = store.did_mutate_on_open() || error.saved_before_failure();
+            let revision_changed = matches!(command, BatchCommand::Ocr { .. })
+                && command
+                    .id()
+                    .and_then(|batch_id| saved_batch(store, batch_id).ok())
+                    .map(|batch| batch.revision)
+                    != initial_revision;
+            let changed =
+                store.did_mutate_on_open() || error.saved_before_failure() || revision_changed;
             super::render_error(
                 command.operation().into(),
                 None,

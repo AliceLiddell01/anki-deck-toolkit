@@ -1419,6 +1419,44 @@ fn progress_jsonl_is_separate_from_the_single_final_json_response() {
 }
 
 #[test]
+fn ocr_error_after_saved_owner_reuse_reports_durable_change() {
+    let mut fixture = Fixture::new();
+    fixture.start("ocr-owner", &['元']);
+    publish_reference(&fixture, "reference");
+    fixture.store = AssetStore::open_kanji(StoreOptions::new(fixture.store.root())).unwrap();
+    assert!(!fixture.store.did_mutate_on_open());
+    let revision = fixture.load("ocr-owner").revision;
+    let command = BatchCommand::Ocr {
+        batch_id: "ocr-owner".into(),
+        options: crate::kanji_ocr::OcrOptions {
+            inference: crate::inference_cli::InferenceArgs {
+                inference_set: vec!["tasks.kanji_ocr.unknown_key=1".into()],
+                ..Default::default()
+            },
+            rescan: false,
+        },
+    };
+    let output = execute_with_progress(
+        &fixture.store,
+        fixture.summary(),
+        &command,
+        OutputFormat::Json,
+        false,
+        &mut CapturedProgress::default(),
+    );
+    let response: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(
+        response["error"]["code"], "inference_config_invalid",
+        "{response}"
+    );
+    // Сверка с владельцем сохранена до отказа конфигурации inference.
+    let state = fixture.load("ocr-owner");
+    assert_ne!(state.revision, revision);
+    assert_eq!(state.items[0].status, BatchItemStatus::ExistingVerified);
+    assert_eq!(response["changed"], true);
+}
+
+#[test]
 fn reuse_trusted_assets_and_publication_resume_do_not_acquire_again() {
     let fixture = Fixture::new();
     fixture.start("original", &['元']);
