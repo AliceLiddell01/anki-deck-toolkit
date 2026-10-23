@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 1434777f9e0bd829e1f3b41adbf52d7fab7736aa -->
+<!-- i18n-source-git-blob: 9155548fcaa7c074d8d3527982453ae3c44712fa -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -719,6 +719,8 @@ cargo run --quiet --locked --bin pitch-assets -- --output json inference probe \
 #### Managed `llama-server`
 
 With `mode = "managed"` one operation starts its own process, proves its readiness and identity, runs requests and stops it. The server is launched without a shell, with explicit arguments, a random `--alias` and an `--api-key`; the parent's `LLAMA_ARG_*` variables are not inherited. Readiness means a successful `/health` and matching `/props`: alias, weights path and vision support. A foreign process on the chosen port yields `foreign_server`, a model without vision `model_does_not_support_vision`, other weights `model_mismatch`. Port `0` means a random free port outside the Linux dynamic range; a busy explicit port yields `port_in_use`. Startup failures are distinguished by server output: `projector_load_failed`, `model_load_failed`, `invalid_server_arguments`, `server_exited_during_startup`, `startup_timeout`, `model_file_missing`.
+
+`gpu_layers = "auto"` chooses layer placement from the free video memory at launch time. If another process holds it — for example, Ollama keeping a model for its `keep_alive` — most layers go to the CPU and answers become several times slower until the next launch. `inference check` shows the process working set, and the answer `timings` show generation speed.
 
 One heavy model is loaded at a time (`max_loaded_models = 1`): a second launch gets `managed_server_busy` instead of loading in parallel, and switching profiles stops the previous process before the next one starts. Stopping sends SIGTERM to the group, then SIGKILL after `shutdown_timeout_seconds`; afterwards an empty group, a released port and, for Windows, the disappearance of the Windows process are checked. Only a proven stop removes the lease file in `$XDG_CACHE_HOME/anki-deck-toolkit/inference/` (otherwise `~/.cache/…`). The lease of a process left over after a crash is checked by PID, start time and the alias in its command line; the next run stops such a process and never touches foreign ones. Ctrl+C interrupts the current request, stops the server and returns `interrupted` with code `130`; records already saved remain. If the stop cannot be proven, the command returns code `3` and `inference_server_stop_unproven`.
 

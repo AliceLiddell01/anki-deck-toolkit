@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 1434777f9e0bd829e1f3b41adbf52d7fab7736aa -->
+<!-- i18n-source-git-blob: 9155548fcaa7c074d8d3527982453ae3c44712fa -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -721,6 +721,8 @@ cargo run --quiet --locked --bin pitch-assets -- --output json inference probe \
 #### 托管 `llama-server`
 
 在 `mode = "managed"` 下，一次操作启动自己的进程，证明其就绪与身份，执行请求并将其停止。服务器不经 shell 启动，使用显式参数、随机 `--alias` 和 `--api-key`；不继承父进程的 `LLAMA_ARG_*` 变量。就绪意味着 `/health` 成功且 `/props` 一致：别名、权重路径和视觉支持。所选端口上的他人进程返回 `foreign_server`，无视觉能力的模型返回 `model_does_not_support_vision`，其他权重返回 `model_mismatch`。端口 `0` 表示 Linux 动态范围之外的随机空闲端口；被占用的显式端口返回 `port_in_use`。启动失败按服务器输出区分：`projector_load_failed`、`model_load_failed`、`invalid_server_arguments`、`server_exited_during_startup`、`startup_timeout`、`model_file_missing`。
+
+`gpu_layers = "auto"` 按启动时的空闲显存决定各层放置。如果显存被其他进程占用——例如 Ollama 在 `keep_alive` 期间保留模型——大部分层会放到 CPU 上，直到下一次启动前答复都会慢数倍。`inference check` 显示进程工作集，答复的 `timings` 显示生成速度。
 
 同一时间只加载一个重型模型（`max_loaded_models = 1`）：第二次启动得到 `managed_server_busy` 而不是并行加载，切换配置档会在启动下一个进程之前停止前一个。停止时向进程组发送 SIGTERM，超过 `shutdown_timeout_seconds` 后发送 SIGKILL；随后检查进程组为空、端口已释放，以及（Windows 情况下）Windows 进程已消失。只有被证明的停止才会删除 `$XDG_CACHE_HOME/anki-deck-toolkit/inference/`（否则为 `~/.cache/…`）中的 lease 文件。崩溃后遗留进程的 lease 按 PID、启动时间和命令行中的别名核对；下一次运行会停止这样的进程，绝不触碰他人的进程。Ctrl+C 中断当前请求、停止服务器并以退出码 `130` 返回 `interrupted`；已保存的记录保留。如果无法证明已停止，命令返回退出码 `3` 和 `inference_server_stop_unproven`。
 
