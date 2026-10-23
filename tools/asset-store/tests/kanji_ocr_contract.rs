@@ -1179,6 +1179,18 @@ impl Managed {
         self.command(fixture, mode, args).output().unwrap()
     }
 
+    /// `inference orphans` без конфигурации задачи: команда её не принимает.
+    fn orphans(&self, fixture: &Fixture, extra: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_kanji-assets"))
+            .arg("--store")
+            .arg(fixture.store.root())
+            .args(["--output", "json", "inference", "orphans"])
+            .args(extra)
+            .env("XDG_CACHE_HOME", &self.cache)
+            .output()
+            .unwrap()
+    }
+
     fn ocr(&self, fixture: &Fixture, extra: &[&str]) -> Output {
         let mut args = vec!["batch", "ocr", "--batch-id", "ocr"];
         args.extend_from_slice(extra);
@@ -1427,11 +1439,27 @@ fn orphaned_server_from_a_killed_run_is_stopped_by_the_next_owner() {
         .to_string(),
     )
     .unwrap();
+    // Осмотр не трогает процесс и аренду, но называет их.
+    let inspected = managed.orphans(&fixture, &[]);
+    assert_eq!(inspected.status.code(), Some(3));
+    let inspected = value(&inspected);
+    assert_eq!(inspected["outcome"], "orphans_remaining");
+    assert_eq!(inspected["orphans"][0]["state"], "process_alive");
+    assert_eq!(inspected["orphans"][0]["pid"], pid);
+    assert!(
+        inspected["orphans"][0]["lease"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("{alias}.json"))
+    );
+    assert!(orphan.try_wait().unwrap().is_none());
+    assert_eq!(managed.leases(), 1);
     let response = managed.check(&fixture, "ok");
     assert_eq!(response["outcome"], "ready", "{response}");
     let stopped = &response["session"]["server"]["orphans_stopped"][0];
     assert_eq!(stopped["pid"], pid);
     assert_eq!(stopped["stopped"], true);
+    assert_eq!(stopped["state"], "stopped");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while orphan.try_wait().unwrap().is_none() {
         if std::time::Instant::now() > deadline {
@@ -1441,6 +1469,32 @@ fn orphaned_server_from_a_killed_run_is_stopped_by_the_next_owner() {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(managed.leases(), 0);
+    let clean = managed.orphans(&fixture, &["--stop"]);
+    assert_eq!(clean.status.code(), Some(0));
+    assert_eq!(value(&clean)["outcome"], "clean");
+}
+
+#[test]
+fn server_without_a_durable_lease_is_stopped_instead_of_used() {
+    let fixture = Fixture::new();
+    let managed = Managed::new(&fixture, "");
+    let state = managed.cache.join("anki-deck-toolkit/inference");
+    fs::create_dir_all(&state).unwrap();
+    // Аренду некуда записать: на месте каталога аренд лежит файл.
+    fs::write(state.join("leases"), b"not a directory").unwrap();
+    let response = managed.check(&fixture, "ok");
+    assert_eq!(response["outcome"], "unavailable", "{response}");
+    assert_eq!(response["failure"]["code"], "lease_write_failed");
+    assert_eq!(response["failure"]["stop"]["proven"], true);
+    assert_eq!(response["stop_unproven"], false);
+    let pids = managed.started_pids();
+    for pid in &pids {
+        assert!(!fake_llama::process_alive(*pid), "процесс без аренды жив");
+    }
+    assert!(
+        managed.chats().is_empty(),
+        "сервер без аренды не используется"
+    );
 }
 
 #[test]
@@ -1480,6 +1534,11 @@ fn ctrl_c_during_inference_stops_the_owned_server_and_saves_nothing_partial() {
         .unwrap();
     let response: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(response["error"]["code"], "interrupted");
+    // Сведения об остановке и её доказанность сохранены и при Ctrl+C.
+    let details = &response["error"]["details"];
+    assert_eq!(details["stop_unproven"], false);
+    assert_eq!(details["inference"]["stop"]["group_empty"], true);
+    assert_eq!(details["saved"], 0);
     for pid in managed.started_pids() {
         assert!(!fake_llama::process_alive(pid));
     }
@@ -1541,6 +1600,14 @@ fn external_llama_server_is_used_but_never_stopped() {
             .get("stop")
             .is_none()
     );
+    // Путь, лишь сообщённый внешним сервером, не доказывает неизменность
+    // весов: повтор не становится попаданием кэша и спрашивает модель снова.
+    assert_eq!(value(&output)["ocr_summary"]["cache_reuse_blocked"], true);
+    let chats = managed.chats().len();
+    let again = managed.ocr(&fixture, &[]);
+    assert_ok(&again);
+    assert_eq!(value(&again)["ocr_summary"]["cache_hits"], 0);
+    assert_eq!(managed.chats().len(), chats + 1);
     assert!(fake_llama::process_alive(external.id() as i64));
     external.kill().unwrap();
     external.wait().unwrap();

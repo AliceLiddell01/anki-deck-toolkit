@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
-use crate::inference::{InferenceSession, SessionReport};
+use crate::inference::{InferenceFailure, InferenceSession, STOP_UNPROVEN_BLOCKER, SessionReport};
 use crate::inference_config::{
     ConfigSources, LoadedConfig, ResolvedBackend, ResolvedTask, TaskId, parse_assignment,
 };
@@ -180,6 +180,14 @@ pub enum InferenceCommand {
         #[command(flatten)]
         inference: InferenceArgs,
     },
+    /// Аренды управляемых серверов прежних запусков: состояние, PID процесса
+    /// Windows и путь файла аренды. С `--stop` повторяет остановку собственных
+    /// процессов; аренда снимается только при доказанной остановке.
+    Orphans {
+        /// Остановить собственные осиротевшие процессы, как при запуске сервера.
+        #[arg(long)]
+        stop: bool,
+    },
 }
 
 impl InferenceCommand {
@@ -188,6 +196,7 @@ impl InferenceCommand {
             Self::Show { .. } => "inference_show",
             Self::Check { .. } => "inference_check",
             Self::Probe { .. } => "inference_probe",
+            Self::Orphans { .. } => "inference_orphans",
         }
     }
 
@@ -196,6 +205,7 @@ impl InferenceCommand {
             Self::Show { inference, .. }
             | Self::Check { inference, .. }
             | Self::Probe { inference, .. } => inference,
+            Self::Orphans { .. } => return,
         };
         inference.repository_root = root.to_path_buf();
     }
@@ -229,6 +239,7 @@ pub(crate) fn execute(command: &InferenceCommand) -> InferenceOutput {
             images,
             inference,
         } => run_blocking(probe((*task).into(), images, inference)),
+        InferenceCommand::Orphans { stop } => run_blocking(orphans(*stop)),
     };
     match result {
         Ok(output) => output,
@@ -274,6 +285,79 @@ fn session_value(report: &SessionReport) -> Value {
     serde_json::to_value(report).unwrap_or(Value::Null)
 }
 
+/// Код выхода и машинные маркеры остановки. Прерывание сигналом сохраняет
+/// код `130`; недоказанная остановка при этом не теряется: она остаётся в
+/// `stop_unproven` и `blockers`.
+fn exit_and_blockers(interrupted: bool, failed: bool, stop_unproven: bool) -> (u8, Value) {
+    let exit_code = if interrupted {
+        130
+    } else if failed || stop_unproven {
+        3
+    } else {
+        0
+    };
+    let blockers = if stop_unproven {
+        json!([STOP_UNPROVEN_BLOCKER])
+    } else {
+        json!([])
+    };
+    (exit_code, blockers)
+}
+
+/// Ответ на отказ подготовки сессии для `check` и `probe`.
+fn unavailable_value(
+    operation: &str,
+    task: TaskId,
+    failure: &InferenceFailure,
+    report: &SessionReport,
+) -> InferenceOutput {
+    let stop_unproven = failure.stop_unproven();
+    let (exit_code, blockers) = exit_and_blockers(failure.is_interrupted(), true, stop_unproven);
+    InferenceOutput {
+        exit_code,
+        value: json!({
+            "schema_version": 1,
+            "operation": operation,
+            "outcome": if failure.is_interrupted() { "interrupted" } else { "unavailable" },
+            "task": task,
+            "failure": failure,
+            "stop_unproven": stop_unproven,
+            "blockers": blockers,
+            "session": session_value(report),
+        }),
+    }
+}
+
+async fn orphans(stop: bool) -> Result<InferenceOutput, AssetError> {
+    let (leases, orphans) = crate::llama_server::inspect_orphans(stop)
+        .await
+        .map_err(InferenceFailure::into_asset_error)?;
+    let remaining = orphans
+        .iter()
+        .filter(|orphan| !orphan.stopped && orphan.state != "stale")
+        .count();
+    let outcome = if remaining > 0 {
+        "orphans_remaining"
+    } else if orphans.is_empty() {
+        "clean"
+    } else if stop {
+        "stopped"
+    } else {
+        "stale_only"
+    };
+    Ok(InferenceOutput {
+        exit_code: if remaining > 0 { 3 } else { 0 },
+        value: json!({
+            "schema_version": 1,
+            "operation": "inference_orphans",
+            "outcome": outcome,
+            "stop": stop,
+            "leases_directory": leases,
+            "orphans": orphans,
+        }),
+    })
+}
+
 async fn check(task: TaskId, inference: &InferenceArgs) -> Result<InferenceOutput, AssetError> {
     let resolved = inference.resolve(task)?;
     resolved.require_ready()?;
@@ -282,32 +366,31 @@ async fn check(task: TaskId, inference: &InferenceArgs) -> Result<InferenceOutpu
         Ok(session) => {
             let provenance = session.provenance().clone();
             let report = session.finish().await;
-            let proven = report.stop.as_ref().is_none_or(|stop| stop.proven());
+            let stop_unproven = report.stop.as_ref().is_some_and(|stop| !stop.proven());
+            let (exit_code, blockers) = exit_and_blockers(false, false, stop_unproven);
             Ok(InferenceOutput {
-                exit_code: if proven { 0 } else { 3 },
+                exit_code,
                 value: json!({
                     "schema_version": 1,
                     "operation": "inference_check",
-                    "outcome": if proven { "ready" } else { "stop_unproven" },
+                    "outcome": if stop_unproven { "stop_unproven" } else { "ready" },
                     "task": task,
                     "provenance": provenance,
+                    "cache_reusable": provenance.reusable(),
+                    "stop_unproven": stop_unproven,
+                    "blockers": blockers,
                     "session": session_value(&report),
                 }),
             })
         }
         Err(error) => {
             let (failure, report) = *error;
-            Ok(InferenceOutput {
-                exit_code: if failure.is_interrupted() { 130 } else { 3 },
-                value: json!({
-                    "schema_version": 1,
-                    "operation": "inference_check",
-                    "outcome": "unavailable",
-                    "task": task,
-                    "failure": failure,
-                    "session": session_value(&report),
-                }),
-            })
+            Ok(unavailable_value(
+                "inference_check",
+                task,
+                &failure,
+                &report,
+            ))
         }
     }
 }
@@ -407,22 +490,36 @@ async fn probe(
         });
         prepared.push((path, entry));
     }
+    // Ни одного пригодного входа: модель не запускается вовсе.
+    if prepared.iter().all(|(_, entry)| entry.is_err()) {
+        let results: Vec<Value> = prepared
+            .iter()
+            .map(|(path, entry)| json!({"image": path, "failure": entry.as_ref().err()}))
+            .collect();
+        return Ok(InferenceOutput {
+            exit_code: 3,
+            value: json!({
+                "schema_version": 1,
+                "operation": "inference_probe",
+                "outcome": "no_valid_images",
+                "task": task,
+                "results": results,
+                "stop_unproven": false,
+                "blockers": [],
+            }),
+        });
+    }
     let (contract, transform) = task_contract(task);
     let mut session = match InferenceSession::prepare(resolved, contract, transform).await {
         Ok(session) => session,
         Err(error) => {
             let (failure, report) = *error;
-            return Ok(InferenceOutput {
-                exit_code: if failure.is_interrupted() { 130 } else { 3 },
-                value: json!({
-                    "schema_version": 1,
-                    "operation": "inference_probe",
-                    "outcome": "unavailable",
-                    "task": task,
-                    "failure": failure,
-                    "session": session_value(&report),
-                }),
-            });
+            return Ok(unavailable_value(
+                "inference_probe",
+                task,
+                &failure,
+                &report,
+            ));
         }
     };
     let provenance = session.provenance().clone();
@@ -443,7 +540,7 @@ async fn probe(
             break;
         }
         let prepared_sha256 = sha256_hex(&png);
-        match session.run(&png).await {
+        match session.run(Some(&png)).await {
             Ok(response) => {
                 let interpreted = interpret_probe(task, &response.content);
                 if interpreted.is_err() {
@@ -478,14 +575,8 @@ async fn probe(
         }
     }
     let report = session.finish().await;
-    let proven = report.stop.as_ref().is_none_or(|stop| stop.proven());
-    let exit_code = if interrupted {
-        130
-    } else if failures > 0 || !proven {
-        3
-    } else {
-        0
-    };
+    let stop_unproven = report.stop.as_ref().is_some_and(|stop| !stop.proven());
+    let (exit_code, blockers) = exit_and_blockers(interrupted, failures > 0, stop_unproven);
     Ok(InferenceOutput {
         exit_code,
         value: json!({
@@ -495,32 +586,68 @@ async fn probe(
             "task": task,
             "provenance": provenance,
             "results": results,
+            "stop_unproven": stop_unproven,
+            "blockers": blockers,
             "session": session_value(&report),
         }),
     })
 }
 
-/// Человекочитаемая сводка ответа команды `inference`.
-/// Пара `(stdout, stderr)` для обоих CLI: человекочитаемая ошибка, как и у
-/// остальных команд, идёт в `stderr`, а `stdout` остаётся пустым.
+/// Пара `(stdout, stderr)` для обоих CLI. JSON всегда идёт в `stdout`.
+/// Человекочитаемая сводка неуспешного исхода — ошибки, отказа backend,
+/// отказов отдельных входов, недоказанной остановки, прерывания, то есть
+/// любого ненулевого кода выхода — идёт в `stderr`, как у остальных команд.
 pub(crate) fn render(output: &InferenceOutput, json: bool) -> (String, String) {
     if json {
         let text = serde_json::to_string_pretty(&output.value).unwrap_or_else(|_| "{}".into());
         return (format!("{text}\n"), String::new());
     }
     let summary = human_summary(&output.value);
-    if output.value.get("error").is_some() {
+    if output.exit_code != 0 || output.value.get("error").is_some() {
         (String::new(), summary)
     } else {
         (summary, String::new())
     }
 }
 
+fn operation_title(operation: &str) -> &'static str {
+    match operation {
+        "inference_show" => "Настройки inference",
+        "inference_check" => "Проверка backend",
+        "inference_probe" => "Пробный запрос",
+        "inference_orphans" => "Аренды прежних запусков",
+        _ => "Команда inference",
+    }
+}
+
+fn outcome_title(outcome: &str) -> &'static str {
+    match outcome {
+        "ok" => "выполнено",
+        "ready" => "backend готов, сервер остановлен",
+        "stop_unproven" => "остановка сервера не доказана",
+        "unavailable" => "backend недоступен",
+        "completed" => "выполнено",
+        "completed_with_failures" => "выполнено с отказами",
+        "no_valid_images" => "нет пригодных изображений, модель не запускалась",
+        "interrupted" => "прервано сигналом",
+        "error" => "ошибка",
+        "clean" => "аренд нет",
+        "stale_only" => "живых процессов нет",
+        "stopped" => "собственные процессы остановлены",
+        "orphans_remaining" => "остались неостановленные процессы",
+        _ => "неизвестный исход",
+    }
+}
+
+/// Человекочитаемая сводка ответа команды `inference`: заголовки на русском,
+/// машинные коды — в скобках, как в JSON.
 pub(crate) fn human_summary(value: &Value) -> String {
+    let operation = value["operation"].as_str().unwrap_or("inference");
+    let outcome = value["outcome"].as_str().unwrap_or("?");
     let mut text = format!(
-        "{}: {}\n",
-        value["operation"].as_str().unwrap_or("inference"),
-        value["outcome"].as_str().unwrap_or("?")
+        "{}: {} ({outcome})\n",
+        operation_title(operation),
+        outcome_title(outcome)
     );
     if let Some(error) = value.get("error") {
         text.push_str(&format!(
@@ -562,6 +689,30 @@ pub(crate) fn human_summary(value: &Value) -> String {
             provenance["model"]["weights"].as_str().unwrap_or("?"),
             provenance["backend"]["kind"].as_str().unwrap_or("?"),
             provenance["backend"]["version"].as_str().unwrap_or("?"),
+        ));
+    }
+    if value["stop_unproven"] == true {
+        text.push_str(&format!(
+            "остановка собственного сервера не доказана ({STOP_UNPROVEN_BLOCKER})\n"
+        ));
+    }
+    let orphans = value["orphans"]
+        .as_array()
+        .or_else(|| value["failure"]["orphans"].as_array());
+    for orphan in orphans.into_iter().flatten() {
+        text.push_str(&format!(
+            "аренда {} ({}): {}{}{}\n",
+            orphan["alias"].as_str().unwrap_or("?"),
+            orphan["lease"].as_str().unwrap_or("?"),
+            orphan["state"].as_str().unwrap_or("?"),
+            orphan["windows_pid"]
+                .as_u64()
+                .map(|pid| format!(", PID Windows {pid}"))
+                .unwrap_or_default(),
+            orphan["probe_error"]
+                .as_str()
+                .map(|error| format!(", {error}"))
+                .unwrap_or_default(),
         ));
     }
     if let Some(results) = value["results"].as_array() {
@@ -609,8 +760,147 @@ mod tests {
             value: json!({"operation": "inference_check", "outcome": "ready"}),
         };
         let (stdout, stderr) = render(&ready, false);
-        assert_eq!(stdout, "inference_check: ready\n");
+        assert_eq!(
+            stdout,
+            "Проверка backend: backend готов, сервер остановлен (ready)\n"
+        );
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn unsuccessful_outcomes_without_error_go_to_stderr_in_human_mode() {
+        for (operation, outcome, exit_code) in [
+            ("inference_check", "unavailable", 3),
+            ("inference_check", "stop_unproven", 3),
+            ("inference_probe", "completed_with_failures", 3),
+            ("inference_probe", "no_valid_images", 3),
+            ("inference_probe", "interrupted", 130),
+            ("inference_orphans", "orphans_remaining", 3),
+        ] {
+            let output = InferenceOutput {
+                exit_code,
+                value: json!({
+                    "operation": operation,
+                    "outcome": outcome,
+                    "failure": {"code": "server_not_ready", "message": "нет ответа"},
+                    "stop_unproven": outcome == "stop_unproven",
+                }),
+            };
+            let (stdout, stderr) = render(&output, false);
+            assert!(stdout.is_empty(), "{outcome}");
+            assert!(
+                stderr.contains(&format!("({outcome})")),
+                "{outcome}: {stderr}"
+            );
+            // JSON-режим остаётся машиночитаемым и целиком в stdout.
+            let (stdout, stderr) = render(&output, true);
+            assert!(stderr.is_empty());
+            assert_eq!(
+                serde_json::from_str::<Value>(&stdout).unwrap()["outcome"],
+                outcome
+            );
+        }
+        let stop = InferenceOutput {
+            exit_code: 3,
+            value: json!({"operation": "inference_check", "outcome": "stop_unproven", "stop_unproven": true}),
+        };
+        assert!(
+            render(&stop, false)
+                .1
+                .contains("inference_server_stop_unproven")
+        );
+        for outcome in ["ready", "completed", "clean", "stopped"] {
+            let output = InferenceOutput {
+                exit_code: 0,
+                value: json!({"operation": "inference_probe", "outcome": outcome}),
+            };
+            let (stdout, stderr) = render(&output, false);
+            assert!(!stdout.is_empty() && stderr.is_empty(), "{outcome}");
+            assert!(!stdout.contains("неизвестный исход"), "{outcome}");
+        }
+    }
+
+    fn probe_args(workspace: &TempWorkspace, url: &str) -> InferenceArgs {
+        InferenceArgs {
+            inference_config: Some(crate::inference_test_support::external_config(
+                workspace.path(),
+                url,
+            )),
+            repository_root: workspace.path().join("repository"),
+            ..InferenceArgs::default()
+        }
+    }
+
+    fn kanji_png() -> Vec<u8> {
+        let mut image = image::RgbaImage::from_pixel(64, 64, image::Rgba([255, 255, 255, 255]));
+        for x in 16..48 {
+            image.put_pixel(x, 32, image::Rgba([0, 0, 0, 255]));
+        }
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    #[tokio::test]
+    async fn probe_without_valid_images_never_starts_the_model() {
+        let workspace = TempWorkspace::create("inference-probe-invalid").unwrap();
+        let mock = crate::inference_test_support::MockLlama::new("{\"observed\":\"一\"}");
+        let broken = workspace.path().join("broken.png");
+        std::fs::write(&broken, b"not an image").unwrap();
+        let missing = workspace.path().join("missing.png");
+        let output = probe(
+            TaskId::KanjiOcr,
+            &[broken.clone(), missing.clone()],
+            &probe_args(&workspace, &mock.url),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.exit_code, 3);
+        assert_eq!(output.value["outcome"], "no_valid_images");
+        let results = output.value["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0]["failure"]
+                .as_str()
+                .unwrap()
+                .starts_with("image_prepare_failed")
+        );
+        assert!(
+            results[1]["failure"]
+                .as_str()
+                .unwrap()
+                .starts_with("image_unreadable")
+        );
+        assert!(output.value.get("session").is_none());
+        assert!(
+            mock.state.lock().unwrap().requests.is_empty(),
+            "к серверу не обращались"
+        );
+
+        // Смешанный набор: пригодный вход выполняется, отказ сохраняется.
+        let valid = workspace.path().join("valid.png");
+        std::fs::write(&valid, kanji_png()).unwrap();
+        let output = probe(
+            TaskId::KanjiOcr,
+            &[broken, valid],
+            &probe_args(&workspace, &mock.url),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.exit_code, 3);
+        assert_eq!(output.value["outcome"], "completed_with_failures");
+        let results = output.value["results"].as_array().unwrap();
+        assert!(
+            results[0]["failure"]
+                .as_str()
+                .unwrap()
+                .starts_with("image_prepare_failed")
+        );
+        assert_eq!(results[1]["result"]["observed"], "一");
+        assert_eq!(output.value["stop_unproven"], false);
+        assert_eq!(mock.chats().len(), 1);
     }
 
     #[test]

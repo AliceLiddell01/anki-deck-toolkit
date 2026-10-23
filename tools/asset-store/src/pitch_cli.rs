@@ -1097,6 +1097,11 @@ fn render_response(response: Response, output: OutputFormat, exit_code: u8) -> P
                 if report.stop_unproven {
                     stdout.push_str("  Остановка сервера inference не доказана\n");
                 }
+                if report.cache_reuse_blocked {
+                    stdout.push_str(
+                        "  Сохранённые результаты не переиспользуются: идентичность модели не проверяема\n",
+                    );
+                }
             }
             if let Some(journal) = &response.journal {
                 stdout.push_str(&report_text(journal));

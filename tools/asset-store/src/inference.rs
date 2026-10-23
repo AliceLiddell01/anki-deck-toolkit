@@ -1,8 +1,8 @@
-//! Общий локальный inference для задач с изображением.
+//! Общий локальный inference для текстовых задач и задач с изображением.
 //!
 //! Предметная задача (`kanji_ocr`, `jpdb_pitch_review`) готовит изображение,
-//! задаёт контракт ответа (инструкцию формата и JSON Schema) и сама проверяет
-//! ответ. Этот модуль отвечает только за транспорт и исполнение:
+//! задаёт контракт ответа (инструкцию формата, JSON Schema и нужен ли вход с
+//! изображением) и сама проверяет ответ. Этот модуль отвечает только за транспорт и исполнение:
 //!
 //! - `llama_server` — OpenAI-совместимый `/v1/chat/completions` собственного
 //!   (`managed`, см. `llama_server`) или внешнего (`external`) `llama-server`;
@@ -11,15 +11,17 @@
 //! Протоколы не имитируют друг друга: изображение, параметры генерации,
 //! сведения о модели, структура ответа и ошибки разбираются для каждого
 //! backend отдельно. Перед первым запросом подтверждаются идентичность
-//! модели и наличие vision; перед и после каждого запроса — что модель не
-//! сменилась. Клиент HTTP — без proxy и redirect, ответы ограничены по размеру.
+//! модели и, для задач с изображением, наличие vision; перед и после каждого
+//! запроса — что модель не сменилась. Клиент HTTP — без proxy и redirect, ответы ограничены по размеру.
 //!
 //! Провенанс (`InferenceProvenance`) — идентичность результата: задача,
 //! контракт, backend и его версия, файл весов и projector по SHA-256 (или
 //! digest Ollama), промпт по SHA-256, преобразование изображения и параметры
 //! генерации. Параметры, влияющие только на скорость (размещение слоёв, число
 //! потоков, batch), в идентичность не входят и записываются в сведениях о
-//! запуске.
+//! запуске. Сохранённый результат переиспользуется только при проверяемой
+//! идентичности весов и projector (`InferenceProvenance::reusable`): внешний
+//! сервер, сообщивший лишь путь, или его неизвестный projector дают новый запрос.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -38,9 +40,11 @@ use crate::hashing::sha256_hex;
 use crate::inference_config::{
     LlamaMode, ResolvedBackend, ResolvedModel, ResolvedTask, StructuredOutput, TaskId, is_loopback,
 };
-use crate::llama_server::{LaunchPlan, ManagedServer, ServerReady, StopReport};
+use crate::llama_server::{LaunchPlan, ManagedServer, OrphanStop, ServerReady, StopReport};
 
 pub(crate) const PROVENANCE_SCHEMA: u32 = 1;
+/// Машинный маркер недоказанной остановки собственного сервера.
+pub(crate) const STOP_UNPROVEN_BLOCKER: &str = "inference_server_stop_unproven";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -52,6 +56,9 @@ pub(crate) struct InferenceFailure {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Box<StopSummary>>,
+    /// Аренды прежних запусков, из-за которых запуск отклонён.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub orphans: Vec<OrphanStop>,
 }
 
 /// Сводка остановки сервера после отказа запуска.
@@ -67,6 +74,7 @@ impl InferenceFailure {
             code: code.into(),
             message: message.into(),
             stop: None,
+            orphans: Vec::new(),
         }
     }
 
@@ -97,11 +105,16 @@ impl InferenceFailure {
         } else {
             ErrorCode::InferenceUnavailable
         };
-        AssetError::with_details(
-            code,
-            format!("{}: {}", self.code, self.message),
-            json!({"reason": self.code, "stop": self.stop}),
-        )
+        let stop_unproven = self.stop_unproven();
+        let mut details = json!({"reason": self.code, "stop": self.stop});
+        if !self.orphans.is_empty() {
+            details["orphans"] = json!(self.orphans);
+        }
+        if stop_unproven {
+            details["stop_unproven"] = json!(true);
+            details["blockers"] = json!([STOP_UNPROVEN_BLOCKER]);
+        }
+        AssetError::with_details(code, format!("{}: {}", self.code, self.message), details)
     }
 }
 
@@ -175,6 +188,9 @@ pub(crate) struct ResponseContract {
     /// Добавляется после пользовательского промпта.
     pub instruction: &'static str,
     pub schema: Value,
+    /// Каждый запрос несёт изображение: vision подтверждается до запуска
+    /// задачи. Текстовая задача vision не требует и изображение не передаёт.
+    pub requires_image: bool,
 }
 
 /// Итоговый текст запроса: промпт пользователя и инструкция формата из кода.
@@ -206,9 +222,11 @@ pub(crate) struct ModelIdentity {
     /// `sha256:<hex>` файла весов, `ollama-digest:<digest>` либо
     /// `reported-path:<путь>`, если файл внешнего сервера недоступен для хеша.
     pub weights: String,
-    /// `sha256:<hex>` отдельного projector, если он используется.
+    /// `sha256:<hex>` отдельного projector, если он используется;
+    /// `unverified:external` — внешний сервер может использовать projector,
+    /// который API не сообщает.
     pub projector: Option<String>,
-    /// `projector`, `integrated` или `backend_reported`.
+    /// `projector`, `integrated`, `none` или `backend_reported`.
     pub vision: String,
     /// Параметры загрузки, влияющие на ответ (контекст, рассуждения).
     pub load: BTreeMap<String, String>,
@@ -263,6 +281,21 @@ impl InferenceProvenance {
             generation: generation_parameters(task),
         }
     }
+    /// Можно ли выдать сохранённый результат этой идентичности без запроса.
+    /// Нужны проверяемые веса (SHA-256 файла или digest Ollama) и projector,
+    /// который либо не используется, либо тоже проверен по SHA-256. Путь,
+    /// лишь сообщённый внешним сервером, и его неизвестный projector не
+    /// доказывают, что байты модели не сменились между запусками.
+    pub(crate) fn reusable(&self) -> bool {
+        (self.model.weights.starts_with("sha256:")
+            || self.model.weights.starts_with("ollama-digest:"))
+            && self
+                .model
+                .projector
+                .as_deref()
+                .is_none_or(|projector| projector.starts_with("sha256:"))
+    }
+
     pub(crate) fn summary(&self) -> String {
         format!(
             "{} {} {}; модель {} ({}); prompt sha256 {}; {}",
@@ -398,8 +431,36 @@ pub(crate) fn with_session_evidence(
     details
         .entry("stop_unproven")
         .or_insert(Value::Bool(stop_unproven));
+    if stop_unproven {
+        let blockers = details
+            .entry("blockers")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Value::Array(blockers) = blockers
+            && !blockers
+                .iter()
+                .any(|blocker| blocker == STOP_UNPROVEN_BLOCKER)
+        {
+            blockers.push(json!(STOP_UNPROVEN_BLOCKER));
+        }
+    }
     error.details = Value::Object(details);
     error
+}
+
+/// Ошибка прерывания сигналом обхода задачи: код `interrupted` (выход `130`)
+/// сохраняет и число записанных результатов, и сведения об остановке сервера,
+/// включая `stop_unproven` и блокер `inference_server_stop_unproven`.
+pub(crate) fn interrupted_error(
+    message: &str,
+    saved: usize,
+    stop_unproven: bool,
+    session: Option<&SessionReport>,
+) -> AssetError {
+    with_session_evidence(
+        AssetError::with_details(ErrorCode::Interrupted, message, json!({"saved": saved})),
+        stop_unproven,
+        Some(session.unwrap_or(&SessionReport::default())),
+    )
 }
 
 /// Сведения о сессии для отчёта команды.
@@ -671,7 +732,7 @@ impl InferenceSession {
             ..SessionReport::default()
         };
         let prompt = compose_prompt(&task.prompt.text, &contract);
-        let result = Self::connect(&task, &mut report).await;
+        let result = Self::connect(&task, contract.requires_image, &mut report).await;
         report.prepare_ms = started.elapsed().as_millis() as u64;
         let (transport, cancellation, backend, model, client) = match result {
             Ok(prepared) => prepared,
@@ -706,6 +767,7 @@ impl InferenceSession {
     #[allow(clippy::type_complexity)]
     async fn connect(
         task: &ResolvedTask,
+        requires_image: bool,
         report: &mut SessionReport,
     ) -> Result<
         (
@@ -753,9 +815,10 @@ impl InferenceSession {
                     &json!({"model": name}),
                 )
                 .await?;
-                if !show["capabilities"]
-                    .as_array()
-                    .is_some_and(|caps| caps.iter().any(|cap| cap == "vision"))
+                if requires_image
+                    && !show["capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == "vision"))
                 {
                     return Err(InferenceFailure::new(
                         "model_does_not_support_vision",
@@ -809,7 +872,8 @@ impl InferenceSession {
                 ]);
                 match backend.mode {
                     LlamaMode::Managed => {
-                        let plan = LaunchPlan::new(backend, model)?;
+                        let mut plan = LaunchPlan::new(backend, model)?;
+                        plan.require_vision = requires_image;
                         let weights = format!(
                             "sha256:{}",
                             weights_sha256(model.model.as_ref().expect("readiness проверена"))?
@@ -871,7 +935,8 @@ impl InferenceSession {
                                 projector,
                                 vision: match model.vision {
                                     crate::inference_config::VisionMode::Projector => "projector",
-                                    _ => "integrated",
+                                    crate::inference_config::VisionMode::Integrated => "integrated",
+                                    crate::inference_config::VisionMode::None => "none",
                                 }
                                 .into(),
                                 load,
@@ -896,14 +961,16 @@ impl InferenceSession {
                         let props =
                             crate::llama_server::server_props(&client, &base, None, connect)
                                 .await?;
-                        if !props.vision {
+                        if requires_image && !props.vision {
                             return Err(InferenceFailure::new(
                                 "model_does_not_support_vision",
                                 "внешний сервер не подтвердил vision",
                             ));
                         }
                         // Ожидаемая модель, если задана, сверяется с тем, что сервер
-                        // действительно загрузил; её SHA считается по локальному файлу.
+                        // действительно загрузил; её SHA считается по локальному файлу
+                        // (большой GGUF хешируется один раз на путь, размер и mtime).
+                        // Без неё известен лишь путь: такой результат не переиспользуется.
                         let (name, weights) = match &model.model {
                             Some(path) => {
                                 let expected = if backend.windows_interop {
@@ -952,8 +1019,12 @@ impl InferenceSession {
                                 profile: model.profile.clone(),
                                 name,
                                 weights,
-                                // Отдельный projector внешнего сервера не сообщается API.
-                                projector: None,
+                                // Отдельный projector внешнего сервера API не сообщает:
+                                // он отсутствует, только если профиль явно объявил
+                                // vision встроенным или ненужным.
+                                projector: (model.vision
+                                    == crate::inference_config::VisionMode::Projector)
+                                    .then(|| "unverified:external".to_owned()),
                                 vision: "backend_reported".into(),
                                 load,
                             },
@@ -973,13 +1044,32 @@ impl InferenceSession {
         self.cancellation.interrupted()
     }
 
-    /// Один запрос с изображением PNG. Модель сверяется до и после запроса.
-    pub(crate) async fn run(&mut self, png: &[u8]) -> Result<ModelResponse, InferenceFailure> {
-        if png.len() > MAX_IMAGE_BYTES {
-            return Err(InferenceFailure::new(
-                "image_too_large",
-                "изображение превышает предел",
-            ));
+    /// Один запрос: с изображением PNG для задач с изображением, без него —
+    /// для текстовых. Модель сверяется до и после запроса.
+    pub(crate) async fn run(
+        &mut self,
+        png: Option<&[u8]>,
+    ) -> Result<ModelResponse, InferenceFailure> {
+        match (self.contract.requires_image, png) {
+            (true, None) => {
+                return Err(InferenceFailure::new(
+                    "image_required",
+                    "задача выполняется только с изображением",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(InferenceFailure::new(
+                    "image_not_expected",
+                    "текстовая задача не принимает изображение",
+                ));
+            }
+            (_, Some(png)) if png.len() > MAX_IMAGE_BYTES => {
+                return Err(InferenceFailure::new(
+                    "image_too_large",
+                    "изображение превышает предел",
+                ));
+            }
+            _ => {}
         }
         if self.cancellation.interrupted() {
             return Err(InferenceFailure::interrupted());
@@ -997,11 +1087,11 @@ impl InferenceSession {
         result
     }
 
-    async fn request(&mut self, png: &[u8]) -> Result<ModelResponse, InferenceFailure> {
+    async fn request(&mut self, png: Option<&[u8]>) -> Result<ModelResponse, InferenceFailure> {
         let timeout = Duration::from_secs(self.task.generation.timeout_seconds);
         let generation = self.task.generation.clone();
         let schema = self.contract.schema.clone();
-        let image = base64::engine::general_purpose::STANDARD.encode(png);
+        let image = png.map(|png| base64::engine::general_purpose::STANDARD.encode(png));
         let started = Instant::now();
         match &mut self.transport {
             Transport::Ollama {
@@ -1029,7 +1119,7 @@ impl InferenceSession {
                     "model": model, "stream": false, "think": false,
                     "keep_alive": format!("{keep_alive_seconds}s"),
                     "options": options,
-                    "messages": [{"role": "user", "content": self.prompt, "images": [image]}],
+                    "messages": [ollama_message(&self.prompt, image.as_deref())],
                 });
                 if generation.structured_output == StructuredOutput::JsonSchema {
                     body["format"] = schema;
@@ -1104,10 +1194,7 @@ impl InferenceSession {
                     "stream": false,
                     "temperature": generation.temperature,
                     "max_tokens": generation.max_output_tokens,
-                    "messages": [{"role": "user", "content": [
-                        {"type": "text", "text": self.prompt},
-                        {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{image}")}},
-                    ]}],
+                    "messages": [llama_message(&self.prompt, image.as_deref())],
                 });
                 if let Some(seed) = generation.seed {
                     body["seed"] = json!(seed);
@@ -1205,6 +1292,26 @@ impl InferenceSession {
             report.stop = Some((*server).stop().await);
         }
         report
+    }
+}
+
+/// Сообщение Ollama `/api/chat`: изображения — отдельный массив base64.
+fn ollama_message(prompt: &str, image: Option<&str>) -> Value {
+    match image {
+        Some(image) => json!({"role": "user", "content": prompt, "images": [image]}),
+        None => json!({"role": "user", "content": prompt}),
+    }
+}
+
+/// Сообщение OpenAI-совместимого `/v1/chat/completions`: изображение — часть
+/// содержимого типа `image_url` с data URL.
+fn llama_message(prompt: &str, image: Option<&str>) -> Value {
+    match image {
+        Some(image) => json!({"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{image}")}},
+        ]}),
+        None => json!({"role": "user", "content": prompt}),
     }
 }
 
@@ -1361,6 +1468,10 @@ mod tests {
         (temp, task)
     }
 
+    async fn session_for(url: &str) -> Result<InferenceSession, InferenceFailure> {
+        session(url).await
+    }
+
     async fn session(url: &str) -> Result<InferenceSession, InferenceFailure> {
         let (_temp, task) = task_for(url, &[]);
         InferenceSession::prepare(task, crate::kanji_ocr::contract(), "t-v1")
@@ -1377,12 +1488,18 @@ mod tests {
         assert_eq!(provenance.backend.mode, "external");
         assert_eq!(provenance.backend.version.as_deref(), Some("b0-fixture"));
         assert_eq!(provenance.backend.scope, "loopback");
-        // Файл весов внешнего сервера не указан: идентичность лишь сообщена сервером.
+        // Файл весов внешнего сервера не указан: идентичность лишь сообщена
+        // сервером, такой результат не переиспользуется из кэша.
         assert_eq!(
             provenance.model.weights,
             "reported-path:/models/fixture.gguf"
         );
-        let response = session.run(b"png-bytes").await.unwrap();
+        assert_eq!(
+            provenance.model.projector.as_deref(),
+            Some("unverified:external")
+        );
+        assert!(!provenance.reusable());
+        let response = session.run(Some(b"png-bytes")).await.unwrap();
         assert_eq!(response.content, "{\"observed\":\"保\"}");
         assert_eq!(response.timings.prompt_ms, Some(2));
         let chat = &mock.chats()[0];
@@ -1398,7 +1515,7 @@ mod tests {
         // Сервер сменил модель между запросами: результат не принимается.
         mock.state.lock().unwrap().model_path = "/models/other.gguf".into();
         assert_eq!(
-            session.run(b"png").await.unwrap_err().code,
+            session.run(Some(b"png")).await.unwrap_err().code,
             "model_changed_during_scan"
         );
         let report = session.finish().await;
@@ -1439,7 +1556,7 @@ mod tests {
                 state.chat_error = error.into();
             }
             let mut session = session(&mock.url).await.unwrap();
-            assert_eq!(session.run(b"png").await.unwrap_err().code, code);
+            assert_eq!(session.run(Some(b"png")).await.unwrap_err().code, code);
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let closed = format!("http://{}", listener.local_addr().unwrap());
@@ -1480,10 +1597,147 @@ mod tests {
             .await
             .map_err(|error| error.0)
             .unwrap();
+        let provenance = session.provenance();
         assert_eq!(
-            session.provenance().model.weights,
+            provenance.model.weights,
             format!("sha256:{}", sha256_hex(b"weights"))
         );
+        // Профиль объявил vision встроенным: проверяемые веса — повод для кэша.
+        assert_eq!(provenance.model.projector, None);
+        assert!(provenance.reusable());
+
+        // Тот же путь, но профиль ждёт отдельный projector, который внешний
+        // сервер не сообщает: кэш не используется, хотя SHA весов известен.
+        let (_keep, task) = task_for(
+            &mock.url,
+            &[
+                &assignment,
+                "models.kanji_vision.llama_server.projector=\"\"",
+            ],
+        );
+        let session = InferenceSession::prepare(task, crate::kanji_ocr::contract(), "t")
+            .await
+            .map_err(|error| error.0)
+            .unwrap();
+        assert!(session.provenance().model.weights.starts_with("sha256:"));
+        assert_eq!(
+            session.provenance().model.projector.as_deref(),
+            Some("unverified:external")
+        );
+        assert!(!session.provenance().reusable());
+    }
+
+    #[test]
+    fn only_verifiable_identities_are_reusable() {
+        let (_temp, task) = task_for("http://127.0.0.1:9", &[]);
+        let mut provenance =
+            InferenceProvenance::unavailable(&task, &crate::kanji_ocr::contract(), "t");
+        assert!(!provenance.reusable(), "unavailable");
+        for (weights, projector, reusable) in [
+            ("sha256:aa", None, true),
+            ("sha256:aa", Some("sha256:bb"), true),
+            ("ollama-digest:cc", None, true),
+            ("sha256:aa", Some("unverified:external"), false),
+            ("reported-path:/m.gguf", None, false),
+            ("reported-path:/m.gguf", Some("unverified:external"), false),
+        ] {
+            provenance.model.weights = weights.into();
+            provenance.model.projector = projector.map(str::to_owned);
+            assert_eq!(provenance.reusable(), reusable, "{weights} {projector:?}");
+        }
+    }
+
+    fn text_contract() -> ResponseContract {
+        ResponseContract {
+            id: "text-fixture-v1",
+            instruction: "Return ONLY JSON.",
+            schema: json!({"type": "object"}),
+            requires_image: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn text_task_needs_no_vision_and_sends_no_image() {
+        let mock = MockLlama::new("{\"answer\":\"ok\"}");
+        mock.state.lock().unwrap().vision = false;
+        let (_temp, task) = task_for(&mock.url, &[]);
+        let mut session = InferenceSession::prepare(task.clone(), text_contract(), "text-v1")
+            .await
+            .map_err(|error| error.0)
+            .unwrap();
+        assert_eq!(
+            session.run(Some(b"png")).await.unwrap_err().code,
+            "image_not_expected"
+        );
+        let response = session.run(None).await.unwrap();
+        assert_eq!(response.content, "{\"answer\":\"ok\"}");
+        let chat = &mock.chats()[0];
+        assert!(chat["messages"][0]["content"].is_string());
+        assert!(!chat.to_string().contains("image_url"));
+        // Задача с изображением на той же модели без vision отклоняется заранее,
+        // а запрос без изображения — до обращения к серверу.
+        assert_eq!(
+            InferenceSession::prepare(task, crate::kanji_ocr::contract(), "t")
+                .await
+                .err()
+                .unwrap()
+                .0
+                .code,
+            "model_does_not_support_vision"
+        );
+        mock.state.lock().unwrap().vision = true;
+        let mut session = session_for(&mock.url).await.unwrap();
+        assert_eq!(session.run(None).await.unwrap_err().code, "image_required");
+        assert_eq!(mock.chats().len(), 1);
+    }
+
+    #[test]
+    fn messages_follow_each_backend_protocol() {
+        assert_eq!(
+            ollama_message("p", Some("aW1n")),
+            json!({"role": "user", "content": "p", "images": ["aW1n"]})
+        );
+        assert_eq!(
+            ollama_message("p", None),
+            json!({"role": "user", "content": "p"})
+        );
+        assert_eq!(
+            llama_message("p", Some("aW1n"))["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1n"
+        );
+        assert_eq!(
+            llama_message("p", None),
+            json!({"role": "user", "content": "p"})
+        );
+    }
+
+    #[test]
+    fn interruption_keeps_unproven_stop_evidence() {
+        let session = SessionReport {
+            requests: 1,
+            stop: Some(StopReport {
+                method: "killed".into(),
+                group_empty: true,
+                port_released: false,
+                ..StopReport::default()
+            }),
+            ..SessionReport::default()
+        };
+        let error = interrupted_error("прервано", 2, true, Some(&session));
+        assert_eq!(error.code, ErrorCode::Interrupted);
+        assert_eq!(error.exit_code(), 130);
+        assert_eq!(error.details["saved"], 2);
+        assert_eq!(error.details["stop_unproven"], true);
+        assert_eq!(error.details["blockers"], json!([STOP_UNPROVEN_BLOCKER]));
+        assert_eq!(error.details["inference"]["stop"]["method"], "killed");
+        let proven = interrupted_error("прервано", 0, false, None);
+        assert_eq!(proven.details["stop_unproven"], false);
+        assert!(proven.details.get("blockers").is_none());
+        // Отказ подготовки с недоказанной остановкой несёт тот же маркер.
+        let failure = InferenceFailure::interrupted().with_stop(session.stop.unwrap());
+        let error = failure.into_asset_error();
+        assert_eq!(error.code, ErrorCode::Interrupted);
+        assert_eq!(error.details["blockers"], json!([STOP_UNPROVEN_BLOCKER]));
     }
 
     #[test]

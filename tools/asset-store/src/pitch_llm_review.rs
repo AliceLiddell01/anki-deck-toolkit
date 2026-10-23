@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
@@ -33,8 +34,8 @@ use crate::pitch_review_decisions::{PitchReviewKind, PitchReviewRow};
 use crate::store::AssetStore;
 
 pub(crate) const TRANSFORM_VERSION: &str = "jpdb-png-rgba-lanczos3-upscale-448-v1";
-const CONTRACT_ID: &str = "jpdb-pitch-visual-v1";
-const CONTRACT_INSTRUCTION: &str = "Return ONLY a JSON object with exactly these fields: \"verdict\" (one of \"no_defect_observed\", \"defect_observed\", \"insufficient\"), \"observations\" (an array of at most 6 objects with \"category\" (one of \"cropping\", \"incomplete_glyph\", \"artifact\", \"foreign_element\", \"illegible_text\", \"other\") and \"detail\" (a short English note)), and \"visible_text\" (the kana you can read). Use an empty observations array when no defect is observed. No explanation outside the JSON object.";
+const CONTRACT_ID: &str = "jpdb-pitch-visual-v2";
+const CONTRACT_INSTRUCTION: &str = "Return ONLY a JSON object with exactly these fields: \"verdict\" (one of \"no_defect_observed\", \"defect_observed\", \"insufficient\"), \"observations\" (an array of at most 6 objects with \"category\" (one of \"cropping\", \"incomplete_glyph\", \"artifact\", \"foreign_element\", \"illegible_text\", \"other\") and \"detail\" (a short note in Russian)), and \"visible_text\" (the kana you can read). Use an empty observations array when no defect is observed. No explanation outside the JSON object.";
 const MAX_OBSERVATIONS: usize = 6;
 const MAX_DETAIL_CHARS: usize = 200;
 const MAX_VISIBLE_TEXT_CHARS: usize = 64;
@@ -67,6 +68,7 @@ pub(crate) fn contract() -> ResponseContract {
             "required": ["verdict", "observations", "visible_text"],
             "additionalProperties": false,
         }),
+        requires_image: true,
     }
 }
 
@@ -97,6 +99,20 @@ pub(crate) enum ObservationCategory {
     ForeignElement,
     IllegibleText,
     Other,
+}
+
+impl ObservationCategory {
+    /// Название категории для человекочитаемой сводки.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cropping => "обрезание",
+            Self::IncompleteGlyph => "неполный знак",
+            Self::Artifact => "артефакт",
+            Self::ForeignElement => "посторонний элемент",
+            Self::IllegibleText => "нечитаемый текст",
+            Self::Other => "другое",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,8 +194,12 @@ pub(crate) fn prepare_image(bytes: &[u8]) -> Result<PreparedImage, String> {
     })
 }
 
-fn katakana_to_hiragana(text: &str) -> String {
-    text.chars()
+/// Ключ сравнения чтений: каноническая композиция Unicode (NFC) сводит
+/// `か` + U+3099 к `が`, затем катакана приводится к хирагане, пробелы
+/// удаляются. NFKC не применяется: он стёр бы различия, значимые для
+/// японского текста.
+fn reading_key(text: &str) -> String {
+    text.nfc()
         .map(|character| match character {
             'ァ'..='ヶ' => char::from_u32(character as u32 - 0x60).unwrap_or(character),
             other => other,
@@ -263,10 +283,7 @@ impl PitchLlmSuggestion {
             for observation in &assessment.observations {
                 text.push_str(&format!(
                     "\n- {}: {}",
-                    serde_json::to_value(observation.category)
-                        .ok()
-                        .and_then(|value| value.as_str().map(str::to_owned))
-                        .unwrap_or_default(),
+                    observation.category.label(),
                     observation.detail
                 ));
             }
@@ -378,6 +395,9 @@ pub(crate) struct LlmReviewReport {
     pub failures: Vec<LlmReviewFailure>,
     pub interrupted: bool,
     pub stop_unproven: bool,
+    /// Идентичность модели не проверяема: сохранённые результаты не переиспользуются.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cache_reuse_blocked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference: Option<SessionReport>,
 }
@@ -491,10 +511,11 @@ pub(crate) async fn run(
         )
     })?;
     if report.interrupted {
-        return Err(AssetError::with_details(
-            ErrorCode::Interrupted,
+        return Err(crate::inference::interrupted_error(
             "LLM-проверка прервана сигналом; уже сохранённые предложения остаются в журнале",
-            json!({"saved": report.saved, "inference": report.inference}),
+            report.saved,
+            report.stop_unproven,
+            report.inference.as_ref(),
         ));
     }
     Ok((batch, report))
@@ -515,6 +536,8 @@ async fn review_targets(
         .reload_cached()?
         .ok_or_else(|| invalid("пакет исчез во время LLM-проверки"))?;
     let mut ledger = read_ledger(runtime)?;
+    let reusable = provenance.reusable();
+    report.cache_reuse_blocked = session.is_some() && !reusable;
     for Target { row, reading } in targets {
         if session.as_mut().is_some_and(InferenceSession::interrupted) {
             report.interrupted = true;
@@ -548,6 +571,7 @@ async fn review_targets(
         let key = suggestion.key();
         if session.is_some()
             && !options.rescan
+            && reusable
             && let Some(saved) = ledger.records.get(&key).cloned()
         {
             report.cache_hits += 1;
@@ -576,7 +600,7 @@ async fn review_targets(
                         suggestion.dimensions = Some(prepared.dimensions);
                         runtime.release_lock()?;
                         report.requests += 1;
-                        let response = session.run(&prepared.png).await;
+                        let response = session.run(Some(&prepared.png)).await;
                         runtime.reacquire_lock()?;
                         *batch = runtime
                             .reload_cached()?
@@ -601,10 +625,7 @@ async fn review_targets(
         match result {
             Ok(assessment) => {
                 suggestion.visible_text_matches_reading = (!assessment.visible_text.is_empty())
-                    .then(|| {
-                        katakana_to_hiragana(&assessment.visible_text)
-                            == katakana_to_hiragana(&reading)
-                    });
+                    .then(|| reading_key(&assessment.visible_text) == reading_key(&reading));
                 suggestion.assessment = Some(assessment);
             }
             Err(code) => suggestion.failure = Some(code),
@@ -769,11 +790,46 @@ mod tests {
         let html = std::fs::read_to_string(bundle.directory.join("index.html")).unwrap();
         assert!(html.contains("LLM (предложение, не решение): llm:defect_observed"));
         assert!(html.contains("совпадает с чтением «ゆうれい»: да"));
+        assert!(html.contains("- обрезание: right edge cut"));
+        // Инструкция формата не требует английского текста наблюдений.
+        let prompt = chats[0]["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(prompt.contains("a short note in Russian"));
+        assert!(!prompt.contains("English"));
 
-        // Повтор берёт сохранённый результат той же идентичности.
+        // Внешний сервер сообщил лишь путь модели: её байты могли смениться,
+        // поэтому повтор не выдаёт сохранённый результат, а спрашивает снова.
+        assert!(report.cache_reuse_blocked);
+        let (_, report) = run(&store, BATCH, &options).await.unwrap();
+        assert_eq!((report.cache_hits, report.requests), (0, 1));
+        assert!(report.cache_reuse_blocked);
+        assert_eq!(mock.chats().len(), 2);
+
+        // Проверяемая идентичность: настроенный файл весов совпал с /props,
+        // vision встроен. Повтор берёт сохранённый результат той же идентичности.
+        let weights = workspace.path().join("model.gguf");
+        std::fs::write(&weights, b"weights").unwrap();
+        mock.state.lock().unwrap().model_path = weights.display().to_string();
+        let mut options = options.clone();
+        options.inference.inference_set.extend([
+            format!(
+                "models.jpdb_vision.llama_server.model={}",
+                weights.display()
+            ),
+            "models.jpdb_vision.llama_server.projector=\"\"".into(),
+            "models.jpdb_vision.llama_server.vision=\"integrated\"".into(),
+        ]);
+        let (_, report) = run(&store, BATCH, &options).await.unwrap();
+        assert_eq!((report.cache_hits, report.requests), (0, 1));
+        assert!(!report.cache_reuse_blocked);
         let (_, report) = run(&store, BATCH, &options).await.unwrap();
         assert_eq!((report.cache_hits, report.requests), (1, 0));
-        assert_eq!(mock.chats().len(), 1);
+        assert_eq!(mock.chats().len(), 3);
+        // Подмена содержимого весов по тому же пути — новая идентичность.
+        std::fs::write(&weights, b"weights v2").unwrap();
+        let (_, report) = run(&store, BATCH, &options).await.unwrap();
+        assert_eq!((report.cache_hits, report.requests), (0, 1));
         // Смена промпта — новая идентичность и новый запрос.
         let prompt = workspace.path().join("prompt.txt");
         std::fs::write(&prompt, "Inspect the graph.").unwrap();
@@ -861,9 +917,33 @@ mod tests {
     }
 
     #[test]
-    fn kana_comparison_folds_script_and_whitespace() {
-        assert_eq!(katakana_to_hiragana("ド ア"), "どあ");
-        assert_eq!(katakana_to_hiragana("がっこう"), "がっこう");
+    fn kana_comparison_folds_script_whitespace_and_combining_marks() {
+        assert_eq!(reading_key("ド ア"), "どあ");
+        assert_eq!(reading_key("がっこう"), "がっこう");
+        // Дакутэн и хандакутэн отдельными знаками равны предкомпонованным.
+        for (decomposed, composed) in [
+            ("か\u{3099}っこう", "がっこう"),
+            ("カ\u{3099}ッコウ", "がっこう"),
+            ("は\u{309A}ん", "ぱん"),
+            ("ハ\u{309A}ン", "ぱん"),
+            ("ウ\u{3099}ァイオリン", "ゔぁいおりん"),
+        ] {
+            assert_eq!(
+                reading_key(decomposed),
+                reading_key(composed),
+                "{decomposed}"
+            );
+        }
+        // Разные чтения остаются разными.
+        for (left, right) in [
+            ("はん", "ばん"),
+            ("ぱん", "ばん"),
+            ("は\u{3099}ん", "ぱん"),
+            ("かっこう", "がっこう"),
+            ("ゆうれい", "ゆれい"),
+        ] {
+            assert_ne!(reading_key(left), reading_key(right), "{left} / {right}");
+        }
     }
 
     #[test]

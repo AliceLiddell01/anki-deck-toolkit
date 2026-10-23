@@ -18,10 +18,16 @@
 //! сигналом завершает и процесс Windows; это подтверждается отдельно:
 //! исчезновением процесса с нашим alias из списка Windows и освобождением порта.
 //!
-//! Аренда (`leases/<nonce>.json`) переживает аварийное завершение CLI: следующий
+//! Аренда (`leases/<alias>.json`) переживает аварийное завершение CLI: следующий
 //! запуск находит прокси/процесс по PID, времени старта и alias в командной
 //! строке и останавливает его как собственный. Совпадение только PID не
-//! считается доказательством владения.
+//! считается доказательством владения. Сервер без надёжно записанной аренды
+//! не считается запущенным: процесс останавливается, запуск отклоняется.
+//!
+//! Процесс Windows ищется по собственному alias в командной строке, а не по
+//! имени исполняемого файла: настроенный бинарник может называться иначе, чем
+//! `llama-server.exe`. Завершается он только по PID, командная строка которого
+//! в момент завершения всё ещё содержит этот alias.
 
 use std::fs;
 use std::io::{self, Write};
@@ -46,9 +52,13 @@ use crate::inference_config::{LlamaBackend, LlamaModel, VisionMode};
 const OUTPUT_TAIL_BYTES: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const POWERSHELL: &str = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
-/// Фиксированный запрос списка процессов Windows: без подстановки данных.
-const WINDOWS_PROCESS_QUERY: &str = "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" | Select-Object ProcessId,CommandLine,WorkingSetSize | ConvertTo-Json -Compress";
 const WINDOWS_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Нижняя граница автовыбора порта: ниже — привилегированные и часто занятые порты.
+const AUTO_PORT_FLOOR: u16 = 10_000;
+/// Динамический диапазон портов Windows по умолчанию: при `windows_interop`
+/// его занимают исходящие соединения Windows.
+const WINDOWS_DYNAMIC_PORTS: (u16, u16) = (49_152, 65_535);
+const AUTO_PORT_ATTEMPTS: usize = 64;
 
 /// Аргументы и окружение запуска, вычисленные из профиля.
 #[derive(Debug, Clone)]
@@ -61,6 +71,8 @@ pub(crate) struct LaunchPlan {
     pub model_argument: String,
     pub projector_argument: Option<String>,
     pub model: LlamaModel,
+    /// Задача передаёт изображение: готовность требует подтверждённого vision.
+    pub require_vision: bool,
     pub startup_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub connect_timeout: Duration,
@@ -113,6 +125,7 @@ impl LaunchPlan {
             model_argument: argument(weights)?,
             projector_argument,
             model: model.clone(),
+            require_vision: true,
             startup_timeout: Duration::from_secs(backend.startup_timeout_seconds),
             shutdown_timeout: Duration::from_secs(backend.shutdown_timeout_seconds),
             connect_timeout: Duration::from_secs(backend.connect_timeout_seconds),
@@ -186,11 +199,52 @@ pub(crate) struct WindowsProcess {
     pub working_set_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Состояние аренды прежнего запуска.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct OrphanStop {
     pub pid: i32,
     pub alias: String,
+    pub port: u16,
+    pub windows_interop: bool,
+    /// Файл аренды: по нему владелец находит процесс при следующем запуске.
+    pub lease: String,
+    /// Аренда снята: собственный процесс остановлен или исчез.
     pub stopped: bool,
+    /// `stopped` — остановлен и исчез; `stale` — живого процесса нет;
+    /// `process_alive` — собственный процесс Linux ещё жив;
+    /// `windows_process_alive` — процесс Windows с нашим alias жив;
+    /// `windows_probe_failed` — проверить процесс Windows не удалось;
+    /// `invalid` — файл аренды не читается.
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub windows_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_error: Option<String>,
+}
+
+impl OrphanStop {
+    /// Человекочитаемое описание для сообщения об отказе запуска.
+    fn describe(&self) -> String {
+        let mut text = format!("{} (lease {})", self.alias, self.lease);
+        match self.state.as_str() {
+            "process_alive" => text.push_str(&format!(": процесс {} ещё жив", self.pid)),
+            "windows_process_alive" => {
+                text.push_str(": процесс Windows ещё жив");
+                if let Some(pid) = self.windows_pid {
+                    text.push_str(&format!(", PID Windows {pid}"));
+                }
+                if let Some(error) = &self.probe_error {
+                    text.push_str(&format!(" ({error})"));
+                }
+            }
+            "windows_probe_failed" => text.push_str(&format!(
+                ": проверить процесс Windows не удалось ({})",
+                self.probe_error.as_deref().unwrap_or("?")
+            )),
+            other => text.push_str(&format!(": {other}")),
+        }
+        text
+    }
 }
 
 /// Доказательства остановки собственного процесса.
@@ -319,47 +373,137 @@ fn group_alive(group: Pid) -> bool {
     .unwrap_or(true)
 }
 
-/// Останавливает осиротевшие собственные процессы прежних запусков.
-async fn stop_orphans(directory: &Path) -> Vec<OrphanStop> {
-    stop_orphans_with(
-        directory,
-        |alias| async move { windows_process(&alias).await },
-        Duration::from_secs(15),
-    )
-    .await
+/// Проверка и завершение процессов Windows; подменяется в тестах.
+pub(crate) trait WindowsProcesses {
+    /// Процесс Windows с данным alias в командной строке: `Ok(None)` — такого нет.
+    async fn find(&self, alias: &str) -> Result<Option<WindowsProcess>, String>;
+    /// Завершает процесс `pid`, только если его командная строка всё ещё содержит alias.
+    async fn terminate(&self, pid: u32, alias: &str) -> Result<(), String>;
 }
 
-/// Аренда удаляется только при доказанной остановке: для `windows_interop`
-/// исчезновение прокси WSL не доказывает исчезновения процесса Windows, поэтому
-/// он проверяется отдельно, как и при обычной остановке.
-async fn stop_orphans_with<F, Fut>(
+/// Процессы Windows через PowerShell WSL interop.
+pub(crate) struct PowerShell;
+
+impl WindowsProcesses for PowerShell {
+    async fn find(&self, alias: &str) -> Result<Option<WindowsProcess>, String> {
+        windows_process(alias).await
+    }
+
+    async fn terminate(&self, pid: u32, alias: &str) -> Result<(), String> {
+        terminate_windows_process(pid, alias).await
+    }
+}
+
+/// Ждёт исчезновения процесса Windows с alias; по истечении `grace` завершает
+/// его по PID (только пока командная строка содержит alias) и проверяет снова.
+async fn stop_windows_process<W: WindowsProcesses>(
+    windows: &W,
+    alias: &str,
+    grace: Duration,
+) -> Result<(), (Option<u32>, String)> {
+    let deadline = Instant::now() + grace;
+    let alive = loop {
+        match windows.find(alias).await {
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Ok(Some(process)) => break process,
+            Err(error) => return Err((None, error)),
+        }
+    };
+    if let Err(error) = windows.terminate(alive.pid, alias).await {
+        return Err((
+            Some(alive.pid),
+            format!("windows_terminate_failed: {error}"),
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match windows.find(alias).await {
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Ok(Some(process)) => {
+                return Err((Some(process.pid), "windows_process_alive".into()));
+            }
+            Err(error) => return Err((Some(alive.pid), error)),
+        }
+    }
+}
+
+/// Останавливает осиротевшие собственные процессы прежних запусков.
+async fn stop_orphans(directory: &Path) -> Vec<OrphanStop> {
+    orphans_with(directory, &PowerShell, Duration::from_secs(15), true).await
+}
+
+/// Состояние аренд прежних запусков; при `stop` — остановка их собственных
+/// процессов. Аренда удаляется только при доказанной остановке: для
+/// `windows_interop` исчезновение прокси WSL не доказывает исчезновения
+/// процесса Windows, поэтому он проверяется отдельно, как и при обычной
+/// остановке. Без `stop` сигналы не отправляются и файлы не меняются.
+async fn orphans_with<W: WindowsProcesses>(
     directory: &Path,
-    windows_probe: F,
+    windows: &W,
     windows_grace: Duration,
-) -> Vec<OrphanStop>
-where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = Result<Option<WindowsProcess>, String>>,
-{
+    stop: bool,
+) -> Vec<OrphanStop> {
     let leases = directory.join("leases");
     let Ok(entries) = fs::read_dir(&leases) else {
         return Vec::new();
     };
-    let mut stopped = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    paths.sort();
+    let mut reported = Vec::new();
+    for path in paths {
         let lease: Option<Lease> = fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         let Some(lease) = lease else {
-            let _ = fs::remove_file(&path);
+            if stop {
+                let _ = fs::remove_file(&path);
+            } else {
+                reported.push(OrphanStop {
+                    pid: 0,
+                    alias: String::new(),
+                    port: 0,
+                    windows_interop: false,
+                    lease: path.display().to_string(),
+                    stopped: false,
+                    state: "invalid".into(),
+                    windows_pid: None,
+                    probe_error: None,
+                });
+            }
             continue;
+        };
+        let mut orphan = OrphanStop {
+            pid: lease.pid,
+            alias: lease.alias.clone(),
+            port: lease.port,
+            windows_interop: lease.windows_interop,
+            lease: path.display().to_string(),
+            stopped: false,
+            state: "stale".into(),
+            windows_pid: None,
+            probe_error: None,
         };
         let owned = process_start_ticks(lease.pid) == Some(lease.start_ticks)
             && process_command_line(lease.pid)
                 .is_some_and(|argv| argv.iter().any(|argument| argument == &lease.alias));
-        let mut group_gone = true;
-        if owned && let Some(group) = Pid::from_raw(lease.pid) {
+        let mut group_gone = !owned;
+        if owned
+            && stop
+            && let Some(group) = Pid::from_raw(lease.pid)
+        {
             let _ = kill_process_group(group, Signal::TERM);
             let deadline = Instant::now() + Duration::from_secs(10);
             while group_alive(group) && Instant::now() < deadline {
@@ -371,40 +515,101 @@ where
             }
             group_gone = !group_alive(group);
         }
-        let windows_gone = if lease.windows_interop {
-            let deadline = Instant::now() + windows_grace;
-            loop {
-                match windows_probe(lease.alias.clone()).await {
-                    Ok(None) => break true,
-                    Ok(Some(_)) if Instant::now() < deadline => {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                    // Живой процесс или отказ проверки — остановка не доказана.
-                    Ok(Some(_)) | Err(_) => break false,
-                }
-            }
-        } else {
-            true
-        };
-        let gone = group_gone && windows_gone;
-        if gone {
-            let _ = fs::remove_file(&path);
+        if !group_gone {
+            orphan.state = "process_alive".into();
         }
-        if owned || !gone {
-            tracing::warn!(
-                stage = "inference_orphan",
-                pid = lease.pid,
-                stopped = gone,
-                "осиротевший llama-server прежнего запуска"
-            );
-            stopped.push(OrphanStop {
-                pid: lease.pid,
-                alias: lease.alias.clone(),
-                stopped: gone,
-            });
+        let mut windows_gone = true;
+        if lease.windows_interop && group_gone {
+            let result = if stop {
+                stop_windows_process(windows, &lease.alias, windows_grace).await
+            } else {
+                match windows.find(&lease.alias).await {
+                    Ok(None) => Ok(()),
+                    Ok(Some(process)) => Err((Some(process.pid), "windows_process_alive".into())),
+                    Err(error) => Err((None, error)),
+                }
+            };
+            if let Err((pid, error)) = result {
+                windows_gone = false;
+                orphan.windows_pid = pid;
+                // Известный PID — процесс жив, даже если завершить его не удалось.
+                orphan.state = if pid.is_some() {
+                    "windows_process_alive"
+                } else {
+                    "windows_probe_failed"
+                }
+                .into();
+                orphan.probe_error = (error != "windows_process_alive").then_some(error);
+            }
+        }
+        let gone = group_gone && windows_gone;
+        if gone && stop {
+            orphan.stopped = fs::remove_file(&path).is_ok();
+            if owned {
+                orphan.state = "stopped".into();
+            }
+        }
+        if !stop || owned || !gone {
+            if !gone {
+                tracing::warn!(
+                    stage = "inference_orphan",
+                    pid = lease.pid,
+                    state = orphan.state.as_str(),
+                    lease = orphan.lease.as_str(),
+                    "осиротевший llama-server прежнего запуска не остановлен; аренда сохранена"
+                );
+            }
+            reported.push(orphan);
         }
     }
-    stopped
+    reported
+}
+
+/// Отказ запуска из-за неостановленных сирот: живой процесс отличается от
+/// недоступной проверки, сообщение называет аренду и путь восстановления.
+fn orphan_failure(orphans: &[OrphanStop]) -> Option<InferenceFailure> {
+    let remaining: Vec<&OrphanStop> = orphans.iter().filter(|orphan| !orphan.stopped).collect();
+    if remaining.is_empty() {
+        return None;
+    }
+    let alive = remaining
+        .iter()
+        .any(|orphan| orphan.state != "windows_probe_failed");
+    let code = if alive {
+        "orphan_server_alive"
+    } else {
+        "orphan_server_unverified"
+    };
+    let described: Vec<String> = remaining.iter().map(|orphan| orphan.describe()).collect();
+    let mut failure = InferenceFailure::new(
+        code,
+        format!(
+            "осиротевший llama-server прежнего запуска не остановлен, аренда сохранена: {}. \
+             Новая модель не загружается, пока прежняя может занимать память. \
+             Восстановление: `inference orphans` показывает состояние, \
+             `inference orphans --stop` повторяет остановку собственного процесса; \
+             файл аренды вручную не удаляйте",
+            described.join("; ")
+        ),
+    );
+    failure.orphans = orphans.to_vec();
+    Some(failure)
+}
+
+/// Аренды прежних запусков под блокировкой менеджера: без `stop` — только
+/// состояние, со `stop` — остановка собственных процессов, как при запуске.
+pub(crate) async fn inspect_orphans(
+    stop: bool,
+) -> Result<(PathBuf, Vec<OrphanStop>), InferenceFailure> {
+    let directory = state_directory().ok_or_else(|| {
+        InferenceFailure::new(
+            "manager_state_unavailable",
+            "не найден домашний каталог для аренды процесса",
+        )
+    })?;
+    let _lock = ManagerLock::acquire(&directory)?;
+    let orphans = orphans_with(&directory, &PowerShell, Duration::from_secs(15), stop).await;
+    Ok((directory.join("leases"), orphans))
 }
 
 /// Порт свободен, если на нём никто не отвечает. Для нативного сервера порт
@@ -424,12 +629,58 @@ fn port_free(host: IpAddr, port: u16, timeout: Duration, windows_interop: bool) 
 fn linux_ephemeral_range() -> Option<(u16, u16)> {
     let text = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").ok()?;
     let mut parts = text.split_whitespace().map(str::parse::<u16>);
-    Some((parts.next()?.ok()?, parts.next()?.ok()?))
+    let (low, high) = (parts.next()?.ok()?, parts.next()?.ok()?);
+    (low <= high).then_some((low, high))
 }
 
-/// Автовыбор порта: случайный порт из 20000..=32767 вне эфемерного диапазона
-/// Linux, на котором никто не отвечает и который можно занять.
+/// Допустимые диапазоны автовыбора: от `AUTO_PORT_FLOOR` до конца, кроме
+/// эфемерного диапазона Linux и, при `windows_interop`, динамического
+/// диапазона Windows.
+fn auto_port_ranges(ephemeral: Option<(u16, u16)>, windows_interop: bool) -> Vec<(u16, u16)> {
+    let mut ranges = vec![(AUTO_PORT_FLOOR, u16::MAX)];
+    let excluded = ephemeral
+        .into_iter()
+        .chain(windows_interop.then_some(WINDOWS_DYNAMIC_PORTS));
+    for (low, high) in excluded {
+        ranges = ranges
+            .into_iter()
+            .flat_map(|(start, end)| {
+                if high < start || low > end {
+                    return vec![(start, end)];
+                }
+                let mut parts = Vec::new();
+                if start < low {
+                    parts.push((start, low - 1));
+                }
+                if end > high {
+                    parts.push((high + 1, end));
+                }
+                parts
+            })
+            .collect();
+    }
+    ranges
+}
+
+fn random_u32() -> Result<u32, InferenceFailure> {
+    let mut bytes = [0_u8; 4];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut file| io::Read::read_exact(&mut file, &mut bytes))
+        .map_err(|error| io_failure("random_unavailable", error))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+/// Автовыбор порта: случайный свободный порт из допустимых диапазонов. Если
+/// эфемерный диапазон Linux покрывает их целиком, нативный сервер получает
+/// порт, назначенный ядром; для процесса Windows такой порт недоступен.
 fn choose_port(plan: &LaunchPlan) -> Result<u16, InferenceFailure> {
+    choose_port_with(plan, linux_ephemeral_range())
+}
+
+fn choose_port_with(
+    plan: &LaunchPlan,
+    ephemeral: Option<(u16, u16)>,
+) -> Result<u16, InferenceFailure> {
     if plan.port != 0 {
         if !port_free(
             plan.host,
@@ -444,23 +695,48 @@ fn choose_port(plan: &LaunchPlan) -> Result<u16, InferenceFailure> {
         }
         return Ok(plan.port);
     }
-    let ephemeral = linux_ephemeral_range();
-    for _ in 0..32 {
-        let mut bytes = [0_u8; 2];
-        fs::File::open("/dev/urandom")
-            .and_then(|mut file| io::Read::read_exact(&mut file, &mut bytes))
-            .map_err(|error| io_failure("random_unavailable", error))?;
-        let port = 20_000 + u16::from_le_bytes(bytes) % 12_768;
-        if ephemeral.is_some_and(|(low, high)| (low..=high).contains(&port)) {
-            continue;
+    let ranges = auto_port_ranges(ephemeral, plan.windows_interop);
+    let total: u32 = ranges
+        .iter()
+        .map(|(low, high)| u32::from(*high) - u32::from(*low) + 1)
+        .sum();
+    if total > 0 {
+        for _ in 0..AUTO_PORT_ATTEMPTS {
+            let mut offset = random_u32()? % total;
+            let port = ranges
+                .iter()
+                .find_map(|(low, high)| {
+                    let size = u32::from(*high) - u32::from(*low) + 1;
+                    if offset < size {
+                        u16::try_from(u32::from(*low) + offset).ok()
+                    } else {
+                        offset -= size;
+                        None
+                    }
+                })
+                .expect("смещение меньше суммы размеров");
+            if port_free(plan.host, port, plan.connect_timeout, plan.windows_interop) {
+                return Ok(port);
+            }
         }
-        if port_free(plan.host, port, plan.connect_timeout, plan.windows_interop) {
-            return Ok(port);
-        }
+    }
+    if !plan.windows_interop
+        && let Ok(listener) = TcpListener::bind(SocketAddr::new(plan.host, 0))
+        && let Ok(address) = listener.local_addr()
+    {
+        return Ok(address.port());
     }
     Err(InferenceFailure::new(
         "port_unavailable",
-        "не удалось выбрать свободный loopback-порт",
+        format!(
+            "не удалось выбрать свободный loopback-порт: допустимые диапазоны {ranges:?} \
+             (эфемерный диапазон Linux {ephemeral:?}{}); задайте port явно",
+            if plan.windows_interop {
+                ", динамический диапазон Windows 49152-65535"
+            } else {
+                ""
+            }
+        ),
     ))
 }
 
@@ -605,14 +881,8 @@ impl ManagedServer {
         })?;
         let lock = ManagerLock::acquire(&directory)?;
         let orphans_stopped = stop_orphans(&directory).await;
-        if let Some(orphan) = orphans_stopped.iter().find(|orphan| !orphan.stopped) {
-            return Err(InferenceFailure::new(
-                "orphan_server_alive",
-                format!(
-                    "осиротевший llama-server {} прежнего запуска не остановлен; аренда сохранена",
-                    orphan.alias
-                ),
-            ));
+        if let Some(failure) = orphan_failure(&orphans_stopped) {
+            return Err(failure);
         }
         let metadata = fs::metadata(&plan.binary).map_err(|_| {
             InferenceFailure::new(
@@ -668,7 +938,6 @@ impl ManagedServer {
         if let Some(stderr) = child.stderr.take() {
             spawn_reader(stderr, output.clone());
         }
-        let lease = write_lease(&directory, pid, &alias, port, plan.windows_interop);
         let mut server = Self {
             child,
             group,
@@ -680,7 +949,7 @@ impl ManagedServer {
             windows_interop: plan.windows_interop,
             shutdown_timeout: plan.shutdown_timeout,
             output,
-            lease,
+            lease: None,
             _lock: lock,
             ready: ServerReady {
                 pid,
@@ -696,6 +965,21 @@ impl ManagedServer {
                 orphans_stopped,
             },
         };
+        // Без аренды аварийно брошенный сервер не нашёл бы следующий запуск:
+        // такой процесс не становится работающим managed-сервером.
+        match write_lease(&directory, pid, &server.alias, port, plan.windows_interop) {
+            Ok(path) => server.lease = Some(path),
+            Err(failure) => {
+                let report = server.stop().await;
+                tracing::warn!(
+                    stage = "inference_lease_failed",
+                    code = failure.code,
+                    stop_proven = report.proven(),
+                    "аренда llama-server не записана; процесс остановлен"
+                );
+                return Err(failure.with_stop(report));
+            }
+        }
         tracing::info!(
             stage = "inference_server_spawned",
             pid,
@@ -785,7 +1069,7 @@ impl ManagedServer {
                 ),
             ));
         }
-        if !props.vision {
+        if plan.require_vision && !props.vision {
             return Err(InferenceFailure::new(
                 "model_does_not_support_vision",
                 "сервер не подтвердил vision для загруженной модели",
@@ -797,7 +1081,7 @@ impl ManagedServer {
         self.ready.context_size = props.context_size;
         self.ready.ready_ms = started.elapsed().as_millis();
         if self.windows_interop {
-            self.ready.windows = windows_process(&self.alias).await.ok().flatten();
+            self.ready.windows = PowerShell.find(&self.alias).await.ok().flatten();
         }
         tracing::info!(
             stage = "inference_server_ready",
@@ -902,30 +1186,24 @@ impl ManagedServer {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         if self.windows_interop {
-            let gone_deadline = Instant::now() + Duration::from_secs(15);
-            loop {
-                match windows_process(&self.alias).await {
-                    Ok(None) => {
-                        report.windows_process_gone = Some(true);
-                        break;
-                    }
-                    Ok(Some(_)) if Instant::now() < gone_deadline => {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                    Ok(Some(process)) => {
+            match stop_windows_process(&PowerShell, &self.alias, Duration::from_secs(15)).await {
+                Ok(()) => report.windows_process_gone = Some(true),
+                Err((pid, error)) if error == "windows_process_alive" => {
+                    report.windows_process_gone = Some(false);
+                    report.problems.push(format!(
+                        "windows_process_alive:{}",
+                        pid.map_or_else(|| "?".to_owned(), |pid| pid.to_string())
+                    ));
+                }
+                Err((pid, error)) => {
+                    // Отказ проверки не выдаётся за доказанное исчезновение.
+                    if let Some(pid) = pid {
                         report.windows_process_gone = Some(false);
-                        report
-                            .problems
-                            .push(format!("windows_process_alive:{}", process.pid));
-                        break;
+                        report.problems.push(format!("windows_process_alive:{pid}"));
                     }
-                    Err(error) => {
-                        // Отказ проверки не выдаётся за доказанное исчезновение.
-                        report
-                            .problems
-                            .push(format!("windows_probe_failed: {error}"));
-                        break;
-                    }
+                    report
+                        .problems
+                        .push(format!("windows_probe_failed: {error}"));
                 }
             }
         }
@@ -962,10 +1240,16 @@ fn write_lease(
     alias: &str,
     port: u16,
     windows_interop: bool,
-) -> Option<PathBuf> {
-    let start_ticks = process_start_ticks(pid)?;
+) -> Result<PathBuf, InferenceFailure> {
+    let start_ticks = process_start_ticks(pid).ok_or_else(|| {
+        InferenceFailure::new(
+            "lease_write_failed",
+            format!("время старта процесса {pid} недоступно"),
+        )
+    })?;
+    let failed = |error: io::Error| io_failure("lease_write_failed", error);
     let leases = directory.join("leases");
-    fs::create_dir_all(&leases).ok()?;
+    fs::create_dir_all(&leases).map_err(failed)?;
     let path = leases.join(format!("{alias}.json"));
     let lease = Lease {
         pid,
@@ -975,13 +1259,22 @@ fn write_lease(
         windows_interop,
         created_unix_seconds: unix_seconds(),
     };
-    let bytes = serde_json::to_vec(&lease).ok()?;
+    let bytes = serde_json::to_vec(&lease)
+        .map_err(|error| InferenceFailure::new("lease_write_failed", error.to_string()))?;
     let temporary = leases.join(format!(".{alias}.tmp"));
-    let mut file = fs::File::create(&temporary).ok()?;
-    file.write_all(&bytes).ok()?;
-    file.sync_all().ok()?;
-    fs::rename(&temporary, &path).ok()?;
-    Some(path)
+    let written = fs::File::create(&temporary).and_then(|mut file| {
+        file.write_all(&bytes)?;
+        file.sync_all()
+    });
+    if let Err(error) = written.and_then(|()| fs::rename(&temporary, &path)) {
+        let _ = fs::remove_file(&temporary);
+        return Err(failed(error));
+    }
+    // Переименование доказано на диске только после синхронизации каталога.
+    fs::File::open(&leases)
+        .and_then(|directory| directory.sync_all())
+        .map_err(failed)?;
+    Ok(path)
 }
 
 /// Значение `--api-key` не попадает в свидетельства.
@@ -1056,20 +1349,25 @@ pub(crate) async fn server_props(
     })
 }
 
-/// Процесс Windows с данным alias в командной строке: `Ok(None)` — такого нет.
-pub(crate) async fn windows_process(alias: &str) -> Result<Option<WindowsProcess>, String> {
+/// Alias, созданный этим модулем: `anki-` и 32 шестнадцатеричные цифры. Только
+/// такое значение подставляется в запрос PowerShell.
+fn valid_alias(alias: &str) -> bool {
+    alias.strip_prefix("anki-").is_some_and(|token| {
+        token.len() == 32
+            && token
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+async fn powershell(script: &str) -> Result<String, String> {
     if !Path::new(POWERSHELL).is_file() {
         return Err("powershell_unavailable".into());
     }
     let output = tokio::time::timeout(
         WINDOWS_PROBE_TIMEOUT,
         Command::new(POWERSHELL)
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                WINDOWS_PROCESS_QUERY,
-            ])
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)
@@ -1081,8 +1379,26 @@ pub(crate) async fn windows_process(alias: &str) -> Result<Option<WindowsProcess
     if !output.status.success() {
         return Err(format!("windows_probe_exit:{}", output.status));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Процесс Windows с данным alias в командной строке: `Ok(None)` — такого нет.
+/// Поиск идёт по alias, а не по имени исполняемого файла; сам PowerShell,
+/// в чьей командной строке тоже есть alias, исключается по `$PID`.
+pub(crate) async fn windows_process(alias: &str) -> Result<Option<WindowsProcess>, String> {
+    if !valid_alias(alias) {
+        return Err("invalid_alias".into());
+    }
+    let text = powershell(&format!(
+        "Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%{alias}%' AND ProcessId <> $PID\" | Select-Object ProcessId,CommandLine,WorkingSetSize | ConvertTo-Json -Compress"
+    ))
+    .await?;
+    parse_windows_processes(&text, alias)
+}
+
+/// Разбор ответа PowerShell: процесс, в командной строке которого alias —
+/// отдельный аргумент.
+fn parse_windows_processes(text: &str, alias: &str) -> Result<Option<WindowsProcess>, String> {
     if text.is_empty() {
         return Ok(None);
     }
@@ -1106,6 +1422,29 @@ pub(crate) async fn windows_process(alias: &str) -> Result<Option<WindowsProcess
             })
     }))
 }
+
+/// Завершает процесс Windows `pid`, только если его командная строка в момент
+/// завершения содержит alias отдельным аргументом: чужой процесс с тем же PID
+/// не трогается.
+async fn terminate_windows_process(pid: u32, alias: &str) -> Result<(), String> {
+    if !valid_alias(alias) || pid == 0 {
+        return Err("invalid_alias".into());
+    }
+    let answer = powershell(&format!(
+        "$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; \
+         if ($null -eq $p) {{ 'absent' }} \
+         elseif (@(($p.CommandLine -split '\\s+') | ForEach-Object {{ $_.Trim('\"') }}) -contains '{alias}') \
+         {{ Stop-Process -Id {pid} -Force -ErrorAction Stop; 'stopped' }} \
+         else {{ 'foreign' }}"
+    ))
+    .await?;
+    match answer.as_str() {
+        "stopped" | "absent" => Ok(()),
+        "foreign" => Err("windows_process_not_owned".into()),
+        _ => Err("windows_terminate_unexpected_answer".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,73 +1483,254 @@ mod tests {
         assert_eq!(redacted[3], "<redacted>");
     }
 
-    #[tokio::test]
-    async fn foreign_process_with_reused_pid_is_not_treated_as_orphan() {
-        let directory = crate::temp_workspace::TempWorkspace::create("llama-lease").unwrap();
-        let leases = directory.path().join("leases");
+    /// Подменённый список процессов Windows: ответы по очереди, затем последний.
+    struct FakeWindows {
+        answers: Mutex<Vec<Result<Option<WindowsProcess>, String>>>,
+        terminate: Result<(), String>,
+        terminated: Mutex<Vec<(u32, String)>>,
+    }
+
+    impl FakeWindows {
+        fn new(answers: Vec<Result<Option<WindowsProcess>, String>>) -> Self {
+            Self {
+                answers: Mutex::new(answers),
+                terminate: Ok(()),
+                terminated: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WindowsProcesses for FakeWindows {
+        async fn find(&self, _alias: &str) -> Result<Option<WindowsProcess>, String> {
+            let mut answers = self.answers.lock().unwrap();
+            if answers.len() > 1 {
+                answers.remove(0)
+            } else {
+                answers[0].clone()
+            }
+        }
+
+        async fn terminate(&self, pid: u32, alias: &str) -> Result<(), String> {
+            self.terminated
+                .lock()
+                .unwrap()
+                .push((pid, alias.to_owned()));
+            self.terminate.clone()
+        }
+    }
+
+    fn alive(pid: u32) -> Result<Option<WindowsProcess>, String> {
+        Ok(Some(WindowsProcess {
+            pid,
+            working_set_bytes: None,
+        }))
+    }
+
+    fn write_test_lease(
+        directory: &Path,
+        name: &str,
+        alias: &str,
+        windows_interop: bool,
+    ) -> PathBuf {
+        let leases = directory.join("leases");
         fs::create_dir_all(&leases).unwrap();
         // PID текущего процесса жив, но время старта и alias не совпадают:
-        // сигнал ему отправлять нельзя.
+        // процесс Linux не считается собственным.
         let lease = Lease {
             pid: std::process::id() as i32,
             start_ticks: 1,
-            alias: "anki-foreign".into(),
+            alias: alias.into(),
             port: 1,
-            windows_interop: false,
+            windows_interop,
             created_unix_seconds: 0,
         };
-        fs::write(leases.join("x.json"), serde_json::to_vec(&lease).unwrap()).unwrap();
+        let path = leases.join(name);
+        fs::write(&path, serde_json::to_vec(&lease).unwrap()).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn foreign_process_with_reused_pid_is_not_treated_as_orphan() {
+        let directory = crate::temp_workspace::TempWorkspace::create("llama-lease").unwrap();
+        let path = write_test_lease(directory.path(), "x.json", "anki-foreign", false);
         assert!(stop_orphans(directory.path()).await.is_empty());
-        assert!(!leases.join("x.json").exists());
+        assert!(!path.exists());
     }
 
     #[tokio::test]
     async fn windows_lease_survives_until_the_windows_process_is_proven_gone() {
         let directory = crate::temp_workspace::TempWorkspace::create("llama-lease-win").unwrap();
-        let leases = directory.path().join("leases");
-        fs::create_dir_all(&leases).unwrap();
-        // Прокси WSL уже исчез (PID не наш), процесс Windows мог остаться.
-        let lease = Lease {
-            pid: std::process::id() as i32,
-            start_ticks: 1,
-            alias: "anki-windows".into(),
-            port: 1,
-            windows_interop: true,
-            created_unix_seconds: 0,
-        };
-        let path = leases.join("w.json");
-        fs::write(&path, serde_json::to_vec(&lease).unwrap()).unwrap();
-        let alive = || async {
-            Ok(Some(WindowsProcess {
-                pid: 7,
-                working_set_bytes: None,
-            }))
-        };
-        let orphans = stop_orphans_with(directory.path(), |_| alive(), Duration::ZERO).await;
+        let path = write_test_lease(directory.path(), "w.json", "anki-windows", true);
+
+        // Осмотр без --stop: ничего не завершается и не удаляется.
+        let windows = FakeWindows::new(vec![alive(7)]);
+        let inspected = orphans_with(directory.path(), &windows, Duration::ZERO, false).await;
+        assert_eq!(inspected[0].state, "windows_process_alive");
+        assert_eq!(inspected[0].windows_pid, Some(7));
+        assert!(windows.terminated.lock().unwrap().is_empty());
+        assert!(path.exists());
+
+        // Живой процесс с нашим alias завершается по PID; аренда снимается
+        // только после того, как повторная проверка его не нашла.
+        let windows = FakeWindows::new(vec![alive(7), Ok(None)]);
+        let orphans = orphans_with(directory.path(), &windows, Duration::ZERO, true).await;
+        assert_eq!(
+            *windows.terminated.lock().unwrap(),
+            vec![(7, "anki-windows".to_owned())]
+        );
+        assert_eq!(orphans.len(), 0, "процесс Linux не был собственным");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn unproven_windows_stop_keeps_the_lease_and_names_the_recovery() {
+        let directory = crate::temp_workspace::TempWorkspace::create("llama-lease-keep").unwrap();
+        let path = write_test_lease(directory.path(), "w.json", "anki-windows", true);
+
+        // Завершить не удалось: процесс жив, PID известен, аренда сохранена.
+        let mut windows = FakeWindows::new(vec![alive(7)]);
+        windows.terminate = Err("windows_process_not_owned".into());
+        let orphans = orphans_with(directory.path(), &windows, Duration::ZERO, true).await;
         assert_eq!(orphans.len(), 1);
         assert!(!orphans[0].stopped);
-        assert_eq!(orphans[0].alias, "anki-windows");
+        assert_eq!(orphans[0].state, "windows_process_alive");
+        assert_eq!(orphans[0].windows_pid, Some(7));
         assert!(path.exists(), "живой процесс Windows сохраняет аренду");
+        let failure = orphan_failure(&orphans).unwrap();
+        assert_eq!(failure.code, "orphan_server_alive");
+        assert!(failure.message.contains("PID Windows 7"));
+        assert!(failure.message.contains(&path.display().to_string()));
+        assert!(failure.message.contains("inference orphans --stop"));
+        assert_eq!(failure.orphans, orphans);
 
-        let failed = stop_orphans_with(
-            directory.path(),
-            |_| async { Err::<Option<WindowsProcess>, String>("powershell_unavailable".into()) },
-            Duration::ZERO,
-        )
-        .await;
-        assert!(!failed[0].stopped);
+        // Проверка недоступна: это не «процесс жив» и не «процесс исчез».
+        let windows = FakeWindows::new(vec![Err("powershell_unavailable".into())]);
+        let orphans = orphans_with(directory.path(), &windows, Duration::ZERO, true).await;
+        assert_eq!(orphans[0].state, "windows_probe_failed");
+        assert_eq!(orphans[0].windows_pid, None);
+        assert_eq!(
+            orphans[0].probe_error.as_deref(),
+            Some("powershell_unavailable")
+        );
+        assert!(windows.terminated.lock().unwrap().is_empty());
         assert!(path.exists(), "отказ проверки не доказывает исчезновение");
+        let failure = orphan_failure(&orphans).unwrap();
+        assert_eq!(failure.code, "orphan_server_unverified");
+        assert!(failure.message.contains("powershell_unavailable"));
 
-        let gone = stop_orphans_with(
-            directory.path(),
-            |alias| async move {
-                assert_eq!(alias, "anki-windows");
-                Ok(None)
-            },
-            Duration::ZERO,
-        )
-        .await;
-        assert!(gone.is_empty(), "устаревшая аренда снимается без сообщения");
+        // Процесс исчез: устаревшая аренда снимается без сообщения.
+        let windows = FakeWindows::new(vec![Ok(None)]);
+        let gone = orphans_with(directory.path(), &windows, Duration::ZERO, true).await;
+        assert!(gone.is_empty());
         assert!(!path.exists());
+        assert!(orphan_failure(&gone).is_none());
+    }
+
+    #[test]
+    fn windows_process_is_found_by_alias_not_by_executable_name() {
+        let alias = "anki-0123456789abcdef0123456789abcdef";
+        assert!(valid_alias(alias));
+        for invalid in [
+            "anki-windows",
+            "anki-0123",
+            "x' OR 1=1",
+            &format!("{alias}0"),
+        ] {
+            assert!(!valid_alias(invalid), "{invalid}");
+        }
+        // Переименованный бинарник с нашим alias — собственный процесс.
+        let text = format!(
+            r#"[{{"ProcessId":41,"CommandLine":"\"C:\\Tools\\my-llama.exe\" --model C:\\m.gguf --alias {alias}","WorkingSetSize":5}},
+               {{"ProcessId":42,"CommandLine":"powershell.exe -Command Get-CimInstance -Filter \"CommandLine LIKE '%{alias}%'\""}}]"#
+        );
+        assert_eq!(
+            parse_windows_processes(&text, alias).unwrap(),
+            Some(WindowsProcess {
+                pid: 41,
+                working_set_bytes: Some(5)
+            })
+        );
+        // Alias лишь как часть другого аргумента — не наш процесс.
+        let other =
+            format!(r#"{{"ProcessId":43,"CommandLine":"llama-server.exe --alias {alias}-other"}}"#);
+        assert_eq!(parse_windows_processes(&other, alias).unwrap(), None);
+        assert_eq!(parse_windows_processes("", alias).unwrap(), None);
+        assert!(parse_windows_processes("not json", alias).is_err());
+    }
+
+    fn plan(port: u16, windows_interop: bool) -> LaunchPlan {
+        let temp = crate::temp_workspace::TempWorkspace::create("llama-plan").unwrap();
+        let config =
+            crate::inference_config::LoadedConfig::load(&crate::inference_config::ConfigSources {
+                cli_values: vec![
+                    (
+                        "backends.llama.binary".into(),
+                        toml::Value::String("/bin/true".into()),
+                    ),
+                    (
+                        "models.kanji_vision.llama_server.model".into(),
+                        toml::Value::String(temp.path().join("m.gguf").display().to_string()),
+                    ),
+                    (
+                        "models.kanji_vision.llama_server.vision".into(),
+                        toml::Value::String("integrated".into()),
+                    ),
+                ],
+                skip_local_discovery: true,
+                ..crate::inference_config::ConfigSources::default()
+            })
+            .unwrap()
+            .resolve(crate::inference_config::TaskId::KanjiOcr)
+            .unwrap();
+        let (
+            crate::inference_config::ResolvedBackend::LlamaServer(backend),
+            crate::inference_config::ResolvedModel::LlamaServer(model),
+        ) = (&config.backend, &config.model)
+        else {
+            unreachable!()
+        };
+        let mut plan = LaunchPlan::new(backend, model).unwrap();
+        plan.port = port;
+        plan.windows_interop = windows_interop;
+        plan
+    }
+
+    #[test]
+    fn automatic_port_respects_the_actual_ephemeral_range() {
+        // Эфемерный диапазон, перекрывающий прежние 20000..32767 целиком.
+        let wide = Some((20_000, 60_999));
+        assert_eq!(
+            auto_port_ranges(wide, false),
+            vec![(10_000, 19_999), (61_000, 65_535)]
+        );
+        assert_eq!(auto_port_ranges(wide, true), vec![(10_000, 19_999)]);
+        assert_eq!(auto_port_ranges(None, false), vec![(10_000, 65_535)]);
+        for windows_interop in [false, true] {
+            for _ in 0..20 {
+                let port = choose_port_with(&plan(0, windows_interop), wide).unwrap();
+                assert!(!(20_000..=60_999).contains(&port), "{port}");
+                if windows_interop {
+                    assert!(port < 49_152, "{port}");
+                }
+            }
+        }
+        // Эфемерный диапазон покрывает всё: нативный сервер получает порт от
+        // ядра, процессу Windows подходящего порта нет.
+        let all = Some((1_024, 65_535));
+        assert!(auto_port_ranges(all, false).is_empty());
+        assert!(choose_port_with(&plan(0, false), all).unwrap() > 0);
+        assert_eq!(
+            choose_port_with(&plan(0, true), all).unwrap_err().code,
+            "port_unavailable"
+        );
+        // Явный занятый порт отклоняется, свободный принимается как есть.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = listener.local_addr().unwrap().port();
+        assert_eq!(
+            choose_port_with(&plan(busy, false), wide).unwrap_err().code,
+            "port_in_use"
+        );
+        drop(listener);
+        assert_eq!(choose_port_with(&plan(busy, false), wide).unwrap(), busy);
     }
 }

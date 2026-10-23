@@ -45,6 +45,7 @@ pub(crate) fn contract() -> ResponseContract {
             "required": ["observed"],
             "additionalProperties": false,
         }),
+        requires_image: true,
     }
 }
 
@@ -286,6 +287,10 @@ pub(crate) struct OcrScanReport {
     /// Остановка собственного сервера не доказана: команда завершается блокировкой.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stop_unproven: bool,
+    /// Идентичность модели не проверяема (внешний сервер сообщил лишь путь
+    /// или projector неизвестен): сохранённые результаты не переиспользуются.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cache_reuse_blocked: bool,
     #[serde(skip)]
     pub failures: Vec<(AssetIdentity, String)>,
 }
@@ -361,10 +366,11 @@ pub(crate) fn scan(
         report.inference = Some(finished);
     }
     match outcome {
-        Ok(true) => Err(AssetError::with_details(
-            ErrorCode::Interrupted,
+        Ok(true) => Err(crate::inference::interrupted_error(
             "OCR прерван сигналом; уже сохранённые предложения остаются в журнале",
-            json!({"saved": report.saved, "inference": report.inference}),
+            report.saved,
+            report.stop_unproven,
+            report.inference.as_ref(),
         )),
         Ok(false) => Ok(report),
         Err(error) => Err(crate::inference::with_session_evidence(
@@ -393,6 +399,8 @@ fn scan_targets(
         .ok_or_else(|| invalid("пакет исчез во время OCR"))?;
     let mut ledger = read_ledger(runtime)?;
     let config = OcrProvenance::Inference(provenance.clone());
+    let reusable = provenance.reusable();
+    report.cache_reuse_blocked = session.is_some() && !reusable;
     for (identity, generation, candidate) in targets {
         if session.as_mut().is_some_and(InferenceSession::interrupted) {
             return Ok(true);
@@ -403,6 +411,7 @@ fn scan_targets(
         let key = cache_key(&identity, &candidate.sha256, &config);
         if session.is_some()
             && !options.rescan
+            && reusable
             && let Some(saved) = ledger.records.get(&key).cloned()
         {
             if let Some(failure) = &saved.failure {
@@ -442,7 +451,7 @@ fn scan_targets(
                         suggestion.prepared_sha256 = Some(sha256_hex(&image.png));
                         runtime.release_lock()?;
                         report.chat_requests += 1;
-                        let result = executor.block_on(session.run(&image.png));
+                        let result = executor.block_on(session.run(Some(&image.png)));
                         runtime.reacquire_lock()?;
                         *state = runtime
                             .reload_cached()?
