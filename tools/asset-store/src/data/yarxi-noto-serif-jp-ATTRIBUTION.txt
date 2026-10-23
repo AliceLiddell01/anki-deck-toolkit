@@ -26,7 +26,8 @@ This repository does not redistribute the TTF. The generated catalog contains
 6,428 normalized 64x64 binary glyph masks for the Unicode characters also
 present in the pinned KanjiVG catalog. `build_yarxi_font_reference.rs` checks
 the source TTF hash before generating these masks with the locked `resvg`
-dependency and the shared `normalize_binary_mask` routine. It crops binary
+dependency (resvg 0.47.0; resvg 0.48.0 and later render the same TTF into a
+different catalog) and the shared `normalize_binary_mask` routine. It crops binary
 foreground bounds, aspect-fits within 56x56, centers the mask in a 64x64 canvas,
 and samples nearest-neighbor pixels from source-cell centers using
 `floor((2 * output_index + 1) * source_size / (2 * output_size))`.

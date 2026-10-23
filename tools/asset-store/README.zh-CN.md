@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 90d89556401bcdabd815f995ef5a55696860d633 -->
+<!-- i18n-source-git-blob: 641e14e227085d49c7e675fa595c42d1d920b5aa -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -478,6 +478,8 @@ ZIP 必需项：`summary.md`、`manifest.sha256`、`raw-evidence/events.jsonl`�
 主要参考字形库来自 KanjiVG 发布版 `r20250816`，提交 `bd13ffbcc9d85cb86ae98bbbf001d9069220b901`。按 Unicode 码点查找的 SVG 被规范化为 64×64 二值遮罩，包含 **6,430** 个字符，压缩于 `src/data/kanjivg-r20250816.maskdb.zlib`，SHA-256 为 `5581e65d5a681cdf8e441be04c1cea5f6ec61342ce8830ed083ba417d83a88ff`。KanjiVG 使用 CC BY-SA 3.0；版权归属、版本与原始档案 SHA-256 见 `src/data/kanjivg-ATTRIBUTION.txt`。
 
 深色方块另采用 Yarxi `.font-sample` 实际使用的 Noto Serif JP 字体。固定 TTF 的 SHA-256 是 `e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8`；由它生成 **6,428** 个规范遮罩，存于 `src/data/yarxi-noto-serif-jp-r1.maskdb.zlib`，SHA-256 `ea6231b13f23ed16705839b8c3e911f89fea67b91b6b315f3f562f75c7b0531c`。原始 TTF **未提交**仓库，来源及许可见 `src/data/yarxi-noto-serif-jp-ATTRIBUTION.txt`。
+
+参考库生成器仅在 `reference-generator` 功能中使用 `resvg`；生产验证器读取已嵌入的字形库，与 `resvg` 版本无关。KanjiVG 字形库在 `resvg 0.47.0` 和 `0.48.1` 上均可逐字节复现。Noto Serif JP 字形库只能在 `resvg 0.47.0` 上复现：自 `0.48.0` 起字体改由 `skrifa`/`harfrust` 处理，同一个固定 TTF 会生成不同的字形库。因此将生成器迁移到 `resvg 0.48+` 是验证器的语义迁移，而不是普通依赖升级：只有在用同一 TTF（校验 SHA-256）重新生成、逐一比较全部遮罩、重新校准阈值并发布新的验证器版本之后，新字形库才可被接受。没有原始 TTF 时不执行迁移，Renovate 将 `resvg` 限制在 `0.48.0` 以下。测试 `embedded_reference_catalogs_match_registered_identity_and_attribution` 将两个嵌入字形库的 SHA-256 与验证器版本及版权归属文件绑定，未同步更换验证器标识就替换字形库将无法通过检查。
 
 验证器先从图像四角估计背景，通过对比度决定极性，删除边缘相连的边框成分，并提取前景字形遮罩。参考库生成器和生产验证器共用 `kanji_mask::normalize_binary_mask`：裁剪到非空前景，缩放适配到 56×56，再居中放入 64×64。每个输出像素按照 `(2*i+1)*source_size/(2*output_size)` 选择原始网格中心最近的像素。因此 KanjiVG、Noto 和候选图都采用相同规范化算法。
 

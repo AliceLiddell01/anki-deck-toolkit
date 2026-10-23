@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 90d89556401bcdabd815f995ef5a55696860d633 -->
+<!-- i18n-source-git-blob: 641e14e227085d49c7e675fa595c42d1d920b5aa -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -478,6 +478,8 @@ Kanji validator and batch adapter limit images to **8 MiB**. Shared batch runtim
 The main reference catalog is based on KanjiVG release `r20250816`, commit `bd13ffbcc9d85cb86ae98bbbf001d9069220b901`. Unicode-codepoint SVGs are normalized into 64×64 binary masks; **6,430** characters are embedded in compressed `src/data/kanjivg-r20250816.maskdb.zlib`, SHA-256 `5581e65d5a681cdf8e441be04c1cea5f6ec61342ce8830ed083ba417d83a88ff`. KanjiVG uses CC BY-SA 3.0; attribution, release version and source-archive SHA-256 are in `src/data/kanjivg-ATTRIBUTION.txt`.
 
 Dark tiles also use Noto Serif JP—the font Yarxi actually uses in `.font-sample`. The pinned TTF has SHA-256 `e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8`; it generates **6,428** normalized masks in `src/data/yarxi-noto-serif-jp-r1.maskdb.zlib`, SHA-256 `ea6231b13f23ed16705839b8c3e911f89fea67b91b6b315f3f562f75c7b0531c`. The source TTF is **not** committed. Provenance and source license are in `src/data/yarxi-noto-serif-jp-ATTRIBUTION.txt`.
+
+Reference generators use `resvg` only behind the `reference-generator` feature; the runtime validator reads the embedded catalogs and does not depend on the `resvg` version. The KanjiVG catalog reproduces byte-for-byte on both `resvg 0.47.0` and `0.48.1`. The Noto Serif JP catalog reproduces only on `resvg 0.47.0`: since `0.48.0` fonts are handled by `skrifa`/`harfrust`, and the same pinned TTF yields a different catalog. Moving the generator to `resvg 0.48+` is therefore a semantic validator migration, not a dependency bump: a new catalog is acceptable only after regeneration from the same TTF with a SHA-256 check, a comparison of every mask, threshold recalibration and a new validator version. Without the source TTF the migration is not performed, and Renovate keeps `resvg` below `0.48.0`. The `embedded_reference_catalogs_match_registered_identity_and_attribution` test binds the SHA-256 of both embedded catalogs to the validator version and the attribution files, so replacing a catalog without a matching validator identity change fails the check.
 
 Validation estimates the background from image corners, determines contrast polarity, removes frame-connected components at the edge, and extracts the foreground glyph mask. Reference generators and runtime use the same `kanji_mask::normalize_binary_mask`: crop to nonempty foreground, fit inside 56×56, center in 64×64. Each destination pixel chooses the closest-to-center source-cell pixel using `(2*i+1)*source_size/(2*output_size)`. Thus KanjiVG, Noto and candidates share one normalization algorithm.
 

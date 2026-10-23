@@ -1548,4 +1548,58 @@ mod tests {
         assert_eq!(max_distance, f64::from(VERIFIED_MAX_DISTANCE));
         assert_eq!(minimum_margin, f64::from(VERIFIED_MIN_MARGIN));
     }
+
+    /// Возвращает значение строки, следующей за `label`, без учёта отступа и CRLF.
+    fn attribution_value_after<'a>(attribution: &'a str, label: &str) -> Option<&'a str> {
+        let mut lines = attribution.lines();
+        lines.find(|line| line.trim() == label)?;
+        lines.next().map(str::trim)
+    }
+
+    #[test]
+    fn embedded_reference_catalogs_match_registered_identity_and_attribution() {
+        // Замена встроенного каталога без согласованной смены версии валидатора
+        // выдала бы новые маски за прежнее автоматическое решение.
+        let kanjivg_sha256 = crate::hashing::sha256_hex(REFERENCE_DB);
+        let font_sha256 = crate::hashing::sha256_hex(YARXI_FONT_REFERENCE_DB);
+        assert!(
+            KANJIVG_REFERENCE_VERSION.ends_with(&format!("maskdb_sha256={kanjivg_sha256}")),
+            "KANJIVG_REFERENCE_VERSION не описывает встроенный каталог {kanjivg_sha256}"
+        );
+        assert!(
+            YARXI_FONT_REFERENCE_VERSION.ends_with(&format!("maskdb_sha256={font_sha256}")),
+            "YARXI_FONT_REFERENCE_VERSION не описывает встроенный каталог {font_sha256}"
+        );
+        for sha256 in [&kanjivg_sha256, &font_sha256] {
+            assert!(
+                VALIDATOR_VERSION.contains(&format!("-{}-", &sha256[..8])),
+                "версия валидатора {VALIDATOR_VERSION} не ссылается на каталог {sha256}"
+            );
+        }
+        for (attribution, sha256) in [
+            (
+                include_str!("data/kanjivg-ATTRIBUTION.txt"),
+                &kanjivg_sha256,
+            ),
+            (
+                include_str!("data/yarxi-noto-serif-jp-ATTRIBUTION.txt"),
+                &font_sha256,
+            ),
+        ] {
+            assert_eq!(
+                attribution_value_after(attribution, "Generated file SHA-256:"),
+                Some(sha256.as_str())
+            );
+        }
+
+        let kanjivg = load_reference_catalog().expect("встроенный каталог KanjiVG читается");
+        let font =
+            load_yarxi_font_reference_catalog().expect("встроенный каталог Noto Serif JP читается");
+        assert_eq!(kanjivg.len(), 6_430);
+        assert_eq!(font.len(), 6_428);
+        assert!(
+            font.keys().all(|character| kanjivg.contains_key(character)),
+            "генератор Noto Serif JP берёт символы только из каталога KanjiVG"
+        );
+    }
 }
