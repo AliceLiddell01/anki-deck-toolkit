@@ -26,12 +26,22 @@ use crate::validation::{SemanticValidator, ValidatorFailure};
 /// конечную границу для недоверенного входного потока.
 pub(crate) const PITCH_ACCENT_MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Допуск размеров PNG из-за округления границ нативной области снимка CDP.
-/// При DSF 3.0 он ограничивает расхождение одним CSS-пикселем.
-pub(crate) const PITCH_ACCENT_CAPTURE_PIXEL_ROUNDING_TOLERANCE: f64 = 3.0;
-
 /// Геометрический допуск для согласования DOM, области снимка и сохранённого свидетельства.
 pub(crate) const PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX: f64 = 0.25;
+
+/// Минимальное поле подлинного фона страницы вокруг отрисовки выбранного графика.
+/// Область снимка расширяется на это значение и наружу до целых CSS-пикселей,
+/// поэтому при DSF 3.0 каждое поле занимает от 9 до 11 физических пикселей.
+pub const PITCH_ACCENT_CAPTURE_PADDING_CSS_PX: f64 = 3.0;
+
+/// Верхняя граница числа вариантов графика у одной словарной записи.
+pub(crate) const PITCH_ACCENT_MAX_VARIANT_COUNT: usize = 32;
+
+/// Допуск сглаживания на границе отрисовки графика при проверке полей, в физических пикселях.
+const PITCH_ACCENT_PAINT_EDGE_ANTIALIAS_PX: i64 = 1;
+
+/// Доменная метка хеша, по которому выбирается вариант графика без приоритета источника.
+const PITCH_ACCENT_VARIANT_SELECTION_DOMAIN: &str = "anki-decks/jpdb-pitch-variant-selection/v1";
 
 /// Сравнивает чтение JPDB, считая хирагану и катакану эквивалентной записью.
 /// Остальные символы сравниваются буквально; написание не нормализуется.
@@ -50,21 +60,52 @@ pub fn jpdb_readings_equivalent(left: &str, right: &str) -> bool {
         .eq(right.chars().map(hiragana_equivalent))
 }
 
-pub(crate) fn capture_pixel_dimensions_match(
-    pixel_width: u32,
-    pixel_height: u32,
-    clip_width_css_px: f64,
-    clip_height_css_px: f64,
-    device_scale_factor: f64,
-) -> bool {
-    let expected_width = clip_width_css_px * device_scale_factor;
-    let expected_height = clip_height_css_px * device_scale_factor;
-    expected_width.is_finite()
-        && expected_height.is_finite()
-        && (f64::from(pixel_width) - expected_width).abs()
-            <= PITCH_ACCENT_CAPTURE_PIXEL_ROUNDING_TOLERANCE
-        && (f64::from(pixel_height) - expected_height).abs()
-            <= PITCH_ACCENT_CAPTURE_PIXEL_ROUNDING_TOLERANCE
+/// Область нативного снимка для отрисовки графика: поле `padding` с каждой стороны,
+/// расширенное наружу до целых CSS-пикселей. Целочисленные границы при целом DSF
+/// дают PNG точного размера без округления CDP.
+pub(crate) fn pitch_accent_capture_rect_for(
+    paint_rect: PitchAccentCaptureRect,
+    padding: f64,
+) -> PitchAccentCaptureRect {
+    let left = (paint_rect.x - padding).floor();
+    let top = (paint_rect.y - padding).floor();
+    let right = (paint_rect.x + paint_rect.width + padding).ceil();
+    let bottom = (paint_rect.y + paint_rect.height + padding).ceil();
+    PitchAccentCaptureRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    }
+}
+
+/// Оценка варианта для выбора без приоритета источника: SHA-256 от доменной метки,
+/// ID словарной записи и SHA-256 разметки графика. Оценка не зависит от порядка
+/// графиков на странице, запуска, параллельности или возобновления пакета.
+pub fn pitch_accent_variant_selection_score(vocabulary_id: u64, markup_sha256: &str) -> String {
+    sha256_hex(
+        format!("{PITCH_ACCENT_VARIANT_SELECTION_DOMAIN}\0{vocabulary_id}\0{markup_sha256}")
+            .as_bytes(),
+    )
+}
+
+/// Выбирает индекс варианта с наименьшей оценкой; при одинаковой разметке (и потому
+/// одинаковой оценке) — наименьший индекс DOM. `None` для пустого списка.
+pub fn select_pitch_accent_variant<'a>(
+    vocabulary_id: u64,
+    markup_sha256: impl IntoIterator<Item = &'a str>,
+) -> Option<usize> {
+    markup_sha256
+        .into_iter()
+        .enumerate()
+        .map(|(index, markup)| {
+            (
+                pitch_accent_variant_selection_score(vocabulary_id, markup),
+                index,
+            )
+        })
+        .min()
+        .map(|(_, index)| index)
 }
 
 /// Верхняя граница ширины и высоты PNG pitch-accent.
@@ -205,10 +246,55 @@ pub struct PitchAccentEvidence {
     pub source_url: String,
     /// Связанные пары написания и чтения, наблюдённые в словарной записи JPDB.
     pub resolved_forms: Vec<PitchAccentResolvedForm>,
-    /// Число отдельных графиков, обнаруженных на странице источника.
-    pub graph_count: u32,
+    /// Все варианты графика выбранной словарной записи и основание выбора одного из них.
+    pub variant_selection: PitchAccentVariantSelection,
     pub render: PitchAccentRenderEvidence,
     pub browser: BrowserRuntimeProvenance,
+}
+
+/// Основание выбора одного варианта графика внутри уже подтверждённой словарной записи.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PitchAccentVariantSelectionBasis {
+    /// JPDB не сообщает распространённость отдельных вариантов ударения: выбран вариант
+    /// с наименьшей оценкой `pitch_accent_variant_selection_score`.
+    SeededHashWithoutSourcePriority,
+}
+
+/// Обнаруженные варианты графика и выбранный для PNG вариант.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PitchAccentVariantSelection {
+    pub basis: PitchAccentVariantSelectionBasis,
+    /// Число вариантов графика, обнаруженных у словарной записи; в PNG входит один.
+    pub detected_variant_count: u32,
+    /// Индекс выбранного варианта в порядке DOM.
+    pub selected_index: u32,
+    /// Все обнаруженные варианты в порядке DOM.
+    pub variants: Vec<PitchAccentVariantEvidence>,
+}
+
+/// Один вариант графика на странице словарной записи.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PitchAccentVariantEvidence {
+    /// Нулевой индекс в порядке графиков страницы.
+    pub index: u32,
+    /// CSS-селектор конкретного узла графика.
+    pub selector: String,
+    /// Наблюдаемый текст графика без пробелов.
+    pub text: String,
+    /// SHA-256 сериализованной разметки узла графика (`outerHTML`).
+    pub markup_sha256: String,
+    /// Оценка выбора, вычисленная из ID записи и `markup_sha256`.
+    pub selection_score: String,
+    /// Прямоугольник узла графика относительно области просмотра.
+    pub viewport_rect: PitchAccentCaptureRect,
+    /// Прямоугольник узла графика относительно начала документа.
+    pub document_rect: PitchAccentCaptureRect,
+    /// Объединение прямоугольников узла и всех его потомков в координатах документа:
+    /// сегменты графика JPDB с отрицательным полем выходят за прямоугольник узла.
+    pub paint_rect: PitchAccentCaptureRect,
 }
 
 /// Источник получения изображения для этого домена.
@@ -226,20 +312,6 @@ pub enum PitchAccentRenderKind {
     SvgElementScreenshot,
     CanvasElementScreenshot,
     BrowserRegionScreenshot,
-}
-
-/// Один узел графика на странице словарной записи, попавший в снимок браузера.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PitchAccentGraphEvidence {
-    /// Нулевой индекс в порядке графиков страницы.
-    pub index: u32,
-    /// CSS-селектор конкретного узла графика.
-    pub selector: String,
-    /// Прямоугольник узла графика относительно области просмотра.
-    pub viewport_rect: PitchAccentCaptureRect,
-    /// Прямоугольник узла графика относительно начала документа.
-    pub document_rect: PitchAccentCaptureRect,
 }
 
 /// Состояние документа и цветовая схема браузера, наблюдённые перед снимком.
@@ -283,11 +355,11 @@ pub enum PitchAccentCoordinateSpace {
 #[serde(deny_unknown_fields)]
 pub struct PitchAccentRenderEvidence {
     pub kind: PitchAccentRenderKind,
-    /// Селектор общей области, снятой одним снимком браузера.
+    /// Селектор выбранного узла графика, снятого нативным снимком.
     pub selector: String,
-    /// Наблюдённые узлы графиков, попавшие в снимок, в порядке DOM.
-    pub graphs: Vec<PitchAccentGraphEvidence>,
-    /// Система координат объединения графиков и итоговой области снимка.
+    /// Число графиков в PNG; допустимо только значение 1.
+    pub captured_graph_count: u32,
+    /// Система координат прямоугольников вариантов и итоговой области снимка.
     pub coordinate_space: PitchAccentCoordinateSpace,
     pub viewport_width: u32,
     pub viewport_height: u32,
@@ -302,9 +374,9 @@ pub struct PitchAccentRenderEvidence {
     /// `visualViewport.scale`; значение должно быть ровно 1.0.
     pub page_scale_factor: f64,
     pub dark_theme: PitchAccentDarkThemeProof,
-    /// Объединение фактических прямоугольников узлов графиков в координатах документа.
-    pub graph_union_rect: PitchAccentCaptureRect,
-    /// Итоговая область в координатах документа, переданная браузеру для снимка.
+    /// Минимальное поле вокруг `paint_rect` выбранного варианта в CSS-пикселях.
+    pub padding_css_px: f64,
+    /// Итоговая расширенная область в координатах документа, переданная в CDP `clip`.
     pub capture_rect: PitchAccentCaptureRect,
 }
 
@@ -318,7 +390,7 @@ pub struct PitchAccentImageValidator;
 
 impl PitchAccentImageValidator {
     pub const VALIDATOR_ID: &'static str = "jpdb-pitch-accent-render";
-    pub const VALIDATOR_VERSION: &'static str = "5";
+    pub const VALIDATOR_VERSION: &'static str = "6";
     pub const REQUIRED_DEVICE_SCALE_FACTOR: f64 = 3.0;
 
     /// Устойчивый идентификатор валидатора для манифеста и проверок потребителя.
@@ -486,34 +558,30 @@ fn validate_evidence(
             "пара написания и чтения из маршрута JPDB отсутствует среди разрешённых форм".into(),
         ));
     }
-    if evidence.graph_count == 0 {
-        return Err(EvidenceFailure::Incomplete(
-            "подтверждение источника не содержит графиков акцента".into(),
-        ));
-    }
+    let selected = validate_variant_selection(metadata.jpdb_vocabulary_id, evidence)?;
 
     let render = &evidence.render;
     if render.kind != PitchAccentRenderKind::BrowserRegionScreenshot {
         return Err(EvidenceFailure::Incomplete(
-            "все графики pitch accent должны входить в один нативный снимок области браузера"
+            "выбранный график pitch accent должен быть получен нативным снимком области браузера"
                 .into(),
         ));
     }
-    if render.selector.trim().is_empty() || render.selector.chars().any(char::is_control) {
-        return Err(EvidenceFailure::Incomplete(
-            "селектор render отсутствует или содержит управляющие символы".into(),
+    if render.captured_graph_count != 1 {
+        return Err(EvidenceFailure::Contradiction(format!(
+            "PNG должен содержать ровно один график, в свидетельствах указано {}",
+            render.captured_graph_count
+        )));
+    }
+    if render.selector != selected.selector {
+        return Err(EvidenceFailure::Contradiction(
+            "селектор снимка не совпадает с селектором выбранного варианта графика".into(),
         ));
     }
-    if render.graphs.len() != evidence.graph_count as usize
-        || render.graphs.iter().enumerate().any(|(index, graph)| {
-            graph.index != index as u32
-                || graph.selector.trim().is_empty()
-                || graph.selector.chars().any(char::is_control)
-        })
-    {
-        return Err(EvidenceFailure::Contradiction(
-            "список CSS-селекторов графиков не соответствует `graph_count` и порядку DOM".into(),
-        ));
+    if render.padding_css_px != PITCH_ACCENT_CAPTURE_PADDING_CSS_PX {
+        return Err(EvidenceFailure::Incomplete(format!(
+            "поле снимка должно составлять ровно {PITCH_ACCENT_CAPTURE_PADDING_CSS_PX} CSS px"
+        )));
     }
     if render.viewport_width == 0
         || render.viewport_height == 0
@@ -541,9 +609,10 @@ fn validate_evidence(
             "масштаб страницы должен быть ровно 1.0".into(),
         ));
     }
-    validate_capture_geometry(render)?;
+    validate_capture_geometry(render, &evidence.variant_selection)?;
     validate_dark_theme(&render.dark_theme)?;
     validate_capture_background(&render.dark_theme, image)?;
+    validate_capture_margins(render, selected.paint_rect, image)?;
 
     let browser = &evidence.browser;
     if [
@@ -612,8 +681,71 @@ fn validate_dark_theme(proof: &PitchAccentDarkThemeProof) -> Result<(), Evidence
     Ok(())
 }
 
+/// Проверяет перечень вариантов и воспроизводит выбор по сохранённым данным.
+/// Возвращает выбранный вариант.
+fn validate_variant_selection(
+    vocabulary_id: u64,
+    evidence: &PitchAccentEvidence,
+) -> Result<&PitchAccentVariantEvidence, EvidenceFailure> {
+    let selection = &evidence.variant_selection;
+    if selection.variants.is_empty() || selection.detected_variant_count == 0 {
+        return Err(EvidenceFailure::Incomplete(
+            "подтверждение источника не содержит вариантов графика".into(),
+        ));
+    }
+    if selection.variants.len() != selection.detected_variant_count as usize
+        || selection.variants.len() > PITCH_ACCENT_MAX_VARIANT_COUNT
+    {
+        return Err(EvidenceFailure::Contradiction(
+            "число обнаруженных вариантов не совпадает со списком вариантов или превышает предел"
+                .into(),
+        ));
+    }
+    let mut selectors = std::collections::BTreeSet::new();
+    for (index, variant) in selection.variants.iter().enumerate() {
+        if variant.index != index as u32
+            || variant.selector.trim().is_empty()
+            || variant.selector.chars().any(char::is_control)
+            || !selectors.insert(variant.selector.as_str())
+            || variant.text.trim().is_empty()
+            || variant.text.chars().any(char::is_control)
+            || !is_sha256_hex(&variant.markup_sha256)
+        {
+            return Err(EvidenceFailure::Contradiction(
+                "вариант графика имеет неверный индекс DOM, селектор, текст или SHA-256 разметки"
+                    .into(),
+            ));
+        }
+        if variant.selection_score
+            != pitch_accent_variant_selection_score(vocabulary_id, &variant.markup_sha256)
+        {
+            return Err(EvidenceFailure::Contradiction(
+                "оценка выбора варианта не соответствует ID записи и разметке графика".into(),
+            ));
+        }
+    }
+    match selection.basis {
+        PitchAccentVariantSelectionBasis::SeededHashWithoutSourcePriority => {}
+    }
+    let expected = select_pitch_accent_variant(
+        vocabulary_id,
+        selection
+            .variants
+            .iter()
+            .map(|variant| variant.markup_sha256.as_str()),
+    );
+    if expected != Some(selection.selected_index as usize) {
+        return Err(EvidenceFailure::Contradiction(
+            "выбранный вариант не совпадает с воспроизводимым выбором по сохранённым вариантам"
+                .into(),
+        ));
+    }
+    Ok(&selection.variants[selection.selected_index as usize])
+}
+
 pub(crate) fn validate_capture_geometry(
     render: &PitchAccentRenderEvidence,
+    selection: &PitchAccentVariantSelection,
 ) -> Result<(), EvidenceFailure> {
     if render.coordinate_space != PitchAccentCoordinateSpace::Document {
         return Err(EvidenceFailure::Incomplete(
@@ -631,99 +763,130 @@ pub(crate) fn validate_capture_geometry(
             "значения прокрутки документа должны быть конечными и неотрицательными".into(),
         ));
     }
-    if render.graphs.is_empty() {
+    let Some(selected) = selection.variants.get(selection.selected_index as usize) else {
         return Err(EvidenceFailure::Incomplete(
-            "свидетельства захвата не содержат прямоугольников графиков".into(),
+            "свидетельства захвата не содержат выбранного варианта графика".into(),
         ));
-    }
+    };
 
     let geometry_tolerance = PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX;
-    let mut left = f64::INFINITY;
-    let mut top = f64::INFINITY;
-    let mut right = f64::NEG_INFINITY;
-    let mut bottom = f64::NEG_INFINITY;
-    for graph in &render.graphs {
-        validate_positive_rect(graph.viewport_rect, "график в области просмотра")?;
-        validate_positive_rect(graph.document_rect, "график в координатах документа")?;
-        if graph.viewport_rect.x < -geometry_tolerance
-            || graph.viewport_rect.y < -geometry_tolerance
-            || graph.viewport_rect.x + graph.viewport_rect.width
+    let document_width = f64::from(render.document_width);
+    let document_height = f64::from(render.document_height);
+    for variant in &selection.variants {
+        validate_positive_rect(variant.viewport_rect, "график в области просмотра")?;
+        validate_positive_rect(variant.document_rect, "график в координатах документа")?;
+        validate_positive_rect(variant.paint_rect, "отрисовка графика")?;
+        if variant.viewport_rect.x < -geometry_tolerance
+            || variant.viewport_rect.y < -geometry_tolerance
+            || variant.viewport_rect.x + variant.viewport_rect.width
                 > f64::from(render.viewport_width) + geometry_tolerance
-            || graph.viewport_rect.y + graph.viewport_rect.height
+            || variant.viewport_rect.y + variant.viewport_rect.height
                 > f64::from(render.viewport_height) + geometry_tolerance
         {
             return Err(EvidenceFailure::Contradiction(
                 "прямоугольник графика выходит за границы области просмотра".into(),
             ));
         }
-        if (graph.document_rect.x - (graph.viewport_rect.x + render.scroll_x)).abs()
+        if (variant.document_rect.x - (variant.viewport_rect.x + render.scroll_x)).abs()
             > geometry_tolerance
-            || (graph.document_rect.y - (graph.viewport_rect.y + render.scroll_y)).abs()
+            || (variant.document_rect.y - (variant.viewport_rect.y + render.scroll_y)).abs()
                 > geometry_tolerance
-            || (graph.document_rect.width - graph.viewport_rect.width).abs() > geometry_tolerance
-            || (graph.document_rect.height - graph.viewport_rect.height).abs() > geometry_tolerance
-            || graph.document_rect.x < -geometry_tolerance
-            || graph.document_rect.y < -geometry_tolerance
-            || graph.document_rect.x + graph.document_rect.width
-                > f64::from(render.document_width) + geometry_tolerance
-            || graph.document_rect.y + graph.document_rect.height
-                > f64::from(render.document_height) + geometry_tolerance
+            || (variant.document_rect.width - variant.viewport_rect.width).abs()
+                > geometry_tolerance
+            || (variant.document_rect.height - variant.viewport_rect.height).abs()
+                > geometry_tolerance
+            || !rect_within(variant.document_rect, document_width, document_height)
         {
             return Err(EvidenceFailure::Contradiction(
                 "прямоугольник графика в документе не соответствует области просмотра и прокрутке"
                     .into(),
             ));
         }
-        left = left.min(graph.document_rect.x);
-        top = top.min(graph.document_rect.y);
-        right = right.max(graph.document_rect.x + graph.document_rect.width);
-        bottom = bottom.max(graph.document_rect.y + graph.document_rect.height);
-    }
-
-    let expected_union = PitchAccentCaptureRect {
-        x: left,
-        y: top,
-        width: right - left,
-        height: bottom - top,
-    };
-    validate_positive_rect(render.graph_union_rect, "объединение графиков")?;
-    if !rects_match(render.graph_union_rect, expected_union, geometry_tolerance) {
-        return Err(EvidenceFailure::Contradiction(
-            "объединение не соответствует прямоугольникам графиков в координатах документа".into(),
-        ));
+        if !rect_contains(
+            variant.paint_rect,
+            variant.document_rect,
+            geometry_tolerance,
+        ) || !rect_within(variant.paint_rect, document_width, document_height)
+        {
+            return Err(EvidenceFailure::Contradiction(
+                "область отрисовки графика не охватывает его узел или выходит за пределы документа"
+                    .into(),
+            ));
+        }
     }
 
     let rect = render.capture_rect;
     validate_positive_rect(rect, "снимок")?;
+    let expected = pitch_accent_capture_rect_for(selected.paint_rect, render.padding_css_px);
+    if rect != expected {
+        return Err(EvidenceFailure::Contradiction(
+            "область снимка должна совпадать с отрисовкой выбранного графика, расширенной на поле до целых CSS-пикселей".into(),
+        ));
+    }
     if rect.x < 0.0
         || rect.y < 0.0
-        || rect.x + rect.width > f64::from(render.document_width)
-        || rect.y + rect.height > f64::from(render.document_height)
+        || rect.x + rect.width > document_width
+        || rect.y + rect.height > document_height
     {
         return Err(EvidenceFailure::Contradiction(
-            "область снимка выходит за пределы страницы документа".into(),
+            "область снимка с полями выходит за пределы страницы документа".into(),
+        ));
+    }
+    if selection
+        .variants
+        .iter()
+        .filter(|variant| variant.index != selected.index)
+        .any(|variant| rects_intersect(rect, variant.paint_rect))
+    {
+        return Err(EvidenceFailure::Contradiction(
+            "область снимка с полями захватывает отрисовку соседнего варианта графика".into(),
         ));
     }
 
-    if !rects_match(rect, expected_union, geometry_tolerance) {
+    let expected_width = rect.width * render.device_scale_factor;
+    let expected_height = rect.height * render.device_scale_factor;
+    if f64::from(render.pixel_width) != expected_width
+        || f64::from(render.pixel_height) != expected_height
+    {
         return Err(EvidenceFailure::Contradiction(
-            "область снимка должна точно совпадать с объединением прямоугольников графиков".into(),
-        ));
-    }
-
-    if !capture_pixel_dimensions_match(
-        render.pixel_width,
-        render.pixel_height,
-        rect.width,
-        rect.height,
-        render.device_scale_factor,
-    ) {
-        return Err(EvidenceFailure::Contradiction(
-            "размеры PNG не соответствуют области снимка в CSS-пикселях и масштабу устройства"
+            "размеры PNG не равны области снимка в CSS-пикселях, умноженной на масштаб устройства"
                 .into(),
         ));
     }
     Ok(())
+}
+
+fn rect_within(rect: PitchAccentCaptureRect, width: f64, height: f64) -> bool {
+    let tolerance = PITCH_ACCENT_CAPTURE_GEOMETRY_TOLERANCE_CSS_PX;
+    rect.x >= -tolerance
+        && rect.y >= -tolerance
+        && rect.x + rect.width <= width + tolerance
+        && rect.y + rect.height <= height + tolerance
+}
+
+fn rect_contains(
+    outer: PitchAccentCaptureRect,
+    inner: PitchAccentCaptureRect,
+    tolerance: f64,
+) -> bool {
+    outer.x <= inner.x + tolerance
+        && outer.y <= inner.y + tolerance
+        && outer.x + outer.width >= inner.x + inner.width - tolerance
+        && outer.y + outer.height >= inner.y + inner.height - tolerance
+}
+
+fn rects_intersect(left: PitchAccentCaptureRect, right: PitchAccentCaptureRect) -> bool {
+    left.x < right.x + right.width
+        && right.x < left.x + left.width
+        && left.y < right.y + right.height
+        && right.y < left.y + left.height
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_positive_rect(
@@ -741,17 +904,6 @@ fn validate_positive_rect(
         )));
     }
     Ok(())
-}
-
-fn rects_match(
-    actual: PitchAccentCaptureRect,
-    expected: PitchAccentCaptureRect,
-    tolerance: f64,
-) -> bool {
-    (actual.x - expected.x).abs() <= tolerance
-        && (actual.y - expected.y).abs() <= tolerance
-        && (actual.width - expected.width).abs() <= tolerance
-        && (actual.height - expected.height).abs() <= tolerance
 }
 
 pub(crate) fn validate_capture_background(
@@ -805,6 +957,57 @@ pub(crate) fn validate_capture_background(
     Ok(())
 }
 
+/// Проверяет по фактическим пикселям, что всё вне отрисовки выбранного графика —
+/// наблюдённый фон. Так доказывается, что поля не пусты от чужого содержимого
+/// (соседних вариантов, кнопок, подписей), а линии и символы графика не касаются
+/// краёв PNG и потому не обрезаны областью снимка.
+pub(crate) fn validate_capture_margins(
+    render: &PitchAccentRenderEvidence,
+    paint_rect: PitchAccentCaptureRect,
+    image: &image::DynamicImage,
+) -> Result<(), EvidenceFailure> {
+    let scale = render.device_scale_factor;
+    let capture = render.capture_rect;
+    let to_pixels = |value: f64| value * scale;
+    let inner_left =
+        to_pixels(paint_rect.x - capture.x).floor() as i64 - PITCH_ACCENT_PAINT_EDGE_ANTIALIAS_PX;
+    let inner_top =
+        to_pixels(paint_rect.y - capture.y).floor() as i64 - PITCH_ACCENT_PAINT_EDGE_ANTIALIAS_PX;
+    let inner_right = to_pixels(paint_rect.x + paint_rect.width - capture.x).ceil() as i64
+        + PITCH_ACCENT_PAINT_EDGE_ANTIALIAS_PX;
+    let inner_bottom = to_pixels(paint_rect.y + paint_rect.height - capture.y).ceil() as i64
+        + PITCH_ACCENT_PAINT_EDGE_ANTIALIAS_PX;
+    let (width, height) = image.dimensions();
+    if inner_left < 1
+        || inner_top < 1
+        || inner_right >= i64::from(width)
+        || inner_bottom >= i64::from(height)
+    {
+        return Err(EvidenceFailure::Contradiction(
+            "в PNG нет свободного поля фона с каждой стороны отрисовки графика".into(),
+        ));
+    }
+    for (x, y, pixel) in image.pixels() {
+        let (x, y) = (i64::from(x), i64::from(y));
+        if (inner_left..inner_right).contains(&x) && (inner_top..inner_bottom).contains(&y) {
+            continue;
+        }
+        let matches_background = pixel.0[3] == 255
+            && pixel.0[..3]
+                .iter()
+                .zip(render.dark_theme.background_rgb)
+                .all(|(actual, expected)| {
+                    actual.abs_diff(expected) <= PITCH_ACCENT_BACKGROUND_RGB_TOLERANCE
+                });
+        if !matches_background {
+            return Err(EvidenceFailure::Contradiction(format!(
+                "поле PNG вне отрисовки выбранного графика содержит не фон в пикселе ({x}, {y})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn relative_luminance(rgb: [u8; 3]) -> f64 {
     let linear = rgb.map(|channel| {
         let value = f64::from(channel) / 255.0;
@@ -839,6 +1042,53 @@ pub(crate) enum JpdbVocabularyRouteError {
 pub(crate) fn parse_jpdb_vocabulary_route(
     value: &str,
 ) -> Result<JpdbVocabularyRoute, JpdbVocabularyRouteError> {
+    let (vocabulary_id, segments) = parse_jpdb_vocabulary_path(value)?;
+    let surface = segments[0].clone();
+    let reading = segments.get(1).cloned();
+    if surface.eq_ignore_ascii_case("used-in")
+        || reading
+            .as_ref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("used-in"))
+    {
+        return Err(JpdbVocabularyRouteError::Path);
+    }
+    Ok(JpdbVocabularyRoute {
+        vocabulary_id,
+        surface,
+        reading,
+    })
+}
+
+/// ID и написание из ссылки `Used in` строки JPDB.
+///
+/// Ссылка ведёт на список употреблений, а не на словарную запись, поэтому
+/// маршрутом карточки не является; она лишь свидетельствует, к какой записи
+/// относится строка поиска.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JpdbUsedInRoute {
+    pub(crate) vocabulary_id: u64,
+    pub(crate) surface: String,
+}
+
+/// Разбирает только точный путь `/vocabulary/<id>/<surface>/used-in` на `jpdb.io`.
+pub(crate) fn parse_jpdb_used_in_route(
+    value: &str,
+) -> Result<JpdbUsedInRoute, JpdbVocabularyRouteError> {
+    let (vocabulary_id, segments) = parse_jpdb_vocabulary_path(value)?;
+    if segments.len() != 2
+        || segments[1] != "used-in"
+        || segments[0].eq_ignore_ascii_case("used-in")
+    {
+        return Err(JpdbVocabularyRouteError::Path);
+    }
+    Ok(JpdbUsedInRoute {
+        vocabulary_id,
+        surface: segments[0].clone(),
+    })
+}
+
+/// Общая часть разбора: origin, `vocabulary`, ID и декодированные сегменты после ID.
+fn parse_jpdb_vocabulary_path(value: &str) -> Result<(u64, Vec<String>), JpdbVocabularyRouteError> {
     let url = Url::parse(value).map_err(|_| JpdbVocabularyRouteError::Url)?;
     if url.scheme() != "https"
         || !url.username().is_empty()
@@ -871,27 +1121,14 @@ pub(crate) fn parse_jpdb_vocabulary_route(
         .ok()
         .filter(|id| *id > 0 && id.to_string() == encoded_segments[1])
         .ok_or(JpdbVocabularyRouteError::VocabularyId)?;
-    let surface = decode_path_segment(encoded_segments[2])?;
-    let reading = encoded_segments
-        .get(3)
+    let segments = encoded_segments[2..]
+        .iter()
         .map(|segment| decode_path_segment(segment))
-        .transpose()?;
-    if surface.trim().is_empty()
-        || reading
-            .as_ref()
-            .is_some_and(|value| value.trim().is_empty())
-        || surface.eq_ignore_ascii_case("used-in")
-        || reading
-            .as_ref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("used-in"))
-    {
+        .collect::<Result<Vec<_>, _>>()?;
+    if segments.iter().any(|segment| segment.trim().is_empty()) {
         return Err(JpdbVocabularyRouteError::Path);
     }
-    Ok(JpdbVocabularyRoute {
-        vocabulary_id,
-        surface,
-        reading,
-    })
+    Ok((vocabulary_id, segments))
 }
 
 fn decode_path_segment(segment: &str) -> Result<String, JpdbVocabularyRouteError> {
@@ -983,11 +1220,166 @@ fn decision(
     )
 }
 
+/// Согласованные фикстуры одного варианта для тестов пакетов, CLI и отчёта.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
+    use std::io::Cursor;
+
     use super::*;
 
-    fn valid_metadata(surface: &str) -> PitchAccentDomainMetadata {
+    /// Отрисовка 20×10 CSS px в точке (100, 200) документа при прокрутке 100 CSS px;
+    /// область снимка с полями — (97, 197) 26×16 CSS px, PNG — 78×48.
+    pub(crate) fn single_variant_metadata(
+        surface: &str,
+        reading: &str,
+        vocabulary_id: u64,
+        source_url: String,
+        browser: BrowserRuntimeProvenance,
+    ) -> PitchAccentDomainMetadata {
+        let document_rect = PitchAccentCaptureRect {
+            x: 100.0,
+            y: 200.0,
+            width: 20.0,
+            height: 10.0,
+        };
+        let markup_sha256 = sha256_hex(format!("<div>{reading}</div>").as_bytes());
+        let selector = ".subsection-pitch-accent .subsection > div > div:nth-child(1) > div:nth-child(2)[style*=\"word-break: keep-all\"]".to_owned();
+        let capture_rect =
+            pitch_accent_capture_rect_for(document_rect, PITCH_ACCENT_CAPTURE_PADDING_CSS_PX);
+        PitchAccentDomainMetadata {
+            surface: surface.into(),
+            reading: reading.into(),
+            jpdb_vocabulary_id: vocabulary_id,
+            evidence: PitchAccentEvidence {
+                provider: PitchAccentProvider::Jpdb,
+                source_url,
+                resolved_forms: vec![PitchAccentResolvedForm {
+                    surface: surface.into(),
+                    reading: reading.into(),
+                }],
+                variant_selection: PitchAccentVariantSelection {
+                    basis: PitchAccentVariantSelectionBasis::SeededHashWithoutSourcePriority,
+                    detected_variant_count: 1,
+                    selected_index: 0,
+                    variants: vec![PitchAccentVariantEvidence {
+                        index: 0,
+                        selector: selector.clone(),
+                        text: reading.into(),
+                        selection_score: pitch_accent_variant_selection_score(
+                            vocabulary_id,
+                            &markup_sha256,
+                        ),
+                        markup_sha256,
+                        viewport_rect: PitchAccentCaptureRect {
+                            y: 100.0,
+                            ..document_rect
+                        },
+                        document_rect,
+                        paint_rect: document_rect,
+                    }],
+                },
+                render: PitchAccentRenderEvidence {
+                    kind: PitchAccentRenderKind::BrowserRegionScreenshot,
+                    selector,
+                    captured_graph_count: 1,
+                    coordinate_space: PitchAccentCoordinateSpace::Document,
+                    viewport_width: 1280,
+                    viewport_height: 900,
+                    document_width: 1280,
+                    document_height: 1800,
+                    scroll_x: 0.0,
+                    scroll_y: 100.0,
+                    pixel_width: 78,
+                    pixel_height: 48,
+                    device_scale_factor: 3.0,
+                    page_scale_factor: 1.0,
+                    dark_theme: PitchAccentDarkThemeProof {
+                        document_element_classes: vec!["dark-mode".into()],
+                        prefers_color_scheme: "dark".into(),
+                        computed_color_scheme: "dark".into(),
+                        background_selector: ".subsection-pitch-accent".into(),
+                        background_rgb: [24, 36, 48],
+                    },
+                    padding_css_px: PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+                    capture_rect,
+                },
+                browser,
+            },
+        }
+    }
+
+    /// PNG 78×48 для `single_variant_metadata`: фон и линия внутри отрисовки графика.
+    /// `alternate` сдвигает линию и даёт другие байты с той же геометрией.
+    pub(crate) fn single_variant_png(alternate: bool) -> Vec<u8> {
+        let mut image = image::RgbaImage::from_pixel(78, 48, image::Rgba([24, 36, 48, 255]));
+        let start = if alternate { 14 } else { 12 };
+        for x in start..(start + 48) {
+            image.put_pixel(x, 24, image::Rgba([235, 235, 235, 255]));
+        }
+        let mut output = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut output, image::ImageFormat::Png)
+            .unwrap();
+        output.into_inner()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    const BACKGROUND: [u8; 3] = [24, 36, 48];
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> PitchAccentCaptureRect {
+        PitchAccentCaptureRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Вариант с прямоугольником узла `document_rect`; прокрутка документа — 100 CSS px.
+    fn variant(
+        index: u32,
+        markup: &str,
+        document_rect: PitchAccentCaptureRect,
+    ) -> PitchAccentVariantEvidence {
+        let markup_sha256 = sha256_hex(markup.as_bytes());
+        PitchAccentVariantEvidence {
+            index,
+            selector: format!(".pitch-row-{index} > .pitch-graph"),
+            text: "ゆうれい".into(),
+            selection_score: pitch_accent_variant_selection_score(123, &markup_sha256),
+            markup_sha256,
+            viewport_rect: rect(
+                document_rect.x,
+                document_rect.y - 100.0,
+                document_rect.width,
+                document_rect.height,
+            ),
+            document_rect,
+            paint_rect: document_rect,
+        }
+    }
+
+    /// Согласованные метаданные: область снимка вычисляется из выбранного варианта.
+    fn metadata_with_variants(
+        surface: &str,
+        variants: Vec<PitchAccentVariantEvidence>,
+    ) -> PitchAccentDomainMetadata {
+        let selected_index = select_pitch_accent_variant(
+            123,
+            variants
+                .iter()
+                .map(|variant| variant.markup_sha256.as_str()),
+        )
+        .unwrap();
+        let selected = &variants[selected_index];
+        let capture_rect =
+            pitch_accent_capture_rect_for(selected.paint_rect, PITCH_ACCENT_CAPTURE_PADDING_CSS_PX);
         PitchAccentDomainMetadata {
             surface: surface.to_owned(),
             reading: "ゆうれい".into(),
@@ -999,26 +1391,10 @@ mod tests {
                     surface: "幽霊".into(),
                     reading: "ゆうれい".into(),
                 }],
-                graph_count: 1,
                 render: PitchAccentRenderEvidence {
                     kind: PitchAccentRenderKind::BrowserRegionScreenshot,
-                    selector: ".pitch-accent-graph".into(),
-                    graphs: vec![PitchAccentGraphEvidence {
-                        index: 0,
-                        selector: ".pitch-accent-graph".into(),
-                        viewport_rect: PitchAccentCaptureRect {
-                            x: 100.0,
-                            y: 100.0,
-                            width: 20.0,
-                            height: 10.0,
-                        },
-                        document_rect: PitchAccentCaptureRect {
-                            x: 100.0,
-                            y: 200.0,
-                            width: 20.0,
-                            height: 10.0,
-                        },
-                    }],
+                    selector: selected.selector.clone(),
+                    captured_graph_count: 1,
                     coordinate_space: PitchAccentCoordinateSpace::Document,
                     viewport_width: 1280,
                     viewport_height: 900,
@@ -1026,8 +1402,8 @@ mod tests {
                     document_height: 1800,
                     scroll_x: 0.0,
                     scroll_y: 100.0,
-                    pixel_width: 60,
-                    pixel_height: 30,
+                    pixel_width: (capture_rect.width * 3.0) as u32,
+                    pixel_height: (capture_rect.height * 3.0) as u32,
                     device_scale_factor: 3.0,
                     page_scale_factor: 1.0,
                     dark_theme: PitchAccentDarkThemeProof {
@@ -1035,20 +1411,16 @@ mod tests {
                         prefers_color_scheme: "dark".into(),
                         computed_color_scheme: "dark".into(),
                         background_selector: ".subsection-pitch-accent".into(),
-                        background_rgb: [24, 36, 48],
+                        background_rgb: BACKGROUND,
                     },
-                    graph_union_rect: PitchAccentCaptureRect {
-                        x: 100.0,
-                        y: 200.0,
-                        width: 20.0,
-                        height: 10.0,
-                    },
-                    capture_rect: PitchAccentCaptureRect {
-                        x: 100.0,
-                        y: 200.0,
-                        width: 20.0,
-                        height: 10.0,
-                    },
+                    padding_css_px: PITCH_ACCENT_CAPTURE_PADDING_CSS_PX,
+                    capture_rect,
+                },
+                variant_selection: PitchAccentVariantSelection {
+                    basis: PitchAccentVariantSelectionBasis::SeededHashWithoutSourcePriority,
+                    detected_variant_count: variants.len() as u32,
+                    selected_index: selected_index as u32,
+                    variants,
                 },
                 browser: BrowserRuntimeProvenance {
                     product: "Chrome/140".into(),
@@ -1062,11 +1434,56 @@ mod tests {
         }
     }
 
-    fn valid_png() -> Vec<u8> {
-        let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
-        for x in 10..50 {
-            image.put_pixel(x, 15, image::Rgba([235, 235, 235, 255]));
+    fn valid_metadata(surface: &str) -> PitchAccentDomainMetadata {
+        metadata_with_variants(
+            surface,
+            vec![variant(
+                0,
+                "<div>ゆうれい</div>",
+                rect(100.0, 200.0, 20.0, 10.0),
+            )],
+        )
+    }
+
+    /// Три варианта в столбик с естественными промежутками в 10 CSS px.
+    fn multi_variant_metadata() -> PitchAccentDomainMetadata {
+        metadata_with_variants(
+            "幽霊",
+            (0..3)
+                .map(|index| {
+                    variant(
+                        index,
+                        &format!("<div>variant-{index}</div>"),
+                        rect(100.0, 200.0 + f64::from(index) * 20.0, 20.0, 10.0),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// PNG по геометрии метаданных: подлинный фон и горизонтальная линия внутри
+    /// отрисовки выбранного графика на `line_offset` физических пикселей от её края.
+    fn png_for(metadata: &PitchAccentDomainMetadata, line_offset: i64) -> Vec<u8> {
+        let render = &metadata.evidence.render;
+        let selection = &metadata.evidence.variant_selection;
+        let paint = selection.variants[selection.selected_index as usize].paint_rect;
+        let mut image = image::RgbaImage::from_pixel(
+            render.pixel_width,
+            render.pixel_height,
+            image::Rgba([BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 255]),
+        );
+        let left = ((paint.x - render.capture_rect.x) * 3.0) as i64;
+        let right = ((paint.x + paint.width - render.capture_rect.x) * 3.0) as i64;
+        let middle = ((paint.y + paint.height / 2.0 - render.capture_rect.y) * 3.0) as u32;
+        for x in (left + line_offset)..(right - line_offset) {
+            if (0..i64::from(render.pixel_width)).contains(&x) {
+                image.put_pixel(x as u32, middle, image::Rgba([235, 235, 235, 255]));
+            }
         }
+        encode(image)
+    }
+
+    fn encode(image: image::RgbaImage) -> Vec<u8> {
         let mut output = Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut output, image::ImageFormat::Png)
@@ -1074,8 +1491,12 @@ mod tests {
         output.into_inner()
     }
 
+    fn valid_png() -> Vec<u8> {
+        png_for(&valid_metadata("幽霊"), 3)
+    }
+
     fn rgb_png(width: u32, height: u32) -> Vec<u8> {
-        let mut image = image::RgbImage::from_pixel(width, height, image::Rgb([24, 36, 48]));
+        let mut image = image::RgbImage::from_pixel(width, height, image::Rgb(BACKGROUND));
         if width > 0 && height > 0 {
             for x in (width / 4)..((width * 3 / 4).max(1)) {
                 image.put_pixel(x, height / 2, image::Rgb([235, 235, 235]));
@@ -1090,11 +1511,7 @@ mod tests {
 
     fn rgba_png(width: u32, height: u32) -> Vec<u8> {
         let image = image::RgbaImage::from_pixel(width, height, image::Rgba([24, 36, 48, 128]));
-        let mut output = Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(image)
-            .write_to(&mut output, image::ImageFormat::Png)
-            .unwrap();
-        output.into_inner()
+        encode(image)
     }
 
     fn white_png(width: u32, height: u32) -> Vec<u8> {
@@ -1174,10 +1591,15 @@ mod tests {
     #[test]
     fn decodable_png_with_structured_jpdb_evidence_is_verified() {
         let metadata = valid_metadata("幽霊");
+        assert_eq!(
+            metadata.evidence.render.capture_rect,
+            rect(97.0, 197.0, 26.0, 16.0),
+            "отрисовка 20×10 расширяется на 3 CSS px с каждой стороны"
+        );
         let asset = record(Some(metadata));
         let decision = validate(&asset, &valid_png()).unwrap();
 
-        assert_eq!(PitchAccentImageValidator::validator_identity().version, "5");
+        assert_eq!(PitchAccentImageValidator::validator_identity().version, "6");
         assert_eq!(decision.status, SemanticStatus::Verified);
         assert_eq!(
             decision.evidence[0].kind,
@@ -1287,6 +1709,37 @@ mod tests {
     }
 
     #[test]
+    fn used_in_link_is_evidence_of_id_and_surface_but_never_a_vocabulary_route() {
+        let used_in = "https://jpdb.io/vocabulary/123/%E5%B9%BD%E9%9C%8A/used-in";
+        assert_eq!(
+            parse_jpdb_used_in_route(used_in),
+            Ok(JpdbUsedInRoute {
+                vocabulary_id: 123,
+                surface: "幽霊".into(),
+            })
+        );
+        assert!(parse_jpdb_vocabulary_route(used_in).is_err());
+
+        for value in [
+            "https://jpdb.io/vocabulary/123/幽霊/ゆうれい",
+            "https://jpdb.io/vocabulary/123/幽霊",
+            "https://jpdb.io/vocabulary/123/used-in/used-in",
+            "https://jpdb.io/vocabulary/123/幽霊/USED-IN",
+            "https://jpdb.io/vocabulary/123/幽霊/used-in/extra",
+            "https://jpdb.io/vocabulary/0123/幽霊/used-in",
+            "https://jpdb.io/vocabulary/123//used-in",
+            "https://jpdb.io.evil.example/vocabulary/123/幽霊/used-in",
+            "http://jpdb.io/vocabulary/123/幽霊/used-in",
+            "https://jpdb.io/conjugate/123/幽霊/used-in",
+        ] {
+            assert!(
+                parse_jpdb_used_in_route(value).is_err(),
+                "разборщик `Used in` должен отвергать: {value}"
+            );
+        }
+    }
+
+    #[test]
     fn metadata_surface_and_reading_must_be_an_observed_pair() {
         let mut metadata = valid_metadata("幽霊");
         metadata.reading = "げんき".into();
@@ -1306,7 +1759,7 @@ mod tests {
     }
 
     #[test]
-    fn dark_theme_graph_set_and_native_capture_geometry_are_required() {
+    fn dark_theme_render_kind_and_page_scale_are_required() {
         let mut metadata = valid_metadata("幽霊");
         metadata.evidence.render.kind = PitchAccentRenderKind::ElementScreenshot;
         let asset = record(Some(metadata));
@@ -1343,32 +1796,6 @@ mod tests {
             validate(&asset, &valid_png()).unwrap().status,
             SemanticStatus::Uncertain
         );
-
-        let mut metadata = valid_metadata("幽霊");
-        metadata.evidence.render.capture_rect.width = 2.0;
-        let asset = record(Some(metadata));
-        assert_eq!(
-            validate(&asset, &valid_png()).unwrap().status,
-            SemanticStatus::Rejected
-        );
-
-        let mut metadata = valid_metadata("幽霊");
-        metadata.evidence.graph_count = 2;
-        let asset = record(Some(metadata));
-        assert_eq!(
-            validate(&asset, &valid_png()).unwrap().status,
-            SemanticStatus::Rejected
-        );
-    }
-
-    #[test]
-    fn native_capture_clip_rounding_allows_at_most_three_output_pixels() {
-        assert!(capture_pixel_dimensions_match(111, 81, 36.0, 26.0, 3.0));
-        assert!(capture_pixel_dimensions_match(
-            318, 279, 106.047, 93.781, 3.0
-        ));
-        assert!(!capture_pixel_dimensions_match(112, 78, 36.0, 26.0, 3.0));
-        assert!(!capture_pixel_dimensions_match(108, 82, 36.0, 26.0, 3.0));
     }
 
     #[test]
@@ -1380,19 +1807,33 @@ mod tests {
     }
 
     #[test]
-    fn validator_requires_current_render_metadata_for_verified_status() {
+    fn version_5_metadata_with_graph_union_is_not_verified() {
+        // Форма свидетельств валидатора v5: все графики, `graph_count` и объединение.
         let mut legacy = serde_json::to_value(valid_metadata("幽霊")).unwrap();
         let evidence = legacy["evidence"].as_object_mut().unwrap();
-        evidence.remove("resolved_forms");
+        evidence.remove("variant_selection");
+        evidence.insert("graph_count".into(), json!(1));
         let render = evidence["render"].as_object_mut().unwrap();
-        render.remove("graphs");
-        render.remove("page_scale_factor");
-        render.remove("dark_theme");
-        render.remove("capture_rect");
+        render.remove("captured_graph_count");
+        render.remove("padding_css_px");
+        let paint = json!({"x": 100.0, "y": 200.0, "width": 20.0, "height": 10.0});
+        render.insert("graph_union_rect".into(), paint.clone());
+        render.insert("capture_rect".into(), paint.clone());
+        render.insert(
+            "graphs".into(),
+            json!([{
+                "index": 0,
+                "selector": ".pitch-row-0 > .pitch-graph",
+                "viewport_rect": {"x": 100.0, "y": 100.0, "width": 20.0, "height": 10.0},
+                "document_rect": paint,
+            }]),
+        );
+        render.insert("pixel_width".into(), json!(60));
+        render.insert("pixel_height".into(), json!(30));
 
         let mut asset = record(None);
         asset.domain_metadata = Some(legacy);
-        let decision = validate(&asset, &valid_png()).unwrap();
+        let decision = validate(&asset, &rgb_png(60, 30)).unwrap();
 
         assert_eq!(decision.status, SemanticStatus::Uncertain);
         assert_eq!(
@@ -1405,18 +1846,19 @@ mod tests {
     fn page_coordinate_geometry_offsets_graphs_by_document_scroll() {
         let mut metadata = valid_metadata("幽霊");
         metadata.evidence.render.scroll_y = 120.0;
-        metadata.evidence.render.graphs[0].document_rect.y = 220.0;
-        metadata.evidence.render.graph_union_rect.y = 220.0;
-        metadata.evidence.render.capture_rect.y = 220.0;
+        metadata.evidence.variant_selection.variants[0]
+            .viewport_rect
+            .y = 80.0;
         let asset = record(Some(metadata));
-
         assert_eq!(
             validate(&asset, &valid_png()).unwrap().status,
             SemanticStatus::Verified
         );
 
         let mut metadata = valid_metadata("幽霊");
-        metadata.evidence.render.graphs[0].document_rect.y += 1.0;
+        metadata.evidence.variant_selection.variants[0]
+            .document_rect
+            .y += 1.0;
         let asset = record(Some(metadata));
         assert_eq!(
             validate(&asset, &valid_png()).unwrap().status,
@@ -1424,7 +1866,9 @@ mod tests {
         );
 
         let mut metadata = valid_metadata("幽霊");
-        metadata.evidence.render.graphs[0].document_rect.width += 1.0;
+        metadata.evidence.variant_selection.variants[0]
+            .document_rect
+            .width += 1.0;
         let asset = record(Some(metadata));
         assert_eq!(
             validate(&asset, &valid_png()).unwrap().status,
@@ -1434,35 +1878,337 @@ mod tests {
     }
 
     #[test]
-    fn capture_must_equal_the_graph_union_and_document_page_bounds_are_verified() {
-        let mut metadata = valid_metadata("幽霊");
-        metadata.evidence.render.graphs[0].viewport_rect.y = 2.0;
-        metadata.evidence.render.graphs[0].document_rect.y = 2.0;
-        metadata.evidence.render.scroll_y = 0.0;
-        metadata.evidence.render.graph_union_rect.y = 2.0;
-        metadata.evidence.render.capture_rect.y = 2.0;
-        metadata.evidence.render.capture_rect.height = 10.0;
-        let asset = record(Some(metadata));
+    fn paint_overflow_beyond_the_node_is_captured_inside_the_padding() {
+        // Сегмент JPDB с `margin-right: -2px` выходит за прямоугольник узла.
+        let mut overflowing = variant(0, "<div>overflow</div>", rect(100.0, 200.0, 20.0, 10.0));
+        overflowing.paint_rect = rect(100.0, 200.0, 22.0, 10.0);
+        let metadata = metadata_with_variants("幽霊", vec![overflowing]);
+        assert_eq!(
+            metadata.evidence.render.capture_rect,
+            rect(97.0, 197.0, 28.0, 16.0)
+        );
+        let bytes = png_for(&metadata, 3);
+        let asset = record(Some(metadata.clone()));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Verified
+        );
+
+        let mut node_only = metadata;
+        node_only.evidence.variant_selection.variants[0].paint_rect =
+            node_only.evidence.variant_selection.variants[0].document_rect;
+        let asset = record(Some(node_only));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Rejected,
+            "область снимка должна строиться от полной отрисовки, а не от узла"
+        );
+
+        let mut shrunken = valid_metadata("幽霊");
+        shrunken.evidence.variant_selection.variants[0]
+            .paint_rect
+            .width = 10.0;
+        let asset = record(Some(shrunken));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected,
+            "отрисовка обязана охватывать узел графика"
+        );
+    }
+
+    #[test]
+    fn capture_rect_must_be_the_padded_selected_paint_inside_the_document() {
+        let mut unpadded = valid_metadata("幽霊");
+        unpadded.evidence.render.capture_rect = rect(100.0, 200.0, 20.0, 10.0);
+        unpadded.evidence.render.pixel_width = 60;
+        unpadded.evidence.render.pixel_height = 30;
+        let asset = record(Some(unpadded));
         assert_eq!(
             validate(&asset, &rgb_png(60, 30)).unwrap().status,
+            SemanticStatus::Rejected,
+            "прежняя семантика v5 без полей больше не подтверждается"
+        );
+
+        let mut zero_padding = valid_metadata("幽霊");
+        zero_padding.evidence.render.padding_css_px = 0.0;
+        let asset = record(Some(zero_padding));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Uncertain
+        );
+
+        let mut near_top = metadata_with_variants(
+            "幽霊",
+            vec![variant(0, "<div>top</div>", rect(100.0, 101.0, 20.0, 10.0))],
+        );
+        near_top.evidence.render.scroll_y = 100.0;
+        assert_eq!(near_top.evidence.render.capture_rect.y, 98.0);
+        let asset = record(Some(near_top.clone()));
+        assert_eq!(
+            validate(&asset, &png_for(&near_top, 3)).unwrap().status,
+            SemanticStatus::Verified
+        );
+        let mut beyond_document = metadata_with_variants(
+            "幽霊",
+            vec![variant(0, "<div>edge</div>", rect(1.0, 101.0, 20.0, 10.0))],
+        );
+        beyond_document.evidence.render.document_width = 1280;
+        assert_eq!(beyond_document.evidence.render.capture_rect.x, -2.0);
+        let asset = record(Some(beyond_document.clone()));
+        assert_eq!(
+            validate(&asset, &png_for(&beyond_document, 3))
+                .unwrap()
+                .status,
+            SemanticStatus::Rejected,
+            "поле не может выходить за левую границу документа"
+        );
+
+        let mut shifted = valid_metadata("幽霊");
+        shifted.evidence.render.capture_rect.x += 1.0;
+        let asset = record(Some(shifted));
+        assert_eq!(
+            validate(&asset, &valid_png()).unwrap().status,
+            SemanticStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn png_dimensions_must_equal_the_integer_clip_times_device_scale() {
+        let metadata = valid_metadata("幽霊");
+        let mut image = image::RgbaImage::from_pixel(
+            metadata.evidence.render.pixel_width + 1,
+            metadata.evidence.render.pixel_height,
+            image::Rgba([BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 255]),
+        );
+        for x in 12..60 {
+            image.put_pixel(x, 24, image::Rgba([235, 235, 235, 255]));
+        }
+        let bytes = encode(image);
+
+        let mut claimed = metadata.clone();
+        claimed.evidence.render.pixel_width += 1;
+        let asset = record(Some(claimed));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Rejected,
+            "даже на один пиксель шире целочисленной области при DSF 3 — противоречие"
+        );
+        let asset = record(Some(metadata));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn margins_must_contain_only_the_observed_background() {
+        let metadata = valid_metadata("幽霊");
+        let asset = record(Some(metadata.clone()));
+
+        // Линия начинается внутри поля: графику не хватило места, край мог быть обрезан.
+        assert_eq!(
+            validate(&asset, &png_for(&metadata, -6)).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        let mut touching_edge = image::load_from_memory(&valid_png()).unwrap().to_rgba8();
+        touching_edge.put_pixel(0, 20, image::Rgba([235, 235, 235, 255]));
+        assert_eq!(
+            validate(&asset, &encode(touching_edge)).unwrap().status,
+            SemanticStatus::Rejected,
+            "пиксель рисунка у края PNG означает возможное обрезание"
+        );
+
+        let mut foreign = image::load_from_memory(&valid_png()).unwrap().to_rgba8();
+        let last = foreign.height() - 2;
+        foreign.put_pixel(30, last, image::Rgba([200, 40, 40, 255]));
+        assert_eq!(
+            validate(&asset, &encode(foreign)).unwrap().status,
+            SemanticStatus::Rejected,
+            "чужое содержимое в нижнем поле не принимается"
+        );
+
+        let mut antialias = image::load_from_memory(&valid_png()).unwrap().to_rgba8();
+        antialias.put_pixel(8, 20, image::Rgba([60, 70, 80, 255]));
+        assert_eq!(
+            validate(&asset, &encode(antialias)).unwrap().status,
             SemanticStatus::Verified,
-            "capture повторяет график, касающийся верхней границы страницы"
+            "один физический пиксель сглаживания на границе отрисовки допустим"
+        );
+    }
+
+    #[test]
+    fn multi_variant_entry_publishes_exactly_one_reproducibly_selected_graph() {
+        let metadata = multi_variant_metadata();
+        let selection = &metadata.evidence.variant_selection;
+        assert_eq!(selection.detected_variant_count, 3);
+        assert_eq!(metadata.evidence.render.captured_graph_count, 1);
+        let selected = &selection.variants[selection.selected_index as usize];
+        assert_eq!(metadata.evidence.render.selector, selected.selector);
+        let bytes = png_for(&metadata, 3);
+        let asset = record(Some(metadata.clone()));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Verified
         );
 
-        let mut metadata = valid_metadata("幽霊");
-        metadata.evidence.render.graph_union_rect.width += 1.0;
-        let asset = record(Some(metadata));
+        let other = (selection.selected_index + 1) % 3;
+        let mut wrong_choice = metadata.clone();
+        wrong_choice.evidence.variant_selection.selected_index = other;
+        wrong_choice.evidence.render.selector = wrong_choice.evidence.variant_selection.variants
+            [other as usize]
+            .selector
+            .clone();
+        let asset = record(Some(wrong_choice));
         assert_eq!(
-            validate(&asset, &valid_png()).unwrap().status,
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Rejected,
+            "выбор, не совпадающий с воспроизводимым, отвергается"
+        );
+
+        let mut forged_score = metadata.clone();
+        forged_score.evidence.variant_selection.variants[0].selection_score = "0".repeat(64);
+        let asset = record(Some(forged_score));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
             SemanticStatus::Rejected
         );
 
-        let mut metadata = valid_metadata("幽霊");
-        metadata.evidence.render.capture_rect.x = -1.0;
+        let mut forged_markup = metadata.clone();
+        forged_markup.evidence.variant_selection.variants[1].markup_sha256 = "XYZ".into();
+        let asset = record(Some(forged_markup));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        let mut miscounted = metadata.clone();
+        miscounted.evidence.variant_selection.detected_variant_count = 2;
+        let asset = record(Some(miscounted));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        // Удаление невыбранного варианта не в конце списка разрывает индексы DOM.
+        let dropped = (0..3)
+            .find(|index| *index != selection.selected_index && *index != 2)
+            .unwrap();
+        let mut dropped_variant = metadata.clone();
+        dropped_variant
+            .evidence
+            .variant_selection
+            .variants
+            .retain(|variant| variant.index != dropped);
+        dropped_variant
+            .evidence
+            .variant_selection
+            .detected_variant_count = 2;
+        let asset = record(Some(dropped_variant));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Rejected,
+            "удаление варианта из свидетельств нарушает порядок DOM"
+        );
+
+        let mut two_graphs = metadata.clone();
+        two_graphs.evidence.render.captured_graph_count = 2;
+        let asset = record(Some(two_graphs));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        let mut other_selector = metadata.clone();
+        other_selector.evidence.render.selector = metadata.evidence.variant_selection.variants
+            [other as usize]
+            .selector
+            .clone();
+        let asset = record(Some(other_selector));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        let mut duplicate_selector = metadata.clone();
+        duplicate_selector.evidence.variant_selection.variants[other as usize].selector =
+            selected.selector.clone();
+        let asset = record(Some(duplicate_selector));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Rejected
+        );
+
+        let mut empty = metadata;
+        empty.evidence.variant_selection.variants.clear();
+        empty.evidence.variant_selection.detected_variant_count = 0;
+        let asset = record(Some(empty));
+        assert_eq!(
+            validate(&asset, &bytes).unwrap().status,
+            SemanticStatus::Uncertain
+        );
+    }
+
+    #[test]
+    fn capture_padding_must_not_reach_a_neighbouring_variant() {
+        // Соседний график в 2 CSS px ниже: поле в 3 CSS px его задело бы.
+        let metadata = metadata_with_variants(
+            "幽霊",
+            vec![
+                variant(0, "<div>a</div>", rect(100.0, 200.0, 20.0, 10.0)),
+                variant(1, "<div>b</div>", rect(100.0, 212.0, 20.0, 10.0)),
+            ],
+        );
+        let bytes = png_for(&metadata, 3);
         let asset = record(Some(metadata));
         assert_eq!(
-            validate(&asset, &valid_png()).unwrap().status,
+            validate(&asset, &bytes).unwrap().status,
             SemanticStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn variant_selection_is_order_independent_seeded_and_resolves_ties_by_dom_order() {
+        let markups: Vec<String> = (0..4)
+            .map(|index| sha256_hex(format!("variant-{index}").as_bytes()))
+            .collect();
+        let choose = |id: u64, order: &[usize]| {
+            let ordered: Vec<&str> = order.iter().map(|index| markups[*index].as_str()).collect();
+            order[select_pitch_accent_variant(id, ordered.iter().copied()).unwrap()]
+        };
+        for id in 1..64 {
+            let chosen = choose(id, &[0, 1, 2, 3]);
+            assert_eq!(
+                chosen,
+                choose(id, &[3, 2, 1, 0]),
+                "порядок DOM не влияет на выбор"
+            );
+            assert_eq!(chosen, choose(id, &[2, 0, 3, 1]));
+            assert_eq!(
+                chosen,
+                choose(id, &[0, 1, 2, 3]),
+                "повтор даёт тот же выбор"
+            );
+            // Добавление варианта либо сохраняет прежний выбор, либо выбирает новый.
+            let extended = choose(id, &[0, 1, 2]);
+            assert!(chosen == extended || chosen == 3);
+        }
+        let first_positions: BTreeSet<usize> =
+            (1..64).map(|id| choose(id, &[0, 1, 2, 3])).collect();
+        assert!(
+            first_positions.len() > 1,
+            "выбор не сводится к первому элементу: {first_positions:?}"
+        );
+        assert_eq!(
+            select_pitch_accent_variant(7, [markups[1].as_str(), markups[1].as_str()]),
+            Some(0),
+            "одинаковая разметка даёт равные оценки; выбирается меньший индекс DOM"
+        );
+        assert_eq!(select_pitch_accent_variant(7, std::iter::empty()), None);
+        assert_ne!(
+            pitch_accent_variant_selection_score(1, &markups[0]),
+            pitch_accent_variant_selection_score(2, &markups[0]),
+            "оценка зависит от ID словарной записи"
         );
     }
 
@@ -1474,69 +2220,63 @@ mod tests {
             SemanticStatus::Verified
         );
 
-        let mut metadata = valid_metadata("幽霊");
-        metadata.evidence.render.dark_theme.background_rgb = [255, 255, 255];
-        let asset = record(Some(metadata));
+        let metadata = valid_metadata("幽霊");
+        let (width, height) = (
+            metadata.evidence.render.pixel_width,
+            metadata.evidence.render.pixel_height,
+        );
+        let mut light = metadata;
+        light.evidence.render.dark_theme.background_rgb = [255, 255, 255];
+        let asset = record(Some(light));
         assert_eq!(
-            validate(&asset, &white_png(60, 30)).unwrap().status,
+            validate(&asset, &white_png(width, height)).unwrap().status,
             SemanticStatus::Rejected,
             "флаги тёмной темы не могут подтвердить светлый вычисленный фон"
         );
 
         let asset = record(Some(valid_metadata("幽霊")));
         assert_eq!(
-            validate(&asset, &white_png(60, 30)).unwrap().status,
+            validate(&asset, &white_png(width, height)).unwrap().status,
             SemanticStatus::Rejected,
             "содержимое снимка должно включать наблюдённый тёмный фон и пиксели графика"
         );
 
-        let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
-        image.put_pixel(30, 15, image::Rgba([235, 235, 235, 255]));
-        let mut output = Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(image)
-            .write_to(&mut output, image::ImageFormat::Png)
-            .unwrap();
-        let asset = record(Some(valid_metadata("幽霊")));
+        let mut image = image::RgbaImage::from_pixel(
+            width,
+            height,
+            image::Rgba([BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 255]),
+        );
+        image.put_pixel(30, 24, image::Rgba([235, 235, 235, 255]));
         assert_eq!(
-            validate(&asset, &output.into_inner()).unwrap().status,
+            validate(&asset, &encode(image)).unwrap().status,
             SemanticStatus::Rejected,
             "один случайный контрастный пиксель не подтверждает содержимое графика"
         );
     }
 
     #[test]
-    fn transparent_tail_after_background_and_graph_pixels_is_rejected() {
-        let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
-        for x in 1..=8 {
-            image.put_pixel(x, 0, image::Rgba([235, 235, 235, 255]));
-        }
-        image.put_pixel(59, 29, image::Rgba([24, 36, 48, 0]));
-        let mut output = Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(image)
-            .write_to(&mut output, image::ImageFormat::Png)
-            .unwrap();
+    fn transparent_pixel_anywhere_is_rejected() {
+        let mut image = image::load_from_memory(&valid_png()).unwrap().to_rgba8();
+        let (width, height) = image.dimensions();
+        image.put_pixel(width - 1, height - 1, image::Rgba([24, 36, 48, 0]));
 
         let asset = record(Some(valid_metadata("幽霊")));
         assert_eq!(
-            validate(&asset, &output.into_inner()).unwrap().status,
+            validate(&asset, &encode(image)).unwrap().status,
             SemanticStatus::Rejected
         );
     }
 
     #[test]
     fn alpha_254_is_not_fully_opaque() {
-        let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 254]));
-        for x in 10..50 {
-            image.put_pixel(x, 15, image::Rgba([235, 235, 235, 254]));
+        let mut image = image::load_from_memory(&valid_png()).unwrap().to_rgba8();
+        for pixel in image.pixels_mut() {
+            pixel.0[3] = 254;
         }
-        let mut output = Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(image)
-            .write_to(&mut output, image::ImageFormat::Png)
-            .unwrap();
 
         let asset = record(Some(valid_metadata("幽霊")));
         assert_eq!(
-            validate(&asset, &output.into_inner()).unwrap().status,
+            validate(&asset, &encode(image)).unwrap().status,
             SemanticStatus::Rejected
         );
     }

@@ -17,7 +17,12 @@ use repository_maintenance::care;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    maybe_offer_maintenance(&cli);
+    // Предложение обслуживания диска не должно срабатывать для команды, которую
+    // граница закрытой области отвергает: оно читало бы репозиторий, к которому
+    // команда всё равно не получит доступа.
+    if anki_repo::layout::guard_command(&cli.command).is_ok() {
+        maybe_offer_maintenance(&cli);
+    }
 
     match execute_cli(&cli) {
         Ok(rendered) => {

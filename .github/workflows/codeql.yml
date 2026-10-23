@@ -1,8 +1,9 @@
 name: CodeQL
 
 # Advanced setup запускает анализ только когда меняется код или конфигурация,
-# способная повлиять на Rust/GitHub Actions. Изменения одних колод и media не
-# должны запускать многоминутный security scan.
+# способная повлиять на Rust/GitHub Actions. Пользовательские колоды, ресурсы и
+# приватный журнал операций не отслеживаются Git, поэтому их изменения в diff PR
+# попасть не могут и многоминутный security scan не запускают.
 on:
   pull_request:
     paths:
@@ -67,7 +68,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Инициализировать CodeQL
-        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           languages: ${{ matrix.language }}
           # Rust поддерживает анализ без полного cargo build. Для Actions это
@@ -77,6 +78,6 @@ jobs:
           build-mode: none
 
       - name: Выполнить CodeQL-анализ
-        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: '/language:${{ matrix.language }}'

@@ -15,6 +15,7 @@ use crate::ops::create::CreateResult;
 use crate::ops::edit::{EditResult, EditStatus};
 use crate::ops::find::FindResult;
 use crate::ops::inspect::InspectResult;
+use crate::ops::migrate_layout::{ExportPlan, MigrationReport};
 use crate::ops::migrate_media::MigrationResult;
 use crate::ops::models::ModelsResult;
 use crate::ops::qa::QaResult;
@@ -1526,4 +1527,96 @@ pub fn migrate_media(result: &MigrationResult) -> String {
 
     push_validation(&mut out, &result.validation);
     out.finish()
+}
+
+/// Человекочитаемое представление `migrate-layout`.
+pub fn migrate_layout(result: &MigrationReport) -> String {
+    let mut out = Out::default();
+
+    out.line(format!("Корень репозитория: {}", result.root));
+    out.line(format!(
+        "Прежняя область: {} → плоское назначение: {}",
+        result.legacy_area, result.output_dir
+    ));
+    out.line(if result.apply {
+        if result.refused {
+            "Режим: --apply, перенос отклонён целиком".to_string()
+        } else if result.applied {
+            "Режим: --apply, перенос выполнен".to_string()
+        } else {
+            "Режим: --apply, перенос не требовался".to_string()
+        }
+    } else {
+        "Режим: dry-run, файлы не изменялись".to_string()
+    });
+
+    if result.exports.is_empty() {
+        out.line("Экспортов прежней раскладки не найдено");
+    } else {
+        out.line(format!("Экспортов рассмотрено: {}", result.summary.exports));
+        out.blank();
+        for entry in &result.exports {
+            let name = entry.name.as_deref().unwrap_or("—");
+            out.line(format!("{name}: {} → {}", entry.source, action_line(entry)));
+            if entry.state == "applied" || entry.action == "already_present" {
+                out.line(format!(
+                    "  файлов {}, байт {}, sha256 {}",
+                    entry.files,
+                    entry.bytes,
+                    optional(entry.content_sha256.as_deref())
+                ));
+            }
+            if let Some(reason) = entry.reason {
+                out.line(format!(
+                    "  отказ {reason}: {}",
+                    optional(entry.message.as_deref())
+                ));
+            } else if let Some(message) = entry.message.as_deref() {
+                out.line(format!("  {message}"));
+            }
+        }
+    }
+
+    if !result.pruned.is_empty() {
+        out.blank();
+        out.line(format!(
+            "Снято элементов прежней раскладки: {}",
+            result.pruned.len()
+        ));
+        for path in &result.pruned {
+            out.line(format!("  - {path}"));
+        }
+    }
+
+    for diagnostic in &result.diagnostics {
+        out.blank();
+        out.line(format!("{}: {}", diagnostic.code, diagnostic.message));
+        for path in &diagnostic.paths {
+            out.line(format!("  {path}"));
+        }
+    }
+
+    out.blank();
+    out.line(format!(
+        "Итог: к переносу {}, перенесено {}, уже на месте {}, отказов {}",
+        result.summary.planned,
+        result.summary.applied,
+        result.summary.already_present,
+        result.summary.refused
+    ));
+    out.finish()
+}
+
+/// Строка исхода одного экспорта для человекочитаемого режима.
+fn action_line(entry: &ExportPlan) -> String {
+    let target = optional(entry.target.as_deref());
+    match (entry.action, entry.state) {
+        ("move", "applied") => format!("{target} (перенесён)"),
+        ("move", _) => format!("{target} (к переносу)"),
+        ("already_present", "applied") => {
+            format!("{target} (уже на месте, дубликат источника снят)")
+        }
+        ("already_present", _) => format!("{target} (уже на месте)"),
+        _ => "перенос невозможен".to_string(),
+    }
 }

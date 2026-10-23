@@ -12,6 +12,7 @@ use crate::ops::create::CreateResult;
 use crate::ops::edit::EditResult;
 use crate::ops::find::FindResult;
 use crate::ops::inspect::{InspectResult, InspectVerbose, ModelSummary};
+use crate::ops::migrate_layout::MigrationReport;
 use crate::ops::migrate_media::{LegacyMediaDigest, MigratedReference, MigrationResult};
 use crate::ops::models::ModelsResult;
 use crate::ops::qa::QaResult;
@@ -1715,6 +1716,14 @@ impl From<&crate::ops::source::ValidationDelta> for ValidationDeltaDto {
 /// JSON-представление `migrate-media`.
 pub fn migrate_media_json(result: &MigrationResult) -> String {
     to_json("migrate-media", MigrateMediaDto::from(result))
+}
+
+/// JSON-представление `migrate-layout`.
+///
+/// Результат операции уже является стабильным DTO: план, отказы, диагностика и
+/// счётчики описаны на стороне операции, а не собираются заново в рендерере.
+pub fn migrate_layout_json(result: &MigrationReport) -> String {
+    to_json("migrate-layout", result)
 }
 
 #[derive(Serialize)]

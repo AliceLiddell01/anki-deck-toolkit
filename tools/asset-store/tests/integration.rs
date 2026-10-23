@@ -11,9 +11,18 @@ mod browser_acquisition_diagnostics_contract;
 mod cli_contract;
 #[path = "domain_semantics_regression.rs"]
 mod domain_semantics_regression;
+#[path = "journal_contract.rs"]
+mod journal_contract;
+#[path = "kanji_ocr_contract.rs"]
+mod kanji_ocr_contract;
 #[path = "pitch_cli_contract.rs"]
 mod pitch_cli_contract;
 #[path = "pitch_corpus_trust_contract.rs"]
 mod pitch_corpus_trust_contract;
+// Генераторы эталонов собираются только с `reference-generator`; общий модуль
+// публикации от resvg не зависит, и его тесты должны исполняться штатным
+// `cargo test --workspace`.
+#[path = "../src/bin/common/reference_output.rs"]
+mod reference_output;
 #[path = "temp_workspace_contract.rs"]
 mod temp_workspace_contract;

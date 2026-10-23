@@ -14,6 +14,8 @@ mod edit_contract;
 mod edit_source_preservation;
 #[path = "export_contract.rs"]
 mod export_contract;
+#[path = "local_data_contract.rs"]
+mod local_data_contract;
 #[path = "note_lifecycle_contract.rs"]
 mod note_lifecycle_contract;
 #[path = "qa_contract.rs"]

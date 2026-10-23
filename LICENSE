@@ -7,7 +7,8 @@ file or directory states different terms.
 This license does not grant rights to content under `decks/`, user-provided
 media, or third-party assets/corpora (including files under
 `.asset-store/**/assets/`) except where those materials are separately
-licensed. Such materials remain subject to their own terms and rights holders.
+licensed. Such materials remain subject to their own terms and rights holders,
+independently of whether and how they are present in a working copy.
 
 MIT License
 

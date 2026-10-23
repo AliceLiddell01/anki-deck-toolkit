@@ -87,8 +87,13 @@ pub fn read_deck_json_bytes(export_dir: &Path) -> Result<(PathBuf, Vec<u8>), Dom
 /// Проверяет каталог экспорта и возвращает путь к его `deck.json`.
 ///
 /// Единственная реализация каталог-контракта: и текстовое, и байтовое чтение
-/// обязаны сообщать об одной и той же проблеме одинаково.
+/// обязаны сообщать об одной и той же проблеме одинаково. Здесь же стоит
+/// граница закрытой области `decks/input`: она отвечает на вопрос «это вообще
+/// допустимый каталог экспорта?» и потому принадлежит контракту каталога, а не
+/// отдельной команде.
 fn deck_json_path(export_dir: &Path) -> Result<PathBuf, DomainError> {
+    crate::layout::guard_local_path(export_dir, "каталог экспорта")?;
+
     let metadata = fs::metadata(export_dir).map_err(|error| {
         DomainError::with_details(
             ErrorCode::InputUnreadable,

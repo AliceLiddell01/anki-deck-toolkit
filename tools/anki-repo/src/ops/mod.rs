@@ -1,6 +1,6 @@
 //! Предметные операции: `inspect`, `find`, `stats`, `validate`, `edit`, `qa`,
 //! `review`, `review-check`, `models`, `create`, `retire`, `migrate-media`,
-//! `visual-report`.
+//! `migrate-layout`, `visual-report`.
 //!
 //! Каждая операция возвращает собственный результат. Текстовый и JSON-форматы
 //! — два представления одного и того же результата.
@@ -11,6 +11,7 @@ pub mod deck_select;
 pub mod edit;
 pub mod find;
 pub mod inspect;
+pub mod migrate_layout;
 pub mod migrate_media;
 pub mod models;
 pub mod publish;

@@ -20,6 +20,7 @@ asset-store = { path = "../asset-store" }
 repository-maintenance = { path = "../repository-maintenance" }
 serde_yaml = { package = "yaml_serde", version = "0.10" }
 rustix = { version = "1.1", features = ["fs"] }
+unicode-normalization = "0.1"
 
 
 [lib]

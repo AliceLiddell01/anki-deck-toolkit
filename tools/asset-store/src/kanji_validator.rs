@@ -314,16 +314,20 @@ fn decode_media(bytes: &[u8]) -> Result<RasterEvidence, String> {
     }
 }
 
-fn decode_png(bytes: &[u8]) -> Result<RasterEvidence, String> {
+fn png_image(bytes: &[u8]) -> Result<DynamicImage, String> {
     let mut reader = ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Png);
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_DIMENSION);
     limits.max_image_height = Some(MAX_DIMENSION);
     limits.max_alloc = Some(32 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader
+    reader
         .decode()
-        .map_err(|error| format!("ошибка декодирования PNG: {error}"))?;
+        .map_err(|error| format!("ошибка декодирования PNG: {error}"))
+}
+
+fn decode_png(bytes: &[u8]) -> Result<RasterEvidence, String> {
+    let image = png_image(bytes)?;
     let (width, height) = image.dimensions();
     let normalized = image_to_mask(&image)?;
     let foreground_pixels = normalized.foreground_pixels;
@@ -344,7 +348,7 @@ fn decode_png(bytes: &[u8]) -> Result<RasterEvidence, String> {
     })
 }
 
-fn decode_gif(bytes: &[u8]) -> Result<RasterEvidence, String> {
+fn gif_decoder(bytes: &[u8]) -> Result<GifDecoder<Cursor<&[u8]>>, String> {
     let mut decoder = GifDecoder::new(Cursor::new(bytes))
         .map_err(|error| format!("ошибка заголовка GIF: {error}"))?;
     let mut limits = Limits::default();
@@ -354,6 +358,11 @@ fn decode_gif(bytes: &[u8]) -> Result<RasterEvidence, String> {
     decoder
         .set_limits(limits)
         .map_err(|error| format!("ошибка размеров GIF: {error}"))?;
+    Ok(decoder)
+}
+
+fn decode_gif(bytes: &[u8]) -> Result<RasterEvidence, String> {
+    let decoder = gif_decoder(bytes)?;
     let (width, height) = decoder.dimensions();
     if width == 0 || height == 0 {
         return Err("у GIF нулевые размеры".into());
@@ -831,6 +840,59 @@ fn relax(distances: &mut [f32], x: usize, y: usize, other_x: usize, other_y: usi
 #[cfg(test)]
 pub(crate) fn synthetic_reference_png(character: char) -> Vec<u8> {
     tests::reference_png(character)
+}
+
+/// OCR получает кадр, выбранный тем же декодером/маской v6. Повторное
+/// декодирование освобождает все прочие кадры и не хранит всю анимацию в памяти.
+pub(crate) struct OcrImage {
+    pub png: Vec<u8>,
+    pub format: DetectedFormat,
+    pub frame: usize,
+    pub dimensions: [u32; 2],
+}
+
+pub(crate) fn prepare_ocr_image(bytes: &[u8]) -> Result<OcrImage, String> {
+    let raster = decode_media(bytes)?;
+    let image = match raster.format {
+        DetectedFormat::Png => png_image(bytes)?.to_rgba8(),
+        DetectedFormat::Gif => gif_decoder(bytes)?
+            .into_frames()
+            .nth(raster.representative_frame)
+            .ok_or("нет выбранного кадра GIF")?
+            .map_err(|error| error.to_string())?
+            .into_buffer(),
+        _ => return Err("OCR поддерживает PNG/GIF".into()),
+    };
+    // Как в исследовании: прозрачность компонуется на белый фон до Lanczos3.
+    let mut image = image;
+    for pixel in image.pixels_mut() {
+        let alpha = u32::from(pixel[3]);
+        for channel in &mut pixel.0[..3] {
+            *channel = ((u32::from(*channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
+        }
+        pixel[3] = 255;
+    }
+    let dimensions = [image.width() * 2, image.height() * 2];
+    let scaled = image::imageops::resize(
+        &image,
+        dimensions[0],
+        dimensions[1],
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut png = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(scaled)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|error| error.to_string())?;
+    let png = png.into_inner();
+    if png.len() > MAX_MEDIA_BYTES {
+        return Err("подготовленный PNG превышает 8 МиБ".into());
+    }
+    Ok(OcrImage {
+        png,
+        format: raster.format,
+        frame: raster.representative_frame,
+        dimensions,
+    })
 }
 
 #[cfg(test)]
@@ -1450,6 +1512,34 @@ mod tests {
             classify_distance(0.030, 0.010, -0.020),
             SemanticStatus::Rejected
         );
+    }
+
+    #[test]
+    fn ocr_uses_v6_representative_frame_and_rejects_decode_limits() {
+        let full = reference('保');
+        let reduced = progressive_top_rows_with_full_bounds(&full, 22);
+        let bytes = gif_for(vec![full, reduced]);
+        let raster = decode_media(&bytes).unwrap();
+        let prepared = prepare_ocr_image(&bytes).unwrap();
+        assert_eq!(prepared.frame, raster.representative_frame);
+        assert_eq!(prepared.frame, 0, "последний кадр не обязательно полный");
+        assert_eq!(prepared.dimensions, [raster.width * 2, raster.height * 2]);
+        assert_eq!(
+            image::load_from_memory(&prepared.png).unwrap().dimensions(),
+            (prepared.dimensions[0], prepared.dimensions[1])
+        );
+        assert_eq!(prepare_ocr_image(&png_for(&full)).unwrap().frame, 0);
+        for bad in [
+            Vec::new(),
+            b"GIF89a".to_vec(),
+            vec![0u8; MAX_MEDIA_BYTES + 1],
+        ] {
+            assert!(prepare_ocr_image(&bad).is_err());
+        }
+        let too_wide =
+            image::RgbaImage::from_pixel(MAX_DIMENSION + 1, 2, image::Rgba([0, 0, 0, 255]));
+        assert!(prepare_ocr_image(&png_for_image(too_wide)).is_err());
+        assert!(prepare_ocr_image(&gif_for(vec![full; MAX_GIF_FRAMES + 1])).is_err());
     }
 
     #[test]

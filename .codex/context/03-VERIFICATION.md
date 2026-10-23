@@ -7,19 +7,22 @@ Toolkit `tools/anki-repo` покрывает большую часть мини�
 
 ```bash
 # из корня репозитория — там же, где корневой Cargo workspace
-cargo run --quiet --bin anki-repo -- inspect  decks/japanese/words/Words__N3
-cargo run --quiet --bin anki-repo -- stats    decks/japanese/words/Words__N3
-cargo run --quiet --bin anki-repo -- validate decks/japanese/words/Words__N3
+cargo run --quiet --bin anki-repo -- inspect  decks/output/Words__N3
+cargo run --quiet --bin anki-repo -- stats    decks/output/Words__N3
+cargo run --quiet --bin anki-repo -- validate decks/output/Words__N3
 
 # точечная правка значения поля: сначала dry-run, потом запись
-cargo run --quiet --bin anki-repo -- edit decks/japanese/words/Words__N3 \
+cargo run --quiet --bin anki-repo -- edit decks/output/Words__N3 \
   --guid '<guid>' --field 'Значение' --expect '<было>' --set '<стало>'
-cargo run --quiet --bin anki-repo -- edit decks/japanese/words/Words__N3 \
+cargo run --quiet --bin anki-repo -- edit decks/output/Words__N3 \
   --guid '<guid>' --field 'Значение' --expect '<было>' --set '<стало>' --apply
 ```
 
-`Words__N3` здесь — пример текущего экспорта, а не обязательный путь: команды
-работают с любым каталогом CrowdAnki-экспорта, в котором лежит `deck.json`.
+`decks/output/Words__N3` здесь — пример текущего состояния рабочей копии, а не
+обязательный путь: команды работают с любым каталогом CrowdAnki-экспорта, в котором
+лежит `deck.json`. Рабочие колоды живут только в `decks/output/<имя_экспорта>/`,
+`decks/input/` — закрытая область будущего доверенного загрузчика, которую агент не
+читает и не изменяет, а обе области игнорируются Git и в чистом clone отсутствуют.
 
 Соответствие минимуму ниже:
 
@@ -30,12 +33,15 @@ cargo run --quiet --bin anki-repo -- edit decks/japanese/words/Words__N3 \
   `crowdanki_uuid` у объявленных в узле `note_models` и `deck_configurations`;
 - пункты 6 и 7 (неизменность `guid`/UUID и отсутствие случайных массовых
   переформатирований) `validate` закрыть не может: он анализирует один экспорт и
-  не сравнивает версии между собой, для них нужен `git diff`;
+  не сравнивает версии между собой, для них нужен независимый diff —
+  `git diff --no-index` по сохранённой копии состояния «до»: `decks/` не
+  отслеживается Git, поэтому обычный `git diff` эту правку не покажет;
 - `edit` закрывает пункт 7 для своей правки структурно: он пишет только
   канонический `deck.json`, требует `--expect` и проверяет перед записью, что
   изменилось ровно запрошенное число строк и что прирост размера объясняется
   длиной заменённых значений. Изменённое число строк видно в отчёте
-  (`changed_lines`), а `git diff --numstat` подтверждает его независимо.
+  (`changed_lines`), а `git diff --no-index --numstat` по копии «до»
+  подтверждает его независимо.
 - `create` и `retire` закрывают пункт 7 так же: обе публикуют канонический
   `deck.json`, переразбирают кандидат до записи и подтверждают, что изменилась
   ровно ожидаемая поверхность (`only_notes_and_media_files_appended` /
@@ -64,8 +70,8 @@ JSON руками:
 
 ```bash
 # из корня репозитория
-cargo run --quiet --bin anki-repo -- qa     decks/japanese/words/Words__N3
-cargo run --quiet --bin anki-repo -- review decks/japanese/words/Words__N3 --qa-code empty_field_value
+cargo run --quiet --bin anki-repo -- qa     decks/output/Words__N3
+cargo run --quiet --bin anki-repo -- review decks/output/Words__N3 --qa-code empty_field_value
 ```
 
 - `qa` детерминированно находит findings по фиксированному реестру правил
@@ -132,8 +138,9 @@ cargo run --quiet --bin anki-repo -- review decks/japanese/words/Words__N3 --qa-
 3. Выполни ту же команду с `--apply`.
 4. Повтори команду: повторный запуск должен дать статус `already_applied`,
    `applied: false` и не изменить `deck.json` (иначе правка не идемпотентна).
-5. Проверь `git diff --numstat` по `deck.json`: изменённых строк должно быть
-   ровно столько, сколько правок реально меняло значение.
+5. Проверь `git diff --no-index --numstat` между сохранённой копией состояния «до»
+   и текущим `deck.json`: изменённых строк должно быть ровно столько, сколько
+   правок реально меняло значение.
 6. Прогони `validate` и сравни с результатом до правки: новых `ERROR` быть не
    должно.
 
@@ -167,7 +174,7 @@ cargo run --quiet --bin anki-repo -- review decks/japanese/words/Words__N3 --qa-
 что и правка: сначала схема, потом dry-run, потом запись, потом валидация.
 
 ```bash
-EXPORT=decks/japanese/words/Words__N1
+EXPORT=decks/output/Words__N1
 BEFORE=/tmp/Words__N1-before-migration
 
 # 0. сохрани baseline для фактического отчёта «до / после»; повторный запуск
@@ -223,7 +230,10 @@ cargo run --quiet --bin anki-repo -- visual-report \
   обязаны быть `true`; `media_references_absent` и `only_notes_appended` отражают
   фактический план медиафайлов),
   `validation.before`/`after` — новых `ERROR` быть не должно; затем
-  `git diff --numstat` по `deck.json` и `git status` по `media/`. Для явно
+  `git diff --no-index --numstat "$BEFORE/deck.json" "$EXPORT/deck.json"` и
+  `git diff --no-index --stat "$BEFORE/media" "$EXPORT/media"`: `decks/` не
+  отслеживается Git, поэтому ни `git status`, ни обычный `git diff` изменения
+  внутри `media/` не показывают. Для явно
   разрешённых медиафайлов
   сверяй точные имена файлов, SHA-256 и объявления из результата `media`; без
   настроенных правил `media/` и `media_files` не меняются.
@@ -261,6 +271,25 @@ cargo run --quiet --bin anki-repo -- visual-report \
 отчёт показывает `removed`, это наблюдение о составе JSON, а не команда удалять
 заметку.
 
+### Через `migrate-layout`
+
+Перенос раскладки — не правка JSON, а перемещение каталогов, поэтому проверяется
+иначе: команда сама доказывает содержимое каждого экспорта по SHA-256 до переноса и
+сверяет отпечаток после. Для приёмки достаточно трёх прогонов:
+
+```bash
+anki-repo migrate-layout --root . --json            # план: refused должно быть false
+anki-repo migrate-layout --root . --apply --json     # applied: true, summary.applied = N
+anki-repo migrate-layout --root . --apply --json     # повтор: summary.exports = 0
+```
+
+`content_sha256` каждого экспорта до и после переноса обязан совпасть, а `deck.json`
+— остаться байт-в-байт тем же: команда не меняет идентичности. Прежняя раскладка
+отслеживалась Git, поэтому после `--apply` её нужно снять из индекса
+(`git rm -r --cached decks/<прежняя_область>`): `.gitignore` не отменяет уже
+добавленный индекс. Полный контракт и список отказов —
+`tools/anki-repo/README.md`.
+
 Отказы, которые не являются поводом обходить команду:
 
 - `unknown_model` (3) — набор имён полей не совпал с моделью колоды (`mode: auto`).
@@ -283,6 +312,9 @@ cargo run --quiet --bin anki-repo -- visual-report \
   неверно: он внутри `decks/`, пересекается с экспортом, не принадлежит этому
   инструменту или содержит испорченный манифест владения. Выбери чистый каталог
   вне репозитория.
+- `invalid_request` (3) с `reason: input_area_forbidden` — путь адресует закрытую
+  область `decks/input`. Ни одна команда её не читает и не изменяет, и флага-обхода
+  нет: для работы с колодами предназначен `decks/output/`.
 
 ## Проверки CI
 
@@ -299,9 +331,11 @@ cargo run --quiet --bin anki-repo -- visual-report \
   данных репозитория: регрессионные тесты `.github/scripts/test_*.py` и проверка
   метаданных и ссылок Agent Skills; затем `cargo fmt --all --check` и
   `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
-- «Код и тесты» — `cargo test --workspace --locked --profile ci`,
-  проверки verified-only корпусов кандзи и pitch-accent, а также
-  структурная `validate` каждого найденного `decks/**/deck.json`.
+- «Код и тесты» — `cargo test --workspace --locked --profile ci`, а также
+  `python3 .github/scripts/check_local_data_untracked.py`: постоянная граница
+  пользовательских данных по фактическому индексу Git. Проверок содержимого
+  пользовательских областей здесь нет намеренно: в чистом clone их не существует,
+  а свой экспорт и свой корпус проверяются локально.
 - «Заявленная MSRV» — читает `rust_version` через Cargo metadata, требует
   единого значения у участников workspace и выполняет
   `cargo +<msrv> check --workspace --all-targets --all-features --locked`.
@@ -318,6 +352,7 @@ Python-проверки контрактов, затем канонически�
 ```bash
 python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 python3 .github/scripts/check_skill_contracts.py
+python3 .github/scripts/check_local_data_untracked.py
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
@@ -329,10 +364,16 @@ cargo test --workspace --locked
 дополнительно включает `--all-features`. Строгая локальная репетиция
 обязательного CI — те же команды с этими флагами.
 
-Проверки корпусов (`kanji-corpus-gate`, `pitch-corpus-gate`) и структурная
-`validate` найденных экспортов выполняются только при наличии соответствующих
-данных в рабочей копии: их шаги пропускаются, если корпуса или `decks/**`
-отсутствуют.
+Содержимое пользовательских областей CI не проверяет: в чистом clone `decks/`
+и `.asset-store/` отсутствуют, и шаг, который «проверил» бы их
+отсутствие, выдал бы пустоту за проверку личных данных. Свой экспорт проверяют
+локально (`anki-repo validate` по каталогу `decks/output/<имя_экспорта>`,
+`kanji-corpus-gate`, `pitch-corpus-gate`). Вместо этого CI постоянно проверяет
+границу: ни один путь внутри этих областей не должен быть отслеживаемым, а правила
+игнорирования обязаны быть на месте и не ослаблены повторным включением
+(`.github/scripts/check_local_data_untracked.py`). Проверка идёт по фактическому
+индексу Git, потому что `.gitignore` не отменяет уже добавленный индекс и обходится
+`git add -f`.
 
 Здесь важно не смешивать два разных инварианта:
 
@@ -340,16 +381,15 @@ cargo test --workspace --locked
    синтетические экспорты во временных каталогах и `decks/**` не читают: ни одна
    конкретная колода, уровень, note model, имя поля или media не является их
    fixture.
-2. **CI валидирует live payload как данные репозитория.** Он рекурсивно находит
-   все фактически присутствующие CrowdAnki-экспорты под каноническим root
-   `decks/**` и требует их структурной валидности, не зная конкретного layout и
-   состава заранее. Структурно невалидный закоммиченный экспорт делает CI
-   красным; отсутствие экспортов под `decks/**` ошибкой не является.
+2. **CI проверяет tracked код, документацию и самодостаточные fixtures, а не
+   пользовательские данные.** Наличие или отсутствие колод и корпусов в чистом
+   clone не является предметом проверки CI и не выдаётся за неё. Постоянная проверка
+   CI — граница против случайной публикации пользовательских данных.
 
 Поэтому изменение состава колод, уровней, конкретных note models, имён полей и
 media не требует правки CI или default-тестов и не должно начать требовать её: ни
-один шаг не называет колоду по имени, а проверка экспортов сама находит то, что
-лежит в `decks/`. Исключение — изменение самого формата или контракта toolkit'а.
+один шаг не называет колоду по имени. Исключение — изменение самого формата или
+контракта toolkit'а.
 
 ## Минимум после любой правки JSON
 

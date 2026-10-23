@@ -11,10 +11,8 @@ use crate::model::{
     Provenance, SemanticStatus, ValidationRecord,
 };
 use crate::pitch_accent::{
-    PitchAccentCaptureRect, PitchAccentCoordinateSpace, PitchAccentDarkThemeProof,
-    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentEvidence,
-    PitchAccentGraphEvidence, PitchAccentImageValidator, PitchAccentProvider,
-    PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm,
+    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentImageValidator,
+    PitchAccentResolvedForm,
 };
 use crate::pitch_batch::{
     PitchAccentBatch, PitchAccentBatchRuntime, PitchBatchItemStatus, PitchBatchOwnerSnapshot,
@@ -97,76 +95,17 @@ fn browser() -> crate::browser_runtime::BrowserRuntimeProvenance {
 }
 
 fn metadata(surface: &str, reading: &str, vocabulary_id: u64) -> PitchAccentDomainMetadata {
-    let source_url = format!("https://jpdb.io/vocabulary/{vocabulary_id}/{surface}/{reading}#a");
-    let rect = PitchAccentCaptureRect {
-        x: 100.0,
-        y: 200.0,
-        width: 20.0,
-        height: 10.0,
-    };
-    PitchAccentDomainMetadata {
-        surface: surface.into(),
-        reading: reading.into(),
-        jpdb_vocabulary_id: vocabulary_id,
-        evidence: PitchAccentEvidence {
-            provider: PitchAccentProvider::Jpdb,
-            source_url,
-            resolved_forms: vec![PitchAccentResolvedForm {
-                surface: surface.into(),
-                reading: reading.into(),
-            }],
-            graph_count: 1,
-            render: PitchAccentRenderEvidence {
-                kind: PitchAccentRenderKind::BrowserRegionScreenshot,
-                selector: ".pitch-accent-graph".into(),
-                graphs: vec![PitchAccentGraphEvidence {
-                    index: 0,
-                    selector: ".pitch-accent-graph".into(),
-                    viewport_rect: PitchAccentCaptureRect {
-                        x: 100.0,
-                        y: 100.0,
-                        width: 20.0,
-                        height: 10.0,
-                    },
-                    document_rect: rect,
-                }],
-                coordinate_space: PitchAccentCoordinateSpace::Document,
-                viewport_width: 1280,
-                viewport_height: 900,
-                document_width: 1280,
-                document_height: 1800,
-                scroll_x: 0.0,
-                scroll_y: 100.0,
-                pixel_width: 60,
-                pixel_height: 30,
-                device_scale_factor: 3.0,
-                page_scale_factor: 1.0,
-                dark_theme: PitchAccentDarkThemeProof {
-                    document_element_classes: vec!["dark-mode".into()],
-                    prefers_color_scheme: "dark".into(),
-                    computed_color_scheme: "dark".into(),
-                    background_selector: ".subsection-pitch-accent".into(),
-                    background_rgb: [24, 36, 48],
-                },
-                graph_union_rect: rect,
-                capture_rect: rect,
-            },
-            browser: browser(),
-        },
-    }
+    crate::pitch_accent::test_support::single_variant_metadata(
+        surface,
+        reading,
+        vocabulary_id,
+        format!("https://jpdb.io/vocabulary/{vocabulary_id}/{surface}/{reading}#a"),
+        browser(),
+    )
 }
 
 fn png(alternate: bool) -> Vec<u8> {
-    let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
-    let start = if alternate { 12 } else { 10 };
-    for x in start..(start + 40) {
-        image.put_pixel(x, 15, image::Rgba([235, 235, 235, 255]));
-    }
-    let mut output = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(image)
-        .write_to(&mut output, image::ImageFormat::Png)
-        .unwrap();
-    output.into_inner()
+    crate::pitch_accent::test_support::single_variant_png(alternate)
 }
 
 fn acquired(surface: &str, alternate: bool) -> JpdbPitchOutcome {
@@ -287,6 +226,121 @@ fn legacy_batch_schema_without_exact_attempt_and_plan_identity_fails_closed() {
         .unwrap()
         .remove("current_candidate_attempt_index");
     assert!(serde_json::from_value::<PitchAccentBatch>(legacy).is_err());
+}
+
+#[test]
+fn stored_state_of_the_previous_validator_is_refused_before_typed_parsing() {
+    let temporary = temp_store();
+    let mut batch = batch("previous-validator-state", "幽霊", Some("ゆうれい"));
+    let mut runtime = PitchAccentBatchRuntime::create(temporary.path(), &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+    let token = batch.item_token("幽霊").unwrap();
+    assert!(
+        runtime
+            .record_outcome(&mut batch, &token, acquired("幽霊", false))
+            .unwrap()
+    );
+    drop(runtime);
+    let state_path = temporary
+        .path()
+        .join(".runtime/batches/previous-validator-state/state.json");
+    let current: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+
+    // Состояние схемы 2: валидатор v5 и свидетельства объединения всех графиков.
+    let mut previous = current.clone();
+    previous["schema_version"] = serde_json::json!(2);
+    previous["validator"]["version"] = serde_json::json!("5");
+    let evidence =
+        &mut previous["items"][0]["attempts"][0]["outcome"]["candidate"]["metadata"]["evidence"];
+    let evidence = evidence.as_object_mut().unwrap();
+    evidence.remove("variant_selection");
+    evidence.insert("graph_count".into(), serde_json::json!(1));
+    let render = evidence["render"].as_object_mut().unwrap();
+    render.remove("captured_graph_count");
+    render.remove("padding_css_px");
+    render.insert("graph_union_rect".into(), render["capture_rect"].clone());
+    let previous = serde_json::to_vec(&previous).unwrap();
+
+    let mut current_schema_old_validator = current;
+    current_schema_old_validator["validator"]["version"] = serde_json::json!("5");
+    let current_schema_old_validator = serde_json::to_vec(&current_schema_old_validator).unwrap();
+
+    for stored in [previous, current_schema_old_validator] {
+        std::fs::write(&state_path, &stored).unwrap();
+        let mut reopened =
+            PitchAccentBatchRuntime::open(temporary.path(), "previous-validator-state").unwrap();
+        let error = reopened.load().unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::error::ErrorCode::UnsupportedSchemaVersion
+        );
+        assert_eq!(std::fs::read(&state_path).unwrap(), stored);
+    }
+}
+
+#[test]
+fn stored_state_with_damaged_version_fields_is_corrupt_rather_than_outdated() {
+    let temporary = temp_store();
+    let batch = batch("damaged-version-fields", "幽霊", Some("ゆうれい"));
+    drop(PitchAccentBatchRuntime::create(temporary.path(), &batch).unwrap());
+    let state_path = temporary
+        .path()
+        .join(".runtime/batches/damaged-version-fields/state.json");
+    let current: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+
+    let mut missing_schema = current.clone();
+    missing_schema
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    let mut textual_schema = current.clone();
+    textual_schema["schema_version"] = serde_json::json!("2");
+    let mut missing_validator = current.clone();
+    missing_validator
+        .as_object_mut()
+        .unwrap()
+        .remove("validator");
+    let mut numeric_validator_version = current;
+    numeric_validator_version["validator"]["version"] = serde_json::json!(5);
+
+    for damaged in [
+        missing_schema,
+        textual_schema,
+        missing_validator,
+        numeric_validator_version,
+    ] {
+        let stored = serde_json::to_vec(&damaged).unwrap();
+        std::fs::write(&state_path, &stored).unwrap();
+        let mut reopened =
+            PitchAccentBatchRuntime::open(temporary.path(), "damaged-version-fields").unwrap();
+        let error = reopened.load().unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::ManifestCorrupt);
+        assert_eq!(std::fs::read(&state_path).unwrap(), stored);
+    }
+}
+
+#[test]
+fn stored_state_with_repeated_top_level_key_is_corrupt() {
+    let temporary = temp_store();
+    let batch = batch("repeated-top-level-key", "幽霊", Some("ゆうれい"));
+    drop(PitchAccentBatchRuntime::create(temporary.path(), &batch).unwrap());
+    let state_path = temporary
+        .path()
+        .join(".runtime/batches/repeated-top-level-key/state.json");
+    let current = std::fs::read(&state_path).unwrap();
+    assert_eq!(current.first(), Some(&b'{'));
+
+    // Повтор `batch_id` с тем же значением: промежуточный `Value` его схлопнул бы.
+    let mut stored = br#"{"batch_id":"repeated-top-level-key","#.to_vec();
+    stored.extend_from_slice(&current[1..]);
+    std::fs::write(&state_path, &stored).unwrap();
+    let mut reopened =
+        PitchAccentBatchRuntime::open(temporary.path(), "repeated-top-level-key").unwrap();
+    let error = reopened.load().unwrap_err();
+    assert_eq!(error.code, crate::error::ErrorCode::ManifestCorrupt);
+    assert_eq!(std::fs::read(&state_path).unwrap(), stored);
 }
 
 #[test]
@@ -774,7 +828,7 @@ fn publication_reconcile_recovers_crash_after_owner_publish_before_final_state_s
     recovered.reconcile_owner(&snapshot).unwrap();
     assert_eq!(
         recovered.revision, revision,
-        "повторный reconcile идемпотентен"
+        "повторное согласование идемпотентно"
     );
     reopened.save(&recovered).unwrap();
     drop(reopened);
@@ -844,7 +898,7 @@ fn same_sha_in_new_generation_publishes_metadata_from_exact_current_attempt() {
     assert_eq!(
         batch.item("幽霊").unwrap().status(),
         PitchBatchItemStatus::PublicationPending,
-        "старый metadata A с тем же SHA не должен завершить новую публикацию"
+        "старые метаданные A с тем же SHA не должен завершить новую публикацию"
     );
     let publication = batch.item("幽霊").unwrap().publication.as_ref().unwrap();
     let current = batch
@@ -1402,6 +1456,67 @@ fn batch_wide_retry_rolls_back_after_first_item_changes_and_second_overflows() {
     assert_eq!(error.message, "превышен номер изменения элемента");
     assert_eq!(serde_json::to_vec(&batch).unwrap(), before);
     assert_eq!(runtime.load().unwrap().unwrap(), batch);
+}
+
+#[test]
+fn cached_validator_decision_does_not_cover_forged_context_or_changed_bytes() {
+    let temporary = temp_store();
+    let root = temporary.path();
+    let mut batch = batch("validator-memo", "幽霊", Some("ゆうれい"));
+    let mut runtime = PitchAccentBatchRuntime::create(root, &batch).unwrap();
+    batch = runtime.load().unwrap().unwrap();
+    let sha = record_provider_outcome(&mut runtime, &mut batch, "幽霊", acquired("幽霊", false));
+    drop(runtime);
+
+    // Повторные загрузки подтверждённого кандидата остаются успешными.
+    let mut reopened = PitchAccentBatchRuntime::open(root, "validator-memo").unwrap();
+    let loaded = reopened.load().unwrap().unwrap();
+    assert!(reopened.load().unwrap().is_some());
+    let candidate = loaded
+        .item("幽霊")
+        .unwrap()
+        .candidate(&sha)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        reopened.read_candidate(&loaded, &candidate).unwrap(),
+        png(false)
+    );
+    assert!(crate::pitch_batch::candidate_context_is_verified(
+        &candidate,
+        &PitchAccentImageValidator::validator_identity()
+    ));
+
+    // Подделка решения с согласованно пересчитанным контекстом — новый контекст:
+    // она снова проходит через PitchAccentImageValidator и отвергается.
+    let mut forged = candidate.clone();
+    forged.validation.evidence[0].summary = "подделанное свидетельство".into();
+    let forged = crate::pitch_batch::with_validation_context(forged).unwrap();
+    assert_ne!(
+        forged.validation_context_sha256,
+        candidate.validation_context_sha256
+    );
+    let mut forged_batch = loaded.clone();
+    let attempt = forged_batch
+        .item_mut("幽霊")
+        .unwrap()
+        .attempts
+        .last_mut()
+        .unwrap();
+    attempt.outcome = crate::pitch_batch::PitchBatchOutcome::Acquired {
+        candidate: Box::new(forged.clone()),
+    };
+    let error = reopened.read_candidate(&forged_batch, &forged).unwrap_err();
+    assert_eq!(error.code, crate::error::ErrorCode::IntegrityMismatch);
+
+    // Изменённые байты того же контекста отвергает проверка SHA до кэша.
+    let blob = root
+        .join(".runtime/batches/validator-memo")
+        .join(&candidate.blob.storage_path);
+    std::fs::write(&blob, png(true)).unwrap();
+    let error = reopened.read_candidate(&loaded, &candidate).unwrap_err();
+    assert_eq!(error.code, crate::error::ErrorCode::IntegrityMismatch);
+    assert!(reopened.load().is_err());
 }
 
 #[test]

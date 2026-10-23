@@ -1,5 +1,7 @@
 # anki-repo
 
+**Русский** · [English](README.en.md) · [简体中文](README.zh-CN.md)
+
 `anki-repo` — набор инструментов для детерминированного анализа CrowdAnki-экспортов,
 строго ограниченных правок их содержимого в репозитории `Anki-decks`. Он даёт агенту быстрый и предсказуемый доступ к структуре
 `deck.json`, не требуя читать многомегабайтный JSON вручную.
@@ -21,15 +23,25 @@
   каноническое имя домена — единственная команда, которой разрешено изменить
   медиассылку существующей заметки, и только после доказательства её семантики.
 
+Отдельно от этих четырёх команд `migrate-layout` по `--apply` переносит раскладку:
+она перемещает каталоги экспортов прежней раскладки в плоский `decks/output/`,
+снимает её placeholder-файлы и удаляет побайтово совпавшие источники. Содержимое
+экспорта при этом не меняется: `deck.json`, `media/` и идентичности переносятся
+байт в байт, а содержимое каждого экспорта доказывается по SHA-256 до и после
+переноса. Это команда миграции раскладки, а не правка экспорта.
+
 Физического удаления заметок в наборе инструментов нет: заметка, которую пора убрать из
 работы, помечается тегом, а удаляет её человек в Anki. Ни одна команда не создаёт
-и не удаляет колоды, модели, поля и конфигурации, не перемещает сущности и не
+и не удаляет колоды, модели, поля и конфигурации, не перемещает сущности внутри
+экспорта и не
 меняет их идентичности (`guid`, `note_model_uuid`, `crowdanki_uuid`,
 `deck_config_uuid`). По умолчанию изменяющие команды выполняют dry-run; запись
 возможна только по явному `--apply`. `create` размещает только проверенные файлы,
 разрешённые правилами точного домена и поля. `migrate-media` материализует
 канонический файл и удаляет соответствующий старый файл только при доказанной
-миграции; произвольной записи в `media/` набор инструментов не предоставляет.
+миграции; произвольной записи в `media/` набор инструментов не предоставляет:
+`migrate-layout` переносит каталог `media/` целиком, вместе с раскладкой и без
+изменения байтов.
 
 `qa`, `review` и `review-check` образуют конвейер внешней проверки содержимого
 карточек: инструмент детерминированно находит проблемы, отдаёт по ним компактный пакет,
@@ -50,7 +62,7 @@
 
 - Один вызов вместо ручного `jq`/скрипта: `inspect`, `find`, `stats`, `validate`,
   `qa`, `review`, `review-check`, `models`, `visual-report`, `edit`, `create`,
-  `retire`, `migrate-media`.
+  `retire`, `migrate-media`, `migrate-layout`.
 - Разрешение имён полей через `note_model_uuid` → `note_models[].flds[].ord`
   сосредоточено в одной реализации, поэтому агент не повторяет эту логику ни при
   чтении, ни при правке, ни при создании заметки.
@@ -103,7 +115,7 @@ cargo build --release --workspace
 ./target/release/anki-repo --help
 
 # или без установки
-cargo run --quiet --bin anki-repo -- inspect decks/japanese/words/Words__N3
+cargo run --quiet --bin anki-repo -- inspect decks/output/Words__N3
 ```
 
 Пути к экспортам можно задавать и относительно текущего каталога, и абсолютно.
@@ -155,7 +167,7 @@ anki-repo maintenance disable
 ## Команды
 
 Во всех примерах ниже `EXPORT` — каталог экспорта, например
-`decks/japanese/words/Words__N3`. Указывать нужно именно каталог: путь к самому
+`decks/output/Words__N3`. Указывать нужно именно каталог: путь к самому
 `deck.json` отвергается с понятной ошибкой.
 
 Пути и имена полей в примерах иллюстративны. Набор инструментов работает с произвольным
@@ -165,6 +177,25 @@ CrowdAnki-экспортом и не знает имён полей конкре
 Имя поля всегда называет вызывающая сторона, а сверяется оно с фактическими
 `note_models[].flds[].name` того экспорта, с которым работает команда.
 
+### Граница закрытой области `decks/input`
+
+`decks/input/` — закрытая область будущего доверенного загрузчика. Ни одна команда
+набора инструментов её не читает, не просматривает и не изменяет: любой путь,
+адресующий `decks/input` (каталог экспорта, `--before`/`--after`, `--out`, `--root`),
+отвергается с `invalid_request` и `details.reason = input_area_forbidden`, а в
+сообщении названа закрытая область и её назначение. Флага-обхода нет: это граница
+API, а не ограничение файловой системы. Она проверяется в том числе внутри
+контракта каталога экспорта, поэтому её соблюдают и библиотечные вызовы, а не только
+CLI. Для работы с колодами предназначен `decks/output/`.
+
+### Границы областей раскладки
+
+`decks/` — локальные данные: каталог игнорируется Git целиком и в чистом
+clone отсутствует. `decks/output/` создаётся по мере надобности (в том числе
+командой `migrate-layout`), а отсутствие области — нормальное состояние, а не
+ошибка. Отслеживаемыми в репозитории остаются только код, документация и
+самодостаточные fixtures вне `decks/`.
+
 ### `inspect`
 
 Компактное описание структуры экспорта: корневая колода, число узлов колоды,
@@ -172,8 +203,8 @@ CrowdAnki-экспортом и не знает имён полей конкре
 колод, сводка по медиа и распределение заметок по путям колод.
 
 ```bash
-anki-repo inspect decks/japanese/words/Words__N1
-anki-repo inspect decks/japanese/words/Words__N1 --verbose
+anki-repo inspect decks/output/Words__N1
+anki-repo inspect decks/output/Words__N1 --verbose
 ```
 
 `--verbose` добавляет UUID, дерево колод от родителя к детям, шаблоны карточек, статистику
@@ -188,14 +219,14 @@ anki-repo inspect decks/japanese/words/Words__N1 --verbose
 
 ```bash
 # поиск по guid: identity lookup
-anki-repo find decks/japanese/words/Words__N1 --guid 'D!TAYVuHi,'
+anki-repo find decks/output/Words__N1 --guid 'D!TAYVuHi,'
 
 # поиск по сырому значению поля: содержит подстроку
-anki-repo find decks/japanese/words/Words__N1 --field Слово --value 偶然
+anki-repo find decks/output/Words__N1 --field Слово --value 偶然
 
 # общий поиск по любому имени поля: подстрока и точное совпадение
-anki-repo find decks/japanese/words/Words__N2 --field 'Часть речи' --value Существительное
-anki-repo find decks/japanese/words/Words__N1 --field 'Часть речи' --value Существительное --match exact
+anki-repo find decks/output/Words__N2 --field 'Часть речи' --value Существительное
+anki-repo find decks/output/Words__N1 --field 'Часть речи' --value Существительное --match exact
 ```
 
 Поведение:
@@ -222,8 +253,8 @@ anki-repo find decks/japanese/words/Words__N1 --field 'Часть речи' --va
 медиафайлам.
 
 ```bash
-anki-repo stats decks/japanese/words/Words__N3
-anki-repo stats decks/japanese/words/Words__N3 --group-by 'Часть речи' --top 10
+anki-repo stats decks/output/Words__N3
+anki-repo stats decks/output/Words__N3 --group-by 'Часть речи' --top 10
 ```
 
 - `--group-by` считает распределение по сырым значениям указанного поля; `--top`
@@ -236,8 +267,8 @@ anki-repo stats decks/japanese/words/Words__N3 --group-by 'Часть речи' 
 Детерминированная проверка структурной целостности одного экспорта.
 
 ```bash
-anki-repo validate decks/japanese/words/Words__N1
-anki-repo --json validate decks/japanese/words/Words__N1
+anki-repo validate decks/output/Words__N1
+anki-repo --json validate decks/output/Words__N1
 ```
 
 `valid` равно `true`, если не найдено ни одной проблемы уровня `ERROR`.
@@ -285,9 +316,9 @@ anki-repo --json validate decks/japanese/words/Words__N1
 чему, кроме самого экспорта, и не зависят от текущего состояния репозитория.
 
 ```bash
-anki-repo qa decks/japanese/words/Words__N1
-anki-repo qa decks/japanese/words/Words__N3 --code empty_field_value --max-per-code 5
-anki-repo --json qa decks/japanese/words/Words__N5 > findings.json
+anki-repo qa decks/output/Words__N1
+anki-repo qa decks/output/Words__N3 --code empty_field_value --max-per-code 5
+anki-repo --json qa decks/output/Words__N5 > findings.json
 ```
 
 Реестр правил (порядок вывода замечания — это порядок реестра, он же порядок
@@ -360,14 +391,14 @@ anki-repo --json qa decks/japanese/words/Words__N5 > findings.json
 
 ```bash
 # отобрать заметки по найденной проблеме
-anki-repo review decks/japanese/words/Words__N1 --qa-code empty_field_value --limit 25
+anki-repo review decks/output/Words__N1 --qa-code empty_field_value --limit 25
 
 # следующая страница
-anki-repo review decks/japanese/words/Words__N1 --qa-code empty_field_value --offset 25
+anki-repo review decks/output/Words__N1 --qa-code empty_field_value --offset 25
 
 # выбор по содержимому и точный lookup
-anki-repo review decks/japanese/words/Words__N2 --field 'Часть речи' --value Существительное
-anki-repo review decks/japanese/words/Words__N1 --guid 'D!TAYVuHi,'
+anki-repo review decks/output/Words__N2 --field 'Часть речи' --value Существительное
+anki-repo review decks/output/Words__N1 --guid 'D!TAYVuHi,'
 ```
 
 Ровно один критерий отбора обязателен:
@@ -421,16 +452,16 @@ anki-repo review decks/japanese/words/Words__N1 --guid 'D!TAYVuHi,'
 
 ```bash
 # проверить предложения и получить готовый запрос для `edit`
-anki-repo --json review-check decks/japanese/words/Words__N1 \
+anki-repo --json review-check decks/output/Words__N1 \
   --proposals proposals.json | jq .result.edit_request > request.json
 
 # то же со stdin
-anki-repo review-check decks/japanese/words/Words__N1 --proposals - < proposals.json
+anki-repo review-check decks/output/Words__N1 --proposals - < proposals.json
 
 # готовый запрос уходит в существующую границу записи
-anki-repo edit decks/japanese/words/Words__N1 --request request.json
-anki-repo edit decks/japanese/words/Words__N1 --request request.json --apply
-anki-repo validate decks/japanese/words/Words__N1
+anki-repo edit decks/output/Words__N1 --request request.json
+anki-repo edit decks/output/Words__N1 --request request.json --apply
+anki-repo validate decks/output/Words__N1
 ```
 
 У команды собственный версионируемый документ предложений, а не запрос `edit`:
@@ -533,7 +564,7 @@ anki-repo validate decks/japanese/words/Words__N1
 имя поля — не контракт, а факт конкретного экспорта.
 
 ```bash
-EXPORT=decks/japanese/words/Words__N1
+EXPORT=decks/output/Words__N1
 
 # модели корневой колоды экспорта (селектор по умолчанию — preorder 0)
 anki-repo models "$EXPORT"
@@ -581,7 +612,7 @@ anki-repo models "$EXPORT" --sample-limit 5
 схемой, которую объявляет сам экспорт.
 
 ```bash
-EXPORT=decks/japanese/words/Words__N1
+EXPORT=decks/output/Words__N1
 REQUEST=create.json
 
 # 1. сначала dry-run: посмотреть, что получится
@@ -858,7 +889,7 @@ note_models:
 порядок обработчиков выводится из `identity.namespace`, а не из имени файла.
 
 То же плоское пространство имён — источник единственного известного конфликта имён:
-прежний конвейер называл pitch-картинку `<surface>.png`, и для односложного слова
+прежний конвейер называл pitch-картинку `<surface>.png`, и для слова из одного иероглифа
 с запасным kanji-изображением это имя совпадает с каноническим именем изображения символа.
 Такой конфликт разрешается не перезаписью файла и не ручной правкой `deck.json`, а
 отдельной командой [`migrate-media`](#migrate-media), которая переводит ссылки на
@@ -976,7 +1007,7 @@ anki-repo migrate-media EXPORT --namespace pitch_accent --key 飴 --from 飴.png
 Зачем она нужна. Плоское пространство имён `media/` CrowdAnki общее для всех
 доменов, а канонические имена домены разводят намеренно: kanji-домен кладёт изображение
 символа под `<char>.gif|png`, pitch-домен — под `<surface>.pitch.png`. Прежний
-конвейер называл pitch-картинку `<surface>.png`, и для односложного слова с
+конвейер называл pitch-картинку `<surface>.png`, и для слова из одного иероглифа с
 запасным kanji-изображением это имя совпадает с каноническим именем изображения символа: под
 одним именем оказываются два разных файла. `create` обязан отказать
 (`destination_media_conflict`) и не выбирать, чьи байты важнее. Команда переводит
@@ -1105,6 +1136,90 @@ anki-repo migrate-media EXPORT --namespace pitch_accent --key 飴 --from 飴.png
 | `legacy_released` | `true` только если файл действительно удалён при успешном `--apply`; не предсказывает результат удаления |
 | `validation` | счётчики и новые коды до/после |
 
+### `migrate-layout`
+
+Одноразовая контролируемая миграция раскладки экспортов репозитория: экспорты
+прежней раскладки внутри `decks/` переезжают в плоский
+`decks/output/<имя_корня_экспорта>/`. Содержимое экспорта команда не трогает: ни
+`deck.json`, ни `media/`, ни идентичности не меняются.
+
+```bash
+# 1. сначала план: что и куда переедет
+anki-repo migrate-layout --root . --json
+
+# 2. запись: перенести и снять placeholder-файлы прежней раскладки
+anki-repo migrate-layout --root . --apply
+```
+
+Почему перенос доказуем. Перед записью команда перечисляет **все** файлы каждого
+найденного экспорта, их размеры и SHA-256 и сворачивает список в один отпечаток
+содержимого. План строится до захвата блокировки, поэтому непосредственно перед
+переносом отпечаток источника пересчитывается: расхождение — отказ до изменения
+раскладки. После переноса отпечаток пересчитывается по назначению и сверяется с
+доказанным: расхождение — ошибка `source_changed`, а не «успешный» перенос. В
+пределах одной файловой системы экспорт переезжает одним `rename`; если `rename`
+невозможен, каталог копируется во временный `.anki-repo-migrate-tmp-*` рядом с
+назначением, копия проверяется по отпечатку, публикуется `rename`, и только затем
+удаляется источник.
+
+Команда отказывает целиком, не перенося ничего, если:
+
+- два экспорта дают одно плоское имя назначения или оно совпадает с уже лежащим
+  в `decks/output/` (сравнение не различает регистр и Unicode-нормализацию) —
+  `target_name_collision`;
+- назначение занято и его содержимое не совпадает с источником —
+  `target_conflict`; появившееся между планом и записью назначение —
+  `target_appeared`;
+- источник или элемент внутри него является символической ссылкой —
+  `source_is_symlink`, `source_contains_symlink`; назначение-ссылка —
+  `target_is_symlink`;
+- имя корня экспорта или файла внутри него не является корректным UTF-8 —
+  `source_non_utf8_name`;
+- источник исчез или не является каталогом — `source_missing`,
+  `source_not_directory`; источник невозможно прочитать — `source_unreadable`;
+- в источнике нет `deck.json` — `deck_json_missing`;
+- назначение существует, но недоступно для чтения — `target_unreadable`;
+- сам `decks/` содержит `deck.json` (`legacy_area_is_export`): переносить корень
+  области вместе с `decks/input` и `decks/output` нельзя.
+
+Отказ — это код возврата 3 и `refused: true` в отчёте; ни один экспорт при этом не
+переносится.
+
+Что делает команду идемпотентной. Уже существующее назначение, побайтово равное
+источнику, не перезаписывается: команда сообщает `already_present` и снимает
+дубликат источника. Поэтому прерванная на середине миграция доводится повторным
+`--apply`, а завершённая не находит источников и ничего не делает. Свободное место
+проверяется до первой записи: нехватка сообщается как `write_failed` с
+`required_bytes` и `available_bytes`.
+
+Placeholder-файлы прежней раскладки (нулевые `.gitkeep`) и опустевшие каталоги
+снимаются только тогда, когда в прежней области не осталось ничего другого: любой
+посторонний файл сохраняет её целиком и попадает в диагностику
+`legacy_area_retained` со списком путей.
+
+Прежняя область удерживается `ExportLock` на всё время записи, поэтому две
+одновременные миграции не перемешиваются.
+
+#### Отчёт
+
+| Ключ | Значение |
+|---|---|
+| `root` | абсолютный корень репозитория; остальные пути отчёта — относительно него |
+| `legacy_area`, `output_dir` | прежняя область раскладки и плоское назначение |
+| `apply`, `applied`, `refused` | запрошена ли запись, выполнена ли она и есть ли хотя бы один отказ |
+| `exports[]` | по каждому экспорту: `name`, `source`, `target` (относительно корня), `action` (`move` / `already_present` / `refused`), `state` (`planned` / `applied` / `refused`), `files`, `bytes`, `content_sha256`, `reason`, `message` |
+| `pruned` | снятые placeholder-файлы и опустевшие каталоги прежней раскладки (относительно корня) |
+| `diagnostics` | `symlink_skipped`, `legacy_area_absent`, `nothing_to_migrate`, `legacy_area_retained`; `paths` — относительно корня |
+| `summary` | `exports`, `planned`, `applied`, `already_present`, `refused`, `files`, `bytes` |
+
+#### Если прежняя раскладка уже отслеживалась Git
+
+`.gitignore` не отменяет уже добавленный индекс, поэтому перенос файлов сам по себе не
+делает их локальными: после `migrate-layout --apply` их нужно снять из индекса
+(`git rm -r --cached decks/<прежняя_область>`) и закоммитить это удаление. Обратная
+сторона: коммит, удаляющий отслеживаемые файлы, при `git pull` удалит их и в других
+рабочих копиях. Перед получением такого коммита сделайте резервную копию `decks/`.
+
 ### `retire`
 
 Вывод заметки из обращения: к её тегам дописывается один тег, больше не меняется
@@ -1112,7 +1227,7 @@ anki-repo migrate-media EXPORT --namespace pitch_accent --key 飴 --from 飴.png
 невозможно, а удаляет её человек в Anki, когда сочтёт нужным.
 
 ```bash
-EXPORT=decks/japanese/words/Words__N1
+EXPORT=decks/output/Words__N1
 
 # dry-run по одному guid
 anki-repo retire "$EXPORT" --guid "w0Wc3Ip@N#" --tag "archived::auto"
@@ -1200,7 +1315,7 @@ cat retire.json | anki-repo retire "$EXPORT" --request - --apply
 описана ниже и проверяется тестами.
 
 ```bash
-EXPORT=decks/japanese/words/Words__N1
+EXPORT=decks/output/Words__N1
 
 # сравнить колоду с её изменённой копией
 anki-repo visual-report \
@@ -1368,8 +1483,8 @@ anki-repo visual-report --before … --after … --out … --preview-limit 50
 #### Границы каталога отчёта и владение им
 
 `--out` обязан быть вне любого `decks/**` и вне сравниваемых экспортов: отчёт —
-это сотни файлов, и попадание такого каталога внутрь экспорта было бы скрытой
-правкой данных репозитория.
+это сотни файлов, а внутри `decks/**` лежат игнорируемые Git пользовательские данные,
+поэтому попадание туда было бы скрытой правкой данных.
 
 Непустой каталог принимается только тогда, когда он **доказывает**, что он наш: в
 нём лежит `report-manifest.json` — список файлов отчёта, записанный прошлым
@@ -1465,7 +1580,7 @@ anki-repo visual-report --before … --after … --out … --preview-limit 50
 ### Типовой конвейер
 
 ```bash
-EXPORT=decks/japanese/words/Words__N1
+EXPORT=decks/output/Words__N1
 
 # 1. что вообще есть в экспорте
 anki-repo qa "$EXPORT"
@@ -1489,7 +1604,7 @@ anki-repo validate "$EXPORT"
 Добавление новой заметки и вывод старой из обращения идут тем же маршрутом:
 
 ```bash
-EXPORT=decks/japanese/words/Words__N1
+EXPORT=decks/output/Words__N1
 
 # 1. фактическая схема полей: как поля называются и что в них лежит
 anki-repo models "$EXPORT"
@@ -1546,8 +1661,8 @@ anki-repo visual-report --before "$ЭТАЛОН" --after "$EXPORT" --out /tmp/о
 
 ### `edit`
 
-Единственная мутирующая команда. Её предмет — значение одного поля одной уже
-существующей заметки. Правка адресуется парой «`guid` заметки, имя поля»: `guid`
+Команда правки **значений полей существующих заметок**. Её предмет — значение
+одного поля одной уже существующей заметки. Правка адресуется парой «`guid` заметки, имя поля»: `guid`
 ищется в экспорте, имя поля разрешается через `note_model_uuid` заметки и
 `note_models[].flds[].ord`, а записывается результат в `fields[ord]`.
 
@@ -1557,18 +1672,18 @@ anki-repo visual-report --before "$ЭТАЛОН" --after "$EXPORT" --out /tmp/о
 
 ```bash
 # одиночная правка: dry-run
-anki-repo edit decks/japanese/words/Words__N1 \
+anki-repo edit decks/output/Words__N1 \
   --guid 'D!TAYVuHi,' --field 'Значение' --expect 'было' --set 'стало'
 
 # та же правка с записью
-anki-repo edit decks/japanese/words/Words__N1 \
+anki-repo edit decks/output/Words__N1 \
   --guid 'D!TAYVuHi,' --field 'Значение' --expect 'было' --set 'стало' --apply
 
 # пакетная правка из файла запроса
-anki-repo edit decks/japanese/words/Words__N1 --request edits.json --apply
+anki-repo edit decks/output/Words__N1 --request edits.json --apply
 
 # пакетная правка со stdin
-anki-repo edit decks/japanese/words/Words__N1 --request - --apply < edits.json
+anki-repo edit decks/output/Words__N1 --request - --apply < edits.json
 ```
 
 Одиночная правка задаётся флагами `--guid`, `--field`, `--expect` и `--set`; все
@@ -1733,8 +1848,11 @@ non-ASCII без `\u`-экранирования, без завершающег�
 
 ### Добавленные команды и гарантии
 
-- Добавлены `models`, `create`, `retire`, `migrate-media` и `visual-report`.
-  Мутирующих команд четыре (`edit`, `create`, `retire`, `migrate-media`). Ни одна из новых команд не
+- Добавлены `models`, `create`, `retire`, `migrate-media`, `migrate-layout` и
+  `visual-report`.
+  Команд правки экспорта четыре (`edit`, `create`, `retire`, `migrate-media`);
+  пятая команда записи — `migrate-layout`, и меняет она не содержимое экспорта,
+  а раскладку. Ни одна из новых команд не
   создаёт колоды или модели: `create` добавляет заметку в существующую
   колоду существующей модели и по явно заданным правилам может разместить
   проверенные медиафайлы;
@@ -1742,6 +1860,14 @@ non-ASCII без `\u`-экранирования, без завершающег�
 - `visual-report` пишет новый каталог отчёта и **никогда** не пишет внутрь экспорта
   или `decks/**`: это проверяется до первой записи и подтверждается списком
   фактически записанных путей.
+- `migrate-layout` — отдельная команда миграции раскладки, а не одна из четырёх
+  команд правки экспорта: по `--apply` она переносит каталоги экспортов прежней
+  раскладки в плоский `decks/output/`, снимает её placeholder-файлы и удаляет
+  побайтово совпавшие источники, доказывая содержимое каждого экспорта по SHA-256.
+  В `deck.json` она не пишет и идентичности не меняет.
+- Граница `decks/input` добавлена как отказ `invalid_request` с
+  `details.reason = input_area_forbidden` для любого пути, адресующего закрытую
+  область. Отдельного флага-обхода нет.
 - Физического удаления заметки в наборе инструментов нет. Прежнее поведение «отсутствие
   заметки в JSON ничего не удаляет» осталось наблюдением (`removed` в отчёте), и
   именно поэтому вывод из обращения сделан тегом.
@@ -1851,7 +1977,7 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | `0` | Успех |
 | `1` | Зарезервировано |
 | `2` | Ошибка использования CLI (неизвестный аргумент, несовместимая комбинация, значение вне диапазона) |
-| `3` | Неверный ввод, из-за которого команда не может начать работу: нет каталога, передан не каталог, нет `deck.json`, `deck.json` не читается; для всех команд, которым нужен типизированный экспорт (`inspect`, `find`, `stats`, `qa`, `review`, `review-check`, `edit`), — также невалидный JSON (`invalid_json`), корень не `Deck` (`root_not_deck`) или несоответствие типизированному ядру (`schema_invalid`); для `find`, `review` и `qa` — ещё и неизвестное поле, колода или код QA в критерии, а для `review-check` — неразбираемый документ предложений или неканонический `deck.json` (`source_not_canonical`). `maintenance` возвращает этот код с `input_unreadable`, когда не удаётся определить рабочую область Cargo (в том числе по некорректному `--workspace-root`). `validate` сюда не входит: он читает и невалидный JSON, сообщая о нём в виде проблем с кодом возврата `6` |
+| `3` | Неверный ввод, из-за которого команда не может начать работу: нет каталога, передан не каталог, нет `deck.json`, `deck.json` не читается; для всех команд, которым нужен типизированный экспорт (`inspect`, `find`, `stats`, `qa`, `review`, `review-check`, `edit`), — также невалидный JSON (`invalid_json`), корень не `Deck` (`root_not_deck`) или несоответствие типизированному ядру (`schema_invalid`); для `find`, `review` и `qa` — ещё и неизвестное поле, колода или код QA в критерии, а для `review-check` — неразбираемый документ предложений или неканонический `deck.json` (`source_not_canonical`). `maintenance` возвращает этот код с `input_unreadable`, когда не удаётся определить рабочую область Cargo (в том числе по некорректному `--workspace-root`). `validate` сюда не входит: он читает и невалидный JSON, сообщая о нём в виде проблем с кодом возврата `6`. `migrate-layout` возвращает `3` с `refused: true` в отчёте, если хотя бы один экспорт отвергнут: отказ не является успехом, но и не является доменной ошибкой. |
 | `4` | Совпадений не найдено: `find`, `review --guid`, `edit` или предложение `review-check` с несуществующей заметкой |
 | `5` | `find --guid` или `review --guid` нашёл несколько заметок с одним `guid`; для `review-check` — если среди `invalid`-предложений есть хотя бы одно с неоднозначным `guid` |
 | `6` | `validate` нашёл хотя бы одну проблему уровня `ERROR`, в том числе `invalid_json`, `root_not_deck` или `schema_invalid`; `edit` отказался править экспорт с `ERROR` или с неоднозначным определением модели. Повтор `guid` (`duplicate_note_guid`) — это `ERROR`, поэтому `edit` на таком экспорте завершается кодом `6`, а не `5`: проверка валидности исходника идёт раньше разрешения правки. `review-check` называет тот же блокер (`export_invalid` / `export_not_mutable`) и возвращает `6` вместо итогового кода отчёта — запрос он не выпускает |
@@ -1870,7 +1996,7 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | Код | Код возврата | Когда |
 |---|---|---|
 | `usage` | 2 | Несовместимые аргументы, обнаруженные вне clap |
-| `input_unreadable` | 3 | Не удалось прочитать каталог экспорта, запрос `edit` или документ `review-check`; для `maintenance` — определить рабочую область Cargo по отсутствующему или неразрешимому `--workspace-root` |
+| `input_unreadable` | 3 | Не удалось прочитать каталог экспорта, запрос `edit` или документ `review-check`; `migrate-layout` — обойти прежнюю область или снять отпечаток источника; для `maintenance` — определить рабочую область Cargo по отсутствующему или неразрешимому `--workspace-root` |
 | `deck_json_missing` | 3 | В каталоге нет `deck.json` |
 | `invalid_json` | 3 | `deck.json` не является валидным JSON |
 | `root_not_deck` | 3 | Корень не является CrowdAnki `Deck` |
@@ -1878,14 +2004,14 @@ non-ASCII без `\u`-экранирования, без завершающег�
 | `unknown_field` | 3 | Указанного поля нет ни в одной модели экспорта; для `edit` — также если поля нет в модели целевой заметки |
 | `unknown_deck` | 3 | Указанная колода не найдена |
 | `unknown_qa_code` | 3 | Указанного кода QA нет в реестре правил (`qa --code`, `review --qa-code`) |
-| `invalid_request` | 3 | Некорректный документ запроса `edit` либо предложений `review-check`: формат, версия, поля, идентификаторы или лимит размера |
+| `invalid_request` | 3 | Некорректный документ запроса `edit` либо предложений `review-check`: формат, версия, поля, идентификаторы или лимит размера. Для любой команды — путь, адресующий закрытую область `decks/input` (`details.reason = input_area_forbidden`) |
 | `duplicate_edit_target` | 3 | `edit` и `review-check`: пара «`guid`, поле» запрошена дважды (отдельный код, а не `details.reason` внутри `invalid_request`) |
 | `proposal_not_executable` (`details.reason`) | — | Не отдельный код: `review-check` сообщает о неисполнимом предложении статусом `invalid` внутри отчёта, а не ошибкой команды |
 | `source_not_canonical` | 3 | `edit`: `deck.json` не в канонической форме; `review-check`: тот же блокер в `source_blockers`, запрос не выпущен |
 | `export_invalid` | 6 | `edit`: в исходном экспорте есть `ERROR` (в том числе `duplicate_note_guid` — повтор `guid` делает адресацию правки неоднозначной); либо кандидат правки получил новый `ERROR` (проверка до записи). `review-check` называет этот блокер в `source_blockers` и возвращает `6` вместо итогового кода отчёта |
 | `export_not_mutable` | 6 | `edit`: в экспорте есть `conflicting_note_model_definition`; `review-check` — тот же блокер в `source_blockers` |
 | `expected_mismatch` | 7 | `edit`: текущее значение не совпало с `expected` |
-| `source_changed` | 7 | `edit`: `deck.json` изменился или исчез между проверкой и заменой; правка отменена |
+| `source_changed` | 7 | `edit`: `deck.json` изменился или исчез между проверкой и заменой; правка отменена. `migrate-layout`: отпечаток содержимого после переноса разошёлся с доказанным до переноса (в том числе при копировании между файловыми системами) — перенос не считается выполненным |
 | `write_failed` | 8 | Отказ при записи/публикации результата (включая `deck.json`) или настройке системного обслуживания |
 | `not_found` | 4 | `find` или `review --guid`: нет совпадений |
 | `note_not_found` | 4 | `edit`: в экспорте нет заметки с указанным `guid`; в отчёте `review-check` — код проблемы предложения (доменной ошибкой не является) |
@@ -2051,15 +2177,23 @@ cargo test --workspace --locked
 То же самое независимо от локального окружения выполняет CI
 (`.github/workflows/ci.yml`) на `pull_request`, на push в ветку по умолчанию и вручную:
 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D
-warnings` и `cargo test --workspace --locked`. Затем CI сам находит `deck.json`
-внутри `decks/` и вызывает для каждого `validate`, не называя ни одной колоды,
-уровня, модели или поля по имени: если экспортов нет, шаг проходит успешно, а если
-найденный экспорт структурно невалиден — шаг падает. CI только читает репозиторий,
-поэтому изменение состава `decks/` не требует правки процесса CI; валидность
-фактически закоммиченных данных при этом остаётся обязательной проверкой репозитория.
+warnings` и `cargo test --workspace --locked`. Дополнительно CI проверяет границу
+пользовательских данных: ни один путь внутри `decks/` (каталог игнорируется целиком)
+или `.asset-store/` не должен быть отслеживаемым, а правила игнорирования обязаны быть на
+месте и не ослаблены повторным включением (`.github/scripts/check_local_data_untracked.py`).
+Проверка идёт по фактическому индексу Git, потому что `.gitignore` не отменяет уже
+добавленный индекс и обходится `git add -f`.
 
-Фактические данные проверяет CI; обычные тесты набора инструментов строят
-собственные синтетические экспорты и `decks/**` не читают.
+Содержимое пользовательских областей CI не проверяет намеренно: в чистом clone этих
+областей не существует, и шаг, который «проверил» бы их отсутствие, выдал бы пустоту
+за проверку личных колод. Свой экспорт проверяют локально — `anki-repo validate` по
+конкретному каталогу `decks/output/<имя_экспорта>`; свой корпус ресурсов — локальные
+`kanji-corpus-gate` и `pitch-corpus-gate` (см. `tools/asset-store/README.md`). CI
+только читает репозиторий, поэтому изменение состава колод не требует правки процесса
+CI.
+
+Обычные тесты набора инструментов строят собственные синтетические экспорты и
+`decks/**` не читают.
 
 Заявленная MSRV проверяется отдельным заданием на версии из корневого `Cargo.toml`:
 процесс CI читает `[workspace.package] rust-version` через `cargo metadata`, заодно
@@ -2096,6 +2230,10 @@ cargo "+$MSRV" check --workspace --all-targets --locked
 - `tests/cli_contract.rs` — аргументы CLI, коды возврата и разделение
   `stdout`/`stderr` через реальный исполняемый файл, включая негативные проверки снятых
   контрактов: флаг `--word` отвергается как неизвестный аргумент;
+- `tests/local_data_contract.rs` — граница локальных данных: закрытая область
+  `decks/input` отвергается всеми командами с `input_area_forbidden`, экспорт внутри
+  `decks/output` остаётся читаемым, а `migrate-layout` проверяется на идемпотентность,
+  отказ при коллизии имён и сохранение байтов;
 - `tests/qa_contract.rs` — контракт `qa`: состав реестра (ровно пять кодов, без
   `duplicate_primary_field`), уровень `error` без отказа (и без влияния на
   `validate`/`edit`), границы выборок в `evidence`, `--max-per-code` против полных

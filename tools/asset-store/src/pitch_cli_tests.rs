@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Cursor;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -20,10 +19,8 @@ use crate::jpdb::{
 };
 use crate::model::{AssetIdentity, HumanDecision, LifecycleState, Provenance, SemanticStatus};
 use crate::pitch_accent::{
-    PitchAccentCaptureRect, PitchAccentCoordinateSpace, PitchAccentDarkThemeProof,
-    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentEvidence,
-    PitchAccentGraphEvidence, PitchAccentImageValidator, PitchAccentProvider,
-    PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm,
+    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentImageValidator,
+    PitchAccentResolvedForm,
 };
 use crate::pitch_batch::{
     PitchAccentBatch, PitchAccentBatchRuntime, PitchBatchItemStatus, PitchBatchOwnerSnapshot,
@@ -192,74 +189,17 @@ fn browser() -> BrowserRuntimeProvenance {
 }
 
 fn metadata(surface: &str, reading: &str, vocabulary_id: u64) -> PitchAccentDomainMetadata {
-    let rect = PitchAccentCaptureRect {
-        x: 100.0,
-        y: 200.0,
-        width: 20.0,
-        height: 10.0,
-    };
-    PitchAccentDomainMetadata {
-        surface: surface.into(),
-        reading: reading.into(),
-        jpdb_vocabulary_id: vocabulary_id,
-        evidence: PitchAccentEvidence {
-            provider: PitchAccentProvider::Jpdb,
-            source_url: format!("https://jpdb.io/vocabulary/{vocabulary_id}/{surface}/{reading}"),
-            resolved_forms: vec![PitchAccentResolvedForm {
-                surface: surface.into(),
-                reading: reading.into(),
-            }],
-            graph_count: 1,
-            render: PitchAccentRenderEvidence {
-                kind: PitchAccentRenderKind::BrowserRegionScreenshot,
-                selector: ".pitch-graph".into(),
-                graphs: vec![PitchAccentGraphEvidence {
-                    index: 0,
-                    selector: ".pitch-graph".into(),
-                    viewport_rect: PitchAccentCaptureRect {
-                        x: 100.0,
-                        y: 100.0,
-                        width: 20.0,
-                        height: 10.0,
-                    },
-                    document_rect: rect,
-                }],
-                coordinate_space: PitchAccentCoordinateSpace::Document,
-                viewport_width: 1280,
-                viewport_height: 900,
-                document_width: 1280,
-                document_height: 1800,
-                scroll_x: 0.0,
-                scroll_y: 100.0,
-                pixel_width: 60,
-                pixel_height: 30,
-                device_scale_factor: 3.0,
-                page_scale_factor: 1.0,
-                dark_theme: PitchAccentDarkThemeProof {
-                    document_element_classes: vec!["dark-mode".into()],
-                    prefers_color_scheme: "dark".into(),
-                    computed_color_scheme: "normal".into(),
-                    background_selector: "body".into(),
-                    background_rgb: [24, 36, 48],
-                },
-                graph_union_rect: rect,
-                capture_rect: rect,
-            },
-            browser: browser(),
-        },
-    }
+    crate::pitch_accent::test_support::single_variant_metadata(
+        surface,
+        reading,
+        vocabulary_id,
+        format!("https://jpdb.io/vocabulary/{vocabulary_id}/{surface}/{reading}"),
+        browser(),
+    )
 }
 
 fn png() -> Vec<u8> {
-    let mut image = image::RgbaImage::from_pixel(60, 30, image::Rgba([24, 36, 48, 255]));
-    for x in 10..50 {
-        image.put_pixel(x, 15, image::Rgba([235, 235, 235, 255]));
-    }
-    let mut output = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(image)
-        .write_to(&mut output, image::ImageFormat::Png)
-        .unwrap();
-    output.into_inner()
+    crate::pitch_accent::test_support::single_variant_png(false)
 }
 
 fn store_at(root: &std::path::Path) -> AssetStore {
@@ -5981,4 +5921,123 @@ async fn batch_retry_technical_empty_selection_reports_owner_reconciliation_chan
     let response: serde_json::Value = serde_json::from_str(&repeated.stdout).unwrap();
     assert_eq!(response["changed"], false);
     assert!(response.get("retried_identities").is_none());
+}
+
+#[tokio::test]
+async fn review_export_and_apply_bind_decisions_to_snapshot_across_separate_processes() {
+    let workspace = temp_root();
+    let root = workspace.path();
+    let store = store_at(root);
+    let store_root = store.root().to_path_buf();
+    let mut batch = PitchAccentBatch::new(
+        "cli-review",
+        vec![JpdbPitchRequest::new(JpdbPitchQuery::new(
+            "幽霊",
+            Some("ゆうれい".into()),
+        ))],
+        PitchAccentImageValidator::validator_identity(),
+    )
+    .unwrap();
+    let mut runtime = PitchAccentBatchRuntime::create(store.root(), &batch).unwrap();
+    let token = batch.item_token("幽霊").unwrap();
+    assert!(
+        runtime
+            .record_outcome(
+                &mut batch,
+                &token,
+                JpdbPitchOutcome::AmbiguousVocabulary {
+                    surface: "幽霊".into(),
+                    reading: Some("ゆうれい".into()),
+                    candidates: ambiguity_candidates(),
+                },
+            )
+            .unwrap()
+    );
+    drop(runtime);
+    drop(store);
+    let batch_command = |command| {
+        execute(cli(
+            store_root.clone(),
+            root.to_path_buf(),
+            OutputFormat::Json,
+            PitchCommand::Batch { command },
+        ))
+    };
+
+    // Выгрузка и применение — отдельные вызовы CLI: снимок и решения живут на диске.
+    let exported = batch_command(PitchBatchCommand::ReviewExport {
+        batch_id: "cli-review".into(),
+    })
+    .await;
+    assert_eq!(exported.exit_code, 0, "{}", exported.stdout);
+    let exported: serde_json::Value = serde_json::from_str(&exported.stdout).unwrap();
+    assert_eq!(exported["operation"], "batch_review_export");
+    let review_id = exported["review_id"].as_str().unwrap().to_owned();
+    let decisions = PathBuf::from(exported["review_artifact"].as_str().unwrap());
+    let text = fs::read_to_string(&decisions).unwrap();
+    assert!(text.contains(&format!("@review\t1\tcli-review\t{review_id}")));
+    // Файл, выгруженный прежней версией с англоязычной шапкой, применяется так
+    // же: `#`-комментарии не входят ни в подпись, ни в разбор строк.
+    assert!(text.starts_with("# Проверка произношения JPDB, формат v1\n"));
+    let text = text.replacen(
+        "# Проверка произношения JPDB, формат v1",
+        "# JPDB PITCH REVIEW v1",
+        1,
+    );
+    fs::write(
+        &decisions,
+        text.replace(
+            "\t幽霊\tambiguous_vocabulary",
+            "124\t幽霊\tambiguous_vocabulary",
+        ),
+    )
+    .unwrap();
+
+    // Чужой review_id отклоняется, не меняя пакет.
+    let foreign = batch_command(PitchBatchCommand::ReviewApply {
+        batch_id: "cli-review".into(),
+        review_id: "0".repeat(64),
+    })
+    .await;
+    assert_ne!(foreign.exit_code, 0);
+    let foreign: serde_json::Value = serde_json::from_str(&foreign.stdout).unwrap();
+    assert_eq!(foreign["changed"], false);
+
+    let applied = batch_command(PitchBatchCommand::ReviewApply {
+        batch_id: "cli-review".into(),
+        review_id: review_id.clone(),
+    })
+    .await;
+    assert_eq!(applied.exit_code, 0, "{}", applied.stdout);
+    let applied: serde_json::Value = serde_json::from_str(&applied.stdout).unwrap();
+    assert_eq!(applied["changed"], true);
+    assert_eq!(applied["review_decisions"]["selected"], 1);
+    let saved = PitchAccentBatchRuntime::open(&store_root, "cli-review")
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+    let selection = saved
+        .item("幽霊")
+        .unwrap()
+        .request
+        .selection
+        .clone()
+        .unwrap();
+    assert_eq!(selection.vocabulary_id, 124);
+    assert_eq!(
+        selection.detail_url,
+        "https://jpdb.io/vocabulary/124/幽霊/ゆうれい"
+    );
+
+    // Повтор того же снимка идемпотентен.
+    let replay = batch_command(PitchBatchCommand::ReviewApply {
+        batch_id: "cli-review".into(),
+        review_id,
+    })
+    .await;
+    assert_eq!(replay.exit_code, 0, "{}", replay.stdout);
+    let replay: serde_json::Value = serde_json::from_str(&replay.stdout).unwrap();
+    assert_eq!(replay["changed"], false);
+    assert_eq!(replay["review_decisions"]["already_applied"], 1);
 }

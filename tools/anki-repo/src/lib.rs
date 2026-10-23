@@ -42,6 +42,7 @@ pub mod error;
 pub mod guid;
 pub mod htmlscan;
 pub mod index;
+pub mod layout;
 pub mod loader;
 pub mod media;
 pub mod model;

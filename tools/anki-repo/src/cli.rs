@@ -53,7 +53,7 @@ pub enum MatchArg {
 #[command(
     name = "anki-repo",
     version,
-    about = "Анализ CrowdAnki: inspect, find, stats, validate, qa, review, review-check, edit, models, create, retire, migrate-media, visual-report, maintenance",
+    about = "Анализ CrowdAnki: inspect, find, stats, validate, qa, review, review-check, edit, models, create, retire, migrate-media, migrate-layout, visual-report, maintenance",
     long_about = "Анализ, проверка и ограниченные изменения одного CrowdAnki-экспорта.\n\
                   inspect, find, stats, validate, qa, review, review-check, models,\n\
                   visual-report формирует отдельный отчёт.\n\
@@ -61,6 +61,7 @@ pub enum MatchArg {
                   create добавляет заметки в существующие колоды и модели.\n\
                   retire помечает заметки тегом вместо физического удаления.\n\
                   migrate-media переводит только доказанные ссылки с legacy-имени домена.\n\
+                  migrate-layout переносит экспорты прежней раскладки в плоский decks/output/.\n\
                   Изменяющие экспорт команды по умолчанию выполняют dry-run; запись возможна\n\
                   только с явным --apply и после проверок предусловий.\n\
                   maintenance не обращается к экспорту: status только читает состояние,\n\
@@ -101,6 +102,7 @@ impl Cli {
             Command::Models { .. } => "models",
             Command::Create { .. } => "create",
             Command::MigrateMedia { .. } => "migrate-media",
+            Command::MigrateLayout { .. } => "migrate-layout",
             Command::Retire { .. } => "retire",
             Command::VisualReport { .. } => "visual-report",
         }
@@ -477,6 +479,25 @@ pub enum Command {
         /// Проверенное хранилище pitch-accent; по умолчанию .asset-store/pitch-accent из репозитория экспорта.
         #[arg(long)]
         pitch_asset_store: Option<PathBuf>,
+    },
+
+    /// Контролируемая миграция раскладки экспортов в плоский `decks/output/`.
+    ///
+    /// Находит экспорты прежней раскладки внутри `decks/`, доказывает их
+    /// содержимое по SHA-256 и переносит в `decks/output/<имя_корня_экспорта>/`.
+    /// Отказывает целиком при коллизии имён назначения, занятом или отличающемся
+    /// назначении, символической ссылке и нечитаемом файле. `decks/input/` не
+    /// читается. По умолчанию выполняется dry-run; запись возможна только с
+    /// явным `--apply`.
+    #[command(name = "migrate-layout")]
+    MigrateLayout {
+        /// Корень репозитория; по умолчанию определяется от текущего каталога по признаку .git.
+        #[arg(long, value_name = "PATH")]
+        root: Option<PathBuf>,
+
+        /// Выполнить перенос. Без флага печатается только план.
+        #[arg(long)]
+        apply: bool,
     },
 }
 

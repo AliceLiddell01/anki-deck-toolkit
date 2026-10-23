@@ -19,6 +19,10 @@ use sha2::{Digest, Sha256};
 use crate::domain::{AssetDomainPolicy, GenericDomainPolicy, KanjiDomainPolicy};
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::{encode_lower_hex, sha256_hex};
+use crate::journal::{
+    JOURNAL_DIR, Journal, JournalCheck, JournalDraft, JournalEvent, JournalOperation,
+    JournalOutcome, STORE_WIDE_IDENTITY, check, inspect, revision_bound, snapshot,
+};
 use crate::model::{
     AssetIdentity, AssetRecord, DetectedFormat, HumanAttestation, HumanDecision, LifecycleState,
     MANIFEST_SCHEMA_VERSION, Manifest, Provenance, SemanticDecision, SemanticStatus,
@@ -50,6 +54,9 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static FAIL_AFTER_REMOVAL_MANIFEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_AFTER_CANONICAL_TRANSITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Имитирует смерть процесса между зафиксированным изменением состояния и
+    /// закрывающим событием журнала: интент остаётся висящим до сверки.
+    static FAIL_BEFORE_JOURNAL_CLOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Проверенная запись и те же байты, для которых сверена контрольная сумма.
@@ -96,6 +103,9 @@ pub struct AssetStore {
     policy: Arc<dyn AssetDomainPolicy>,
     initialized_on_open: bool,
     layout_migrated_on_open: bool,
+    /// Долговременный журнал операций: дополняется только под эксклюзивной
+    /// блокировкой store и никогда из worker'ов пакета.
+    journal: std::sync::Mutex<Journal>,
     #[cfg(test)]
     fail_next_manifest_write: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -112,6 +122,90 @@ struct LockTestHooks {
 impl std::fmt::Debug for LockTestHooks {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("LockTestHooks")
+    }
+}
+
+/// Фактическое состояние записи в момент закрытия интента журнала.
+#[derive(Debug, Clone, Default)]
+struct JournalStateFacts {
+    revision: Option<u64>,
+    previous_sha256: Option<String>,
+    next_sha256: Option<String>,
+    previous_lifecycle: Option<LifecycleState>,
+    next_lifecycle: Option<LifecycleState>,
+    verified: Option<bool>,
+}
+
+impl JournalStateFacts {
+    /// Состояние по фактическим записям: до изменения и после него.
+    fn from_records(
+        previous: Option<&AssetRecord>,
+        next: Option<&AssetRecord>,
+        revision: Option<u64>,
+    ) -> Self {
+        Self {
+            revision,
+            previous_sha256: previous.map(|record| record.sha256.clone()),
+            next_sha256: next.map(|record| record.sha256.clone()),
+            previous_lifecycle: previous.map(|record| record.lifecycle),
+            next_lifecycle: next.map(|record| record.lifecycle),
+            // Отсутствующая запись не находится в состоянии `verified`.
+            verified: Some(next.is_some_and(|record| record.lifecycle == LifecycleState::Verified)),
+        }
+    }
+
+    /// Состояние отказа до фиксации: прежнее состояние осталось неизменным.
+    fn unchanged(intent: &JournalEvent) -> Self {
+        let lifecycle = lifecycle_from_str(intent.previous_lifecycle.as_deref());
+        Self {
+            revision: intent.manifest_revision,
+            previous_sha256: intent.previous_sha256.clone(),
+            next_sha256: intent.previous_sha256.clone(),
+            previous_lifecycle: lifecycle,
+            next_lifecycle: lifecycle,
+            verified: Some(lifecycle == Some(LifecycleState::Verified)),
+        }
+    }
+}
+
+/// След фактически завершённого восстановления после сбоя.
+///
+/// Восстановление выполняется в свободных функциях, у которых нет доступа к
+/// журналу, поэтому они возвращают следы наверх: событие `Recovered` пишет
+/// вызывающий метод под уже удерживаемой эксклюзивной блокировкой store.
+#[derive(Debug, Clone)]
+struct RecoveryFact {
+    identity: AssetIdentity,
+    previous_sha256: Option<String>,
+    next_sha256: Option<String>,
+    next_lifecycle: Option<LifecycleState>,
+    reason: String,
+}
+
+impl RecoveryFact {
+    fn new(
+        identity: AssetIdentity,
+        previous_sha256: Option<String>,
+        next_sha256: Option<String>,
+        next_lifecycle: Option<LifecycleState>,
+        reason: &str,
+    ) -> Self {
+        Self {
+            identity,
+            previous_sha256,
+            next_sha256,
+            next_lifecycle,
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+fn lifecycle_from_str(value: Option<&str>) -> Option<LifecycleState> {
+    match value? {
+        "pending" => Some(LifecycleState::Pending),
+        "verified" => Some(LifecycleState::Verified),
+        "quarantined" => Some(LifecycleState::Quarantined),
+        _ => None,
     }
 }
 
@@ -415,17 +509,28 @@ impl AssetStore {
         };
 
         let canonical_manifest = load_manifest(&root_handle)?;
-        let runtime_handle = open_or_initialize_runtime(
+        let store_id = canonical_manifest.store_id.clone();
+        let runtime_handle = open_or_initialize_runtime(&root_handle, &store_id, policy.as_ref())?;
+        // Журнал открывается до восстановления: завершённое восстановление
+        // фиксируется событием `Recovered`, а перенос раскладки — `LayoutMigrated`.
+        let journal = std::sync::Mutex::new(Journal::open(&root_handle)?);
+        let mut recovered = recover_publications(&root_handle, policy.as_ref())?;
+        recovered.extend(recover_publications(&runtime_handle, policy.as_ref())?);
+        // Восстановление уже изменило байты и сняло маркеры: следы пишутся до
+        // шагов, которые могут отказать, иначе повторный запуск не восстановит
+        // их и журнал потеряет факт навсегда.
+        write_recovery_facts(
+            &journal,
+            policy.domain_id(),
             &root_handle,
-            &canonical_manifest.store_id,
-            policy.as_ref(),
+            &runtime_handle,
+            &store_id,
+            &recovered,
         )?;
-        recover_publications(&root_handle, policy.as_ref())?;
-        recover_publications(&runtime_handle, policy.as_ref())?;
         recover_layout_migration(&root_handle, policy.as_ref())?;
         recover_layout_migration(&runtime_handle, policy.as_ref())?;
         let mut manifest = load_manifest(&root_handle)?;
-        let mut runtime_manifest = load_runtime_manifest(&runtime_handle, &manifest.store_id)?;
+        let mut runtime_manifest = load_runtime_manifest(&runtime_handle, &store_id)?;
         ensure_store_domain(&manifest, policy.as_ref())?;
         ensure_store_domain(&runtime_manifest, policy.as_ref())?;
         let mut layout_migrated_on_open = false;
@@ -437,22 +542,47 @@ impl AssetStore {
             migrate_layout(&runtime_handle, &mut runtime_manifest, policy.as_ref())?;
             layout_migrated_on_open = true;
         }
+        if layout_migrated_on_open {
+            journal_append(
+                &journal,
+                JournalDraft::store_wide(
+                    policy.domain_id(),
+                    policy.domain_id(),
+                    STORE_WIDE_IDENTITY,
+                    JournalOperation::LayoutMigrated,
+                    JournalOutcome::Completed,
+                )
+                .revision(Some(journal_revision_of(
+                    &root_handle,
+                    &runtime_handle,
+                    &store_id,
+                )?)),
+            )?;
+        }
         manifest = load_manifest(&root_handle)?;
-        runtime_manifest = load_runtime_manifest(&runtime_handle, &manifest.store_id)?;
-        reconcile_runtime_boundary(
+        runtime_manifest = load_runtime_manifest(&runtime_handle, &store_id)?;
+        let reconciled = reconcile_runtime_boundary(
             &root_handle,
             &runtime_handle,
             &manifest,
             &runtime_manifest,
             policy.as_ref(),
         )?;
+        write_recovery_facts(
+            &journal,
+            policy.domain_id(),
+            &root_handle,
+            &runtime_handle,
+            &store_id,
+            &reconciled,
+        )?;
         manifest = load_manifest(&root_handle)?;
-        runtime_manifest = load_runtime_manifest(&runtime_handle, &manifest.store_id)?;
+        runtime_manifest = load_runtime_manifest(&runtime_handle, &store_id)?;
         validate_verified_manifest(&root_handle, &manifest, policy.as_ref())?;
         validate_runtime_manifest(
             &runtime_handle,
             &runtime_manifest,
-            &manifest.store_id,
+            &store_id,
             policy.as_ref(),
         )?;
 
@@ -460,7 +590,8 @@ impl AssetStore {
             root: canonical_root,
             root_handle,
             runtime_handle,
-            store_id: manifest.store_id,
+            journal,
+            store_id,
             policy,
             initialized_on_open,
             layout_migrated_on_open,
@@ -779,17 +910,25 @@ impl AssetStore {
         validate_validator_identity(&validator_id)?;
         let staged = stage_bytes(&self.root_handle, &request.bytes)?;
         let lock = self.lock_exclusive()?;
-        recover_publications(&self.root_handle, self.policy.as_ref())?;
-        recover_publications(&self.runtime_handle, self.policy.as_ref())?;
+        let mut recovered = recover_publications(&self.root_handle, self.policy.as_ref())?;
+        recovered.extend(recover_publications(
+            &self.runtime_handle,
+            self.policy.as_ref(),
+        )?);
+        // Восстановление уже изменило байты и сняло свои маркеры: событие о нём
+        // пишется до шагов, которые могут отказать, иначе повторный запуск не
+        // восстановит эти следы и журнал потеряет факт навсегда.
+        self.record_recovery_facts(&recovered)?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
-        reconcile_runtime_boundary(
+        let reconciled = reconcile_runtime_boundary(
             &self.root_handle,
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
             self.policy.as_ref(),
         )?;
+        self.record_recovery_facts(&reconciled)?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
         validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
@@ -840,6 +979,21 @@ impl AssetStore {
                     byte_length: current.byte_length,
                     changed: false,
                 };
+                // Повторное использование уже доверенного ресурса ничего не
+                // меняет, поэтому пишется одно событие без интента.
+                self.record_journal(
+                    JournalDraft::new(
+                        self.policy.domain_id(),
+                        &current.identity,
+                        JournalOperation::VerifiedReused,
+                        JournalOutcome::Completed,
+                    )
+                    .revision(Some(self.journal_revision()?))
+                    .sha(Some(current.sha256.as_str()), Some(current.sha256.as_str()))
+                    .lifecycle(Some(current.lifecycle), Some(current.lifecycle))
+                    .verified(Some(current.lifecycle == LifecycleState::Verified))
+                    .provenance(Some(&current.provenance)),
+                )?;
                 drop(staged);
                 lock.unlock()?;
                 return Ok(outcome);
@@ -945,53 +1099,96 @@ impl AssetStore {
             .iter()
             .find(|asset| asset.identity == record.identity)
             .cloned();
-        if previous_runtime.is_some() {
-            begin_transition(
-                &self.root_handle,
-                &record.identity,
-                TransitionTarget::Canonical,
-                &record.sha256,
-            )?;
-        }
-        commit_asset_record(
-            &self.root_handle,
-            &staged,
-            previous_canonical.as_ref(),
-            &record,
-            &mut manifest,
-            self.policy.as_ref(),
-            |root, manifest| {
-                #[cfg(test)]
-                {
-                    save_manifest_with_test_hook(
-                        root,
-                        manifest,
-                        false,
-                        &self.fail_next_manifest_write,
-                    )
+        let published_identity = record.identity.clone();
+        let previous_state = previous_canonical
+            .clone()
+            .or_else(|| previous_runtime.clone());
+        let published_record = record.clone();
+        let intent = JournalDraft::new(
+            self.policy.domain_id(),
+            &published_identity,
+            JournalOperation::VerifiedPublished,
+            JournalOutcome::Pending,
+        )
+        .revision(Some(self.journal_revision()?))
+        .sha(
+            previous_state.as_ref().map(|asset| asset.sha256.as_str()),
+            Some(record.sha256.as_str()),
+        )
+        .lifecycle(
+            previous_state.as_ref().map(|asset| asset.lifecycle),
+            Some(LifecycleState::Verified),
+        )
+        .verified(Some(true))
+        .provenance(Some(&record.provenance));
+        self.journal_transition(
+            intent,
+            JournalOperation::VerifiedPublished,
+            &published_identity,
+            || {
+                if previous_runtime.is_some() {
+                    begin_transition(
+                        &self.root_handle,
+                        &record.identity,
+                        TransitionTarget::Canonical,
+                        &record.sha256,
+                    )?;
                 }
-                #[cfg(not(test))]
-                {
-                    save_manifest(root, manifest, false)
+                commit_asset_record(
+                    &self.root_handle,
+                    &staged,
+                    previous_canonical.as_ref(),
+                    &record,
+                    &mut manifest,
+                    self.policy.as_ref(),
+                    |root, manifest| {
+                        #[cfg(test)]
+                        {
+                            save_manifest_with_test_hook(
+                                root,
+                                manifest,
+                                false,
+                                &self.fail_next_manifest_write,
+                            )
+                        }
+                        #[cfg(not(test))]
+                        {
+                            save_manifest(root, manifest, false)
+                        }
+                    },
+                )?;
+                if let Some(candidate) = &previous_runtime {
+                    #[cfg(test)]
+                    if FAIL_AFTER_CANONICAL_TRANSITION.with(|hook| hook.replace(false)) {
+                        return Err(AssetError::new(
+                            ErrorCode::IoFailure,
+                            "тестовый сбой после canonical commit",
+                        ));
+                    }
+                    remove_record_from_area(
+                        &self.runtime_handle,
+                        &mut runtime_manifest,
+                        candidate,
+                        self.policy.as_ref(),
+                    )?;
+                    clear_transition(&self.root_handle)?;
+                    // Запись переместилась из `.runtime` в канонический манифест:
+                    // она покинула локальную область.
+                    self.record_removal(
+                        candidate,
+                        "локальная запись снята после публикации в канонический манифест",
+                    )?;
                 }
+                Ok((
+                    (),
+                    JournalStateFacts::from_records(
+                        previous_state.as_ref(),
+                        Some(&published_record),
+                        Some(self.journal_revision()?),
+                    ),
+                ))
             },
         )?;
-        if let Some(candidate) = previous_runtime {
-            #[cfg(test)]
-            if FAIL_AFTER_CANONICAL_TRANSITION.with(|hook| hook.replace(false)) {
-                return Err(AssetError::new(
-                    ErrorCode::IoFailure,
-                    "тестовый сбой после canonical commit",
-                ));
-            }
-            remove_record_from_area(
-                &self.runtime_handle,
-                &mut runtime_manifest,
-                &candidate,
-                self.policy.as_ref(),
-            )?;
-            clear_transition(&self.root_handle)?;
-        }
         let sha256 = staged.sha256.clone();
         let byte_length = staged.byte_length;
         drop(staged);
@@ -1028,17 +1225,25 @@ impl AssetStore {
             ));
         }
         let lock = self.lock_exclusive()?;
-        recover_publications(&self.root_handle, self.policy.as_ref())?;
-        recover_publications(&self.runtime_handle, self.policy.as_ref())?;
+        let mut recovered = recover_publications(&self.root_handle, self.policy.as_ref())?;
+        recovered.extend(recover_publications(
+            &self.runtime_handle,
+            self.policy.as_ref(),
+        )?);
+        // Восстановление уже изменило байты и сняло свои маркеры: событие о нём
+        // пишется до шагов, которые могут отказать, иначе повторный запуск не
+        // восстановит эти следы и журнал потеряет факт навсегда.
+        self.record_recovery_facts(&recovered)?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
-        reconcile_runtime_boundary(
+        let reconciled = reconcile_runtime_boundary(
             &self.root_handle,
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
             self.policy.as_ref(),
         )?;
+        self.record_recovery_facts(&reconciled)?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
         validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
@@ -1128,46 +1333,88 @@ impl AssetStore {
             .iter()
             .find(|asset| asset.identity == record.identity)
             .cloned();
-        if previous_canonical.is_some() {
-            begin_transition(
-                &self.root_handle,
-                &record.identity,
-                TransitionTarget::Runtime,
-                &record.sha256,
-            )?;
-        }
-        commit_asset_record(
-            &self.runtime_handle,
-            &staged,
-            existing_runtime.as_ref(),
-            &record,
-            &mut runtime_manifest,
-            self.policy.as_ref(),
-            |root, manifest| {
-                #[cfg(test)]
-                {
-                    save_manifest_with_test_hook(
-                        root,
-                        manifest,
-                        false,
-                        &self.fail_next_manifest_write,
-                    )
+        let candidate_identity = record.identity.clone();
+        let candidate_record = record.clone();
+        let intent = JournalDraft::new(
+            self.policy.domain_id(),
+            &candidate_identity,
+            JournalOperation::CandidateWritten,
+            JournalOutcome::Pending,
+        )
+        .revision(Some(self.journal_revision()?))
+        .sha(
+            existing.as_ref().map(|asset| asset.sha256.as_str()),
+            Some(record.sha256.as_str()),
+        )
+        .lifecycle(
+            existing.as_ref().map(|asset| asset.lifecycle),
+            Some(LifecycleState::Pending),
+        )
+        .verified(Some(false))
+        .provenance(Some(&record.provenance));
+        let previous_state = existing.clone();
+        self.journal_transition(
+            intent,
+            JournalOperation::CandidateWritten,
+            &candidate_identity,
+            || {
+                if previous_canonical.is_some() {
+                    begin_transition(
+                        &self.root_handle,
+                        &record.identity,
+                        TransitionTarget::Runtime,
+                        &record.sha256,
+                    )?;
                 }
-                #[cfg(not(test))]
-                {
-                    save_manifest(root, manifest, false)
+                commit_asset_record(
+                    &self.runtime_handle,
+                    &staged,
+                    existing_runtime.as_ref(),
+                    &record,
+                    &mut runtime_manifest,
+                    self.policy.as_ref(),
+                    |root, manifest| {
+                        #[cfg(test)]
+                        {
+                            save_manifest_with_test_hook(
+                                root,
+                                manifest,
+                                false,
+                                &self.fail_next_manifest_write,
+                            )
+                        }
+                        #[cfg(not(test))]
+                        {
+                            save_manifest(root, manifest, false)
+                        }
+                    },
+                )?;
+                if let Some(canonical) = &previous_canonical {
+                    remove_record_from_area(
+                        &self.root_handle,
+                        &mut manifest,
+                        canonical,
+                        self.policy.as_ref(),
+                    )?;
+                    clear_transition(&self.root_handle)?;
+                    // Вытесненная кандидатом опубликованная запись покинула
+                    // канонический манифест: её байты в хранилище больше не
+                    // зарегистрированы.
+                    self.record_removal(
+                        canonical,
+                        "опубликованная запись вытеснена новым кандидатом",
+                    )?;
                 }
+                Ok((
+                    (),
+                    JournalStateFacts::from_records(
+                        previous_state.as_ref(),
+                        Some(&candidate_record),
+                        Some(self.journal_revision()?),
+                    ),
+                ))
             },
         )?;
-        if let Some(canonical) = previous_canonical {
-            remove_record_from_area(
-                &self.root_handle,
-                &mut manifest,
-                &canonical,
-                self.policy.as_ref(),
-            )?;
-            clear_transition(&self.root_handle)?;
-        }
         validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
         validate_runtime_manifest(
             &self.runtime_handle,
@@ -1254,17 +1501,25 @@ impl AssetStore {
         let validator_id = validator.identity();
         validate_validator_identity(&validator_id)?;
         let lock = self.lock_exclusive()?;
-        recover_publications(&self.root_handle, self.policy.as_ref())?;
-        recover_publications(&self.runtime_handle, self.policy.as_ref())?;
+        let mut recovered = recover_publications(&self.root_handle, self.policy.as_ref())?;
+        recovered.extend(recover_publications(
+            &self.runtime_handle,
+            self.policy.as_ref(),
+        )?);
+        // Восстановление уже изменило байты и сняло свои маркеры: событие о нём
+        // пишется до шагов, которые могут отказать, иначе повторный запуск не
+        // восстановит эти следы и журнал потеряет факт навсегда.
+        self.record_recovery_facts(&recovered)?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
-        reconcile_runtime_boundary(
+        let reconciled = reconcile_runtime_boundary(
             &self.root_handle,
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
             self.policy.as_ref(),
         )?;
+        self.record_recovery_facts(&reconciled)?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &manifest.store_id)?;
         validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
@@ -1356,12 +1611,42 @@ impl AssetStore {
             let changed = new_record.lifecycle != old_record.lifecycle
                 || new_record.validation != old_record.validation;
             if changed {
-                self.commit_lifecycle_change(
-                    &old_record,
-                    &new_record,
-                    &mut manifest,
-                    &mut runtime_manifest,
-                )?;
+                let operation = if new_record.lifecycle == LifecycleState::Quarantined {
+                    JournalOperation::Quarantined
+                } else {
+                    JournalOperation::Revalidated
+                };
+                let identity = new_record.identity.clone();
+                let intent = JournalDraft::new(
+                    self.policy.domain_id(),
+                    &identity,
+                    operation,
+                    JournalOutcome::Pending,
+                )
+                .revision(Some(self.journal_revision()?))
+                .sha(
+                    Some(old_record.sha256.as_str()),
+                    Some(new_record.sha256.as_str()),
+                )
+                .lifecycle(Some(old_record.lifecycle), Some(new_record.lifecycle))
+                .verified(Some(new_record.lifecycle == LifecycleState::Verified))
+                .reason(&format!("решение валидатора {}", decision.status.as_str()));
+                self.journal_transition(intent, operation, &identity, || {
+                    self.commit_lifecycle_change(
+                        &old_record,
+                        &new_record,
+                        &mut manifest,
+                        &mut runtime_manifest,
+                    )?;
+                    Ok((
+                        (),
+                        JournalStateFacts::from_records(
+                            Some(&old_record),
+                            Some(&new_record),
+                            Some(self.journal_revision()?),
+                        ),
+                    ))
+                })?;
             }
             report.attempts.push(ValidationAttempt {
                 identity: old_record.identity,
@@ -1414,17 +1699,25 @@ impl AssetStore {
             ));
         }
         let lock = self.lock_exclusive()?;
-        recover_publications(&self.root_handle, self.policy.as_ref())?;
-        recover_publications(&self.runtime_handle, self.policy.as_ref())?;
+        let mut recovered = recover_publications(&self.root_handle, self.policy.as_ref())?;
+        recovered.extend(recover_publications(
+            &self.runtime_handle,
+            self.policy.as_ref(),
+        )?);
+        // Восстановление уже изменило байты и сняло свои маркеры: событие о нём
+        // пишется до шагов, которые могут отказать, иначе повторный запуск не
+        // восстановит эти следы и журнал потеряет факт навсегда.
+        self.record_recovery_facts(&recovered)?;
         let mut manifest = load_manifest(&self.root_handle)?;
         let mut runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
-        reconcile_runtime_boundary(
+        let reconciled = reconcile_runtime_boundary(
             &self.root_handle,
             &self.runtime_handle,
             &manifest,
             &runtime_manifest,
             self.policy.as_ref(),
         )?;
+        self.record_recovery_facts(&reconciled)?;
         manifest = load_manifest(&self.root_handle)?;
         runtime_manifest = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
         validate_verified_manifest(&self.root_handle, &manifest, self.policy.as_ref())?;
@@ -1519,7 +1812,48 @@ impl AssetStore {
         }
         let changed = record != previous;
         if changed {
-            self.commit_lifecycle_change(&previous, &record, &mut manifest, &mut runtime_manifest)?;
+            let operation = match request.decision {
+                HumanDecision::Approve => JournalOperation::TrustGranted,
+                HumanDecision::Reject => JournalOperation::TrustRevoked,
+            };
+            let identity = record.identity.clone();
+            let reason = record
+                .human_attestation
+                .as_ref()
+                .map(|attestation| attestation.reason.clone())
+                .unwrap_or_default();
+            let previous_record = previous.clone();
+            let next_record = record.clone();
+            let intent = JournalDraft::new(
+                self.policy.domain_id(),
+                &identity,
+                operation,
+                JournalOutcome::Pending,
+            )
+            .revision(Some(self.journal_revision()?))
+            .sha(
+                Some(previous_record.sha256.as_str()),
+                Some(next_record.sha256.as_str()),
+            )
+            .lifecycle(Some(previous_record.lifecycle), Some(next_record.lifecycle))
+            .verified(Some(next_record.lifecycle == LifecycleState::Verified))
+            .reason(&reason);
+            self.journal_transition(intent, operation, &identity, || {
+                self.commit_lifecycle_change(
+                    &previous_record,
+                    &next_record,
+                    &mut manifest,
+                    &mut runtime_manifest,
+                )?;
+                Ok((
+                    (),
+                    JournalStateFacts::from_records(
+                        Some(&previous_record),
+                        Some(&next_record),
+                        Some(self.journal_revision()?),
+                    ),
+                ))
+            })?;
         }
         lock.unlock()?;
         Ok(IngestOutcome {
@@ -1593,6 +1927,10 @@ impl AssetStore {
                     self.policy.as_ref(),
                 )?;
                 clear_transition(&self.root_handle)?;
+                self.record_removal(
+                    old_record,
+                    "опубликованная запись переведена в локальную область",
+                )?;
             }
             (LifecycleState::Pending | LifecycleState::Quarantined, LifecycleState::Verified) => {
                 let source =
@@ -1646,6 +1984,10 @@ impl AssetStore {
                     self.policy.as_ref(),
                 )?;
                 clear_transition(&self.root_handle)?;
+                self.record_removal(
+                    old_record,
+                    "локальная запись опубликована в канонический манифест",
+                )?;
             }
             (
                 LifecycleState::Pending | LifecycleState::Quarantined,
@@ -1724,6 +2066,383 @@ impl AssetStore {
     #[cfg(test)]
     pub(crate) fn fail_next_manifest_write(&self) {
         self.fail_next_manifest_write.store(true, Ordering::SeqCst);
+    }
+
+    /// Задаёт контекст запуска для последующих событий журнала.
+    ///
+    /// Контекст не является частью состояния хранилища: он только помечает
+    /// события, записанные этим запуском, и не влияет на идемпотентность, потому
+    /// что в ключ события не входит.
+    pub fn set_journal_context(&self, run_id: Option<&str>, batch_id: Option<&str>) {
+        self.journal_lock()
+            .set_context(run_id.map(str::to_owned), batch_id.map(str::to_owned));
+    }
+
+    /// Блокирует журнал операций.
+    ///
+    /// Повреждённый мьютекс не отменяет операцию: разобранное состояние журнала
+    /// сверяется с файлом по размеру и времени изменения, поэтому отдельное
+    /// восстановление не требуется.
+    fn journal_lock(&self) -> std::sync::MutexGuard<'_, Journal> {
+        self.journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Дописывает событие журнала под уже удерживаемой эксклюзивной блокировкой
+    /// store. Дубликат по `event_key` не является ошибкой операции.
+    fn record_journal(&self, draft: JournalDraft) -> Result<(), AssetError> {
+        self.journal_lock().append(&draft).map(|_| ())
+    }
+
+    /// Дописывает событие и возвращает его: `event_id` интента нужен, чтобы
+    /// закрыть интент событием результата.
+    fn record_journal_event(&self, draft: JournalDraft) -> Result<JournalEvent, AssetError> {
+        self.journal_lock().append_and_return(&draft)
+    }
+
+    /// Пишет событие `Removed` для записи, покинувшей область хранилища.
+    fn record_removal(&self, record: &AssetRecord, reason: &str) -> Result<(), AssetError> {
+        let revision = self.journal_revision()?;
+        self.record_journal(
+            JournalDraft::new(
+                self.policy.domain_id(),
+                &record.identity,
+                JournalOperation::Removed,
+                JournalOutcome::Completed,
+            )
+            .revision(Some(revision))
+            .sha(Some(record.sha256.as_str()), None)
+            .lifecycle(Some(record.lifecycle), None)
+            .verified(Some(false))
+            .reason(reason),
+        )
+    }
+
+    /// Фактическая суммарная ревизия канонического и `.runtime` манифестов.
+    ///
+    /// Сумма строго возрастает при любом изменении состояния и всегда не меньше
+    /// ревизии каждой отдельной области, поэтому ею помечаются и события уровня
+    /// всего хранилища.
+    fn journal_revision(&self) -> Result<u64, AssetError> {
+        journal_revision_of(&self.root_handle, &self.runtime_handle, &self.store_id)
+    }
+
+    /// Пишет события `Recovered` о фактически завершённом восстановлении.
+    fn record_recovery_facts(&self, facts: &[RecoveryFact]) -> Result<(), AssetError> {
+        write_recovery_facts(
+            &self.journal,
+            self.policy.domain_id(),
+            &self.root_handle,
+            &self.runtime_handle,
+            &self.store_id,
+            facts,
+        )
+    }
+
+    /// Закрывает интент фактическим состоянием записи.
+    fn close_journal_intent(
+        &self,
+        intent: &JournalEvent,
+        operation: JournalOperation,
+        identity: &AssetIdentity,
+        outcome: JournalOutcome,
+        facts: &JournalStateFacts,
+        reason: Option<&str>,
+    ) -> Result<(), AssetError> {
+        let mut draft = JournalDraft::new(self.policy.domain_id(), identity, operation, outcome)
+            .closing(&intent.event_id)
+            .revision(facts.revision)
+            .sha(
+                facts.previous_sha256.as_deref(),
+                facts.next_sha256.as_deref(),
+            )
+            .lifecycle(facts.previous_lifecycle, facts.next_lifecycle)
+            .verified(facts.verified)
+            .provenance_text(intent.provenance.as_deref());
+        if let Some(reason) = reason {
+            draft = draft.reason(reason);
+        }
+        self.record_journal(draft)
+    }
+
+    /// Совпадает ли фактическое состояние записи с прежним состоянием интента.
+    ///
+    /// Тело перехода может отказать уже после фиксации манифеста, поэтому исход
+    /// определяется фактическими записями, а не самим фактом ошибки. Проверяются
+    /// обе области: запись, оставшаяся в `.runtime` или уже попавшая в
+    /// канонический манифест, — это изменение состояния, а не прежнее состояние.
+    ///
+    /// Переход, который не меняет ни SHA-256, ни жизненный цикл, по манифесту
+    /// неотличим от отсутствия перехода: так выглядят решения валидатора и
+    /// доверие человека, меняющие только `validation` и `human_attestation`.
+    /// Утверждать «отказ» в этом случае нельзя — интент остаётся открытым и его
+    /// разбирает [`Self::reconcile_journal`].
+    fn intent_state_unchanged(
+        &self,
+        identity: &AssetIdentity,
+        intent: &JournalEvent,
+    ) -> Result<bool, AssetError> {
+        if intent.previous_sha256 == intent.new_sha256
+            && intent.previous_lifecycle == intent.new_lifecycle
+        {
+            return Ok(false);
+        }
+        let canonical = load_manifest(&self.root_handle)?;
+        let runtime = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
+        let mut present = false;
+        for record in canonical.assets.iter().chain(runtime.assets.iter()) {
+            if record.identity.namespace != identity.namespace
+                || record.identity.key != identity.key
+            {
+                continue;
+            }
+            present = true;
+            if Some(record.sha256.as_str()) != intent.previous_sha256.as_deref()
+                || Some(record.lifecycle.as_str()) != intent.previous_lifecycle.as_deref()
+            {
+                return Ok(false);
+            }
+        }
+        if present {
+            return Ok(true);
+        }
+        // Записи нет вовсе: это прежнее состояние только тогда, когда его и
+        // описывал интент.
+        Ok(intent.previous_sha256.is_none() && intent.previous_lifecycle.is_none())
+    }
+
+    /// Обрамляет изменение состояния двумя событиями журнала: интентом до него и
+    /// результатом после.
+    ///
+    /// Штатный отказ закрывает интент событием `Refused`, поэтому обычная работа
+    /// висящих интентов не оставляет. Отказ тела перехода после уже выполненной
+    /// фиксации — не отказ: интент остаётся открытым, и его разбирает
+    /// [`Self::reconcile_journal`]. Так же разбирается интент, оставшийся после
+    /// смерти процесса между фиксацией и закрывающим событием.
+    fn journal_transition<T>(
+        &self,
+        intent: JournalDraft,
+        operation: JournalOperation,
+        identity: &AssetIdentity,
+        body: impl FnOnce() -> Result<(T, JournalStateFacts), AssetError>,
+    ) -> Result<T, AssetError> {
+        let intent_event = self.record_journal_event(intent)?;
+        let result = body();
+        #[cfg(test)]
+        if FAIL_BEFORE_JOURNAL_CLOSE.with(|hook| hook.replace(false)) {
+            return result.map(|(value, _)| value);
+        }
+        match result {
+            Ok((value, facts)) => {
+                self.close_journal_intent(
+                    &intent_event,
+                    operation,
+                    identity,
+                    JournalOutcome::Completed,
+                    &facts,
+                    None,
+                )?;
+                Ok(value)
+            }
+            Err(error) => {
+                // Тело перехода могло отказать уже после фиксации манифеста:
+                // исход определяется фактическим состоянием, а не самим фактом
+                // ошибки. Отказ с прежними фактами записывается только тогда,
+                // когда прежнее состояние действительно сохранилось; иначе
+                // интент остаётся открытым для сверки. Ошибка чтения манифеста
+                // тоже оставляет интент открытым — неизвестное состояние не
+                // выдаётся за отказ.
+                //
+                // Ошибка записи самого журнала не подменяет исходную ошибку
+                // операции: незакрытый интент разберёт сверка.
+                if self
+                    .intent_state_unchanged(identity, &intent_event)
+                    .unwrap_or(false)
+                {
+                    let _ = self.close_journal_intent(
+                        &intent_event,
+                        operation,
+                        identity,
+                        JournalOutcome::Refused,
+                        &JournalStateFacts::unchanged(&intent_event),
+                        Some(&error.message),
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// События журнала по возрастанию `seq`.
+    ///
+    /// `limit` оставляет хвост журнала: последние события, а не первые.
+    pub fn journal_events(
+        &self,
+        limit: Option<usize>,
+        identity: Option<&str>,
+        operation: Option<JournalOperation>,
+    ) -> Result<Vec<JournalEvent>, AssetError> {
+        let lock = self.lock_shared()?;
+        let read = self.journal_lock().read()?;
+        lock.unlock()?;
+        let mut events: Vec<JournalEvent> = read
+            .events
+            .into_iter()
+            .filter(|event| {
+                identity.is_none_or(|identity| event.identity == identity)
+                    && operation.is_none_or(|operation| event.operation == operation)
+            })
+            .collect();
+        if let Some(limit) = limit {
+            let skip = events.len().saturating_sub(limit);
+            events.drain(..skip);
+        }
+        Ok(events)
+    }
+
+    /// Проверяет целостность журнала по фактическим ревизиям обоих манифестов.
+    pub fn journal_check(&self) -> Result<JournalCheck, AssetError> {
+        let lock = self.lock_shared()?;
+        let read = self.journal_lock().read()?;
+        let canonical = load_manifest(&self.root_handle)?;
+        let runtime = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
+        lock.unlock()?;
+        Ok(check(&read, revision_bound(&canonical, &runtime)))
+    }
+
+    /// Сверяет незакрытые интенты журнала с фактическим состоянием манифестов.
+    ///
+    /// Совпадение с ожидаемым `new_*` закрывается как `Recovered`, совпадение с
+    /// прежним `previous_*` — как `Aborted`, всё остальное — как `Unknown`.
+    /// Метод идемпотентен: повторный вызов не дописывает событий. Возвращается
+    /// список фактически дописанных событий.
+    pub fn reconcile_journal(&self) -> Result<Vec<JournalEvent>, AssetError> {
+        let lock = self.lock_exclusive()?;
+        let canonical = load_manifest(&self.root_handle)?;
+        let runtime = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
+        let revision = revision_bound(&canonical, &runtime);
+        let mut records: Vec<AssetRecord> = canonical.assets.clone();
+        records.extend(runtime.assets.iter().cloned());
+        let read = self.journal_lock().read()?;
+        let inspection = inspect(&read, revision);
+        if !inspection.structurally_valid {
+            return Err(AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                "журнал содержит структурно некорректную историю; сверка не дописала события",
+            ));
+        }
+        let mut appended = Vec::new();
+        for intent in inspection.check.open_intents {
+            let Some(event) = read
+                .events
+                .iter()
+                .find(|event| event.event_id == intent.event_id)
+            else {
+                continue;
+            };
+            let actual = records.iter().find(|record| {
+                record.identity.namespace == event.namespace
+                    && record.identity.key == event.identity
+            });
+            let actual_sha256 = actual.map(|record| record.sha256.clone());
+            let actual_lifecycle = actual.map(|record| record.lifecycle);
+            let actual_lifecycle_text = actual_lifecycle.map(|state| state.as_str().to_owned());
+            // Решение валидатора и доверие человека не меняют ни SHA-256, ни
+            // жизненный цикл: манифест не различает применённое и неприменённое
+            // изменение, поэтому исход честно остаётся неизвестным, а не
+            // выдаётся за восстановленный.
+            let indistinguishable = event.previous_sha256 == event.new_sha256
+                && event.previous_lifecycle == event.new_lifecycle;
+            let outcome = if indistinguishable {
+                JournalOutcome::Unknown
+            } else if actual_sha256 == event.new_sha256
+                && actual_lifecycle_text == event.new_lifecycle
+            {
+                JournalOutcome::Recovered
+            } else if actual_sha256 == event.previous_sha256
+                && actual_lifecycle_text == event.previous_lifecycle
+            {
+                JournalOutcome::Aborted
+            } else {
+                JournalOutcome::Unknown
+            };
+            let mut draft = JournalDraft::new(
+                self.policy.domain_id(),
+                &AssetIdentity {
+                    namespace: event.namespace.clone(),
+                    key: event.identity.clone(),
+                },
+                event.operation,
+                outcome,
+            )
+            .closing(&event.event_id)
+            .revision(Some(revision))
+            .sha(event.previous_sha256.as_deref(), actual_sha256.as_deref())
+            .lifecycle(
+                lifecycle_from_str(event.previous_lifecycle.as_deref()),
+                actual_lifecycle,
+            )
+            .verified(Some(actual_lifecycle == Some(LifecycleState::Verified)));
+            if outcome == JournalOutcome::Unknown {
+                draft = draft.reason(&if indistinguishable {
+                    format!(
+                        "переход {} не меняет ни SHA-256, ни жизненный цикл: манифест не \
+                         различает применённое и неприменённое изменение",
+                        intent.identity
+                    )
+                } else {
+                    format!(
+                        "фактическое состояние {} не совпало ни с ожидаемым, ни с прежним",
+                        intent.identity
+                    )
+                });
+            }
+            if read
+                .events
+                .iter()
+                .any(|existing| existing.event_key == draft.event_key())
+            {
+                continue;
+            }
+            appended.push(self.record_journal_event(draft)?);
+        }
+        lock.unlock()?;
+        Ok(appended)
+    }
+
+    /// Записывает единственное явно обозначенное событие `Baseline` со снимком
+    /// фактического состояния хранилища.
+    ///
+    /// Повторная запись запрещена: baseline отмечает начало доверенной истории и
+    /// не должен переписываться.
+    pub fn journal_baseline(&self) -> Result<JournalEvent, AssetError> {
+        let lock = self.lock_exclusive()?;
+        let canonical = load_manifest(&self.root_handle)?;
+        let runtime = load_runtime_manifest(&self.runtime_handle, &self.store_id)?;
+        let read = self.journal_lock().read()?;
+        if read
+            .events
+            .iter()
+            .any(|event| event.operation == JournalOperation::Baseline)
+        {
+            return Err(AssetError::new(
+                ErrorCode::InvalidTransition,
+                "baseline журнала уже записан; повторная запись запрещена",
+            ));
+        }
+        let draft = JournalDraft::store_wide(
+            self.policy.domain_id(),
+            self.policy.domain_id(),
+            STORE_WIDE_IDENTITY,
+            JournalOperation::Baseline,
+            JournalOutcome::Completed,
+        )
+        .revision(Some(revision_bound(&canonical, &runtime)))
+        .snapshot(snapshot(&canonical, &runtime));
+        let event = self.record_journal_event(draft)?;
+        lock.unlock()?;
+        Ok(event)
     }
 }
 
@@ -2197,7 +2916,13 @@ fn inspect_area_top_level(
         let name = entry.file_name().to_string_lossy().into_owned();
         if !(matches!(
             name.as_str(),
-            LOCK_FILE | OWNER_FILE | MANIFEST_FILE | ASSETS_DIR | TEMP_DIR | RUNTIME_DIR
+            LOCK_FILE
+                | OWNER_FILE
+                | MANIFEST_FILE
+                | ASSETS_DIR
+                | TEMP_DIR
+                | RUNTIME_DIR
+                | JOURNAL_DIR
         ) || runtime_extensions && name == BATCHES_DIR)
         {
             return Err(AssetError::new(
@@ -2220,7 +2945,11 @@ fn inspect_area_top_level(
                 format!("symlink запрещён в store root: {name}"),
             ));
         }
-        if matches!(name.as_str(), ASSETS_DIR | TEMP_DIR | RUNTIME_DIR) && !metadata.is_dir() {
+        if matches!(
+            name.as_str(),
+            ASSETS_DIR | TEMP_DIR | RUNTIME_DIR | JOURNAL_DIR
+        ) && !metadata.is_dir()
+        {
             return Err(AssetError::new(
                 unknown_code,
                 format!("{name} существует, но не является каталогом"),
@@ -2241,7 +2970,10 @@ fn ensure_top_level(root: &File) -> Result<(), AssetError> {
     inspect_top_level(root, ErrorCode::UnexpectedPath).map(|_| ())
 }
 
-fn open_directory_at(parent: &File, name: impl rustix::path::Arg) -> std::io::Result<File> {
+pub(crate) fn open_directory_at(
+    parent: &File,
+    name: impl rustix::path::Arg,
+) -> std::io::Result<File> {
     let fd = openat(
         parent,
         name,
@@ -2252,7 +2984,7 @@ fn open_directory_at(parent: &File, name: impl rustix::path::Arg) -> std::io::Re
     Ok(File::from(fd))
 }
 
-fn ensure_dir_entry(root: &File, name: &str) -> Result<File, AssetError> {
+pub(crate) fn ensure_dir_entry(root: &File, name: &str) -> Result<File, AssetError> {
     match open_directory_at(root, name) {
         Ok(directory) => Ok(directory),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2276,7 +3008,7 @@ fn ensure_dir_entry(root: &File, name: &str) -> Result<File, AssetError> {
     }
 }
 
-fn directory_entry_error(name: &str, error: std::io::Error) -> AssetError {
+pub(crate) fn directory_entry_error(name: &str, error: std::io::Error) -> AssetError {
     if is_symlink_error(&error) || error.kind() == std::io::ErrorKind::NotADirectory {
         AssetError::new(
             ErrorCode::BoundaryViolation,
@@ -2817,16 +3549,70 @@ fn validate_legacy_verified_manifest(
     validate_verified_manifest(root, manifest, policy)
 }
 
+/// Дописывает событие в уже открытый журнал хранилища.
+///
+/// Используется там, где `AssetStore` ещё не собран (открытие хранилища).
+fn journal_append(
+    journal: &std::sync::Mutex<Journal>,
+    draft: JournalDraft,
+) -> Result<(), AssetError> {
+    journal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .append(&draft)
+        .map(|_| ())
+}
+
+/// Фактическая суммарная ревизия манифестов двух областей хранилища.
+fn journal_revision_of(root: &File, runtime: &File, store_id: &str) -> Result<u64, AssetError> {
+    let canonical = load_manifest(root)?;
+    let local = load_runtime_manifest(runtime, store_id)?;
+    Ok(revision_bound(&canonical, &local))
+}
+
+/// Пишет события `Recovered` для следов, оставленных завершённым восстановлением.
+fn write_recovery_facts(
+    journal: &std::sync::Mutex<Journal>,
+    domain: &str,
+    root: &File,
+    runtime: &File,
+    store_id: &str,
+    facts: &[RecoveryFact],
+) -> Result<(), AssetError> {
+    if facts.is_empty() {
+        return Ok(());
+    }
+    let revision = journal_revision_of(root, runtime, store_id)?;
+    for fact in facts {
+        journal_append(
+            journal,
+            JournalDraft::new(
+                domain,
+                &fact.identity,
+                JournalOperation::Recovered,
+                JournalOutcome::Completed,
+            )
+            .revision(Some(revision))
+            .sha(fact.previous_sha256.as_deref(), fact.next_sha256.as_deref())
+            .lifecycle(None, fact.next_lifecycle)
+            .verified(Some(fact.next_lifecycle == Some(LifecycleState::Verified)))
+            .reason(&fact.reason),
+        )?;
+    }
+    Ok(())
+}
+
 fn reconcile_runtime_boundary(
     root: &File,
     runtime: &File,
     canonical_manifest: &Manifest,
     runtime_manifest: &Manifest,
     policy: &dyn AssetDomainPolicy,
-) -> Result<(), AssetError> {
+) -> Result<Vec<RecoveryFact>, AssetError> {
     let mut canonical = canonical_manifest.clone();
     let mut local = runtime_manifest.clone();
     let transition = load_transition(root)?;
+    let mut facts = Vec::new();
 
     // Старые версии хранили все состояния жизненного цикла в публикуемом
     // манифесте. Сначала переносим байты в игнорируемую `.runtime`-область,
@@ -2837,6 +3623,10 @@ fn reconcile_runtime_boundary(
         .filter(|asset| asset.lifecycle != LifecycleState::Verified)
         .cloned()
         .collect();
+    // Идентичности, перенесённые этим циклом, описываются одним событием:
+    // удаление их прежней записи ниже — часть того же переноса, а не отдельный
+    // прерванный переход.
+    let mut migrated_legacy: BTreeSet<AssetIdentity> = BTreeSet::new();
     for candidate in legacy_candidates {
         if local
             .assets
@@ -2856,6 +3646,14 @@ fn reconcile_runtime_boundary(
             policy,
             |root, manifest| save_manifest(root, manifest, false),
         )?;
+        migrated_legacy.insert(candidate.identity.clone());
+        facts.push(RecoveryFact::new(
+            candidate.identity.clone(),
+            Some(candidate.sha256.clone()),
+            Some(candidate.sha256.clone()),
+            Some(candidate.lifecycle),
+            "устаревшая запись перенесена из публикуемого манифеста в .runtime",
+        ));
     }
 
     // Совпадающая идентичность в `.runtime` и каноническом манифесте означает,
@@ -2878,16 +3676,21 @@ fn reconcile_runtime_boundary(
             && marker.identity == previous.identity
             && matches!(marker.target, TransitionTarget::Canonical)
         {
-            let target = canonical
+            let survivor = canonical
                 .assets
                 .iter()
-                .find(|asset| asset.identity == marker.identity);
-            if target.is_none_or(|asset| asset.sha256 != marker.sha256) {
+                .find(|asset| asset.identity == marker.identity)
+                .cloned();
+            if survivor
+                .as_ref()
+                .is_none_or(|asset| asset.sha256 != marker.sha256)
+            {
                 return Err(AssetError::new(
                     ErrorCode::IntegrityMismatch,
                     "transition marker не совпадает с canonical asset",
                 ));
             }
+            let survivor = survivor.expect("совпадение проверено выше");
             let previous_runtime = local
                 .assets
                 .iter()
@@ -2900,8 +3703,32 @@ fn reconcile_runtime_boundary(
                     )
                 })?;
             remove_record_from_area(runtime, &mut local, &previous_runtime, policy)?;
+            // Идентичность остаётся живой записью в каноническом манифесте,
+            // поэтому событие описывает её фактическое состояние, а не удаление.
+            facts.push(RecoveryFact::new(
+                previous_runtime.identity.clone(),
+                Some(previous_runtime.sha256.clone()),
+                Some(survivor.sha256.clone()),
+                Some(survivor.lifecycle),
+                "прерванный переход к канонической записи завершён: локальная запись удалена",
+            ));
         } else {
             remove_record_from_area(root, &mut canonical, &previous, policy)?;
+            if !migrated_legacy.contains(&previous.identity) {
+                // Запись остаётся в `.runtime`, поэтому событие описывает её
+                // фактическое состояние в другой области.
+                let survivor = local
+                    .assets
+                    .iter()
+                    .find(|asset| asset.identity == previous.identity);
+                facts.push(RecoveryFact::new(
+                    previous.identity.clone(),
+                    Some(previous.sha256.clone()),
+                    survivor.map(|asset| asset.sha256.clone()),
+                    survivor.map(|asset| asset.lifecycle),
+                    "прерванный переход к локальной записи завершён: опубликованная запись удалена",
+                ));
+            }
         }
     }
 
@@ -2928,7 +3755,7 @@ fn reconcile_runtime_boundary(
     cleanup_matching_orphans(runtime, &local, &canonical)?;
     validate_verified_manifest(root, &canonical, policy)?;
     validate_runtime_manifest(runtime, &local, &canonical.store_id, policy)?;
-    Ok(())
+    Ok(facts)
 }
 
 fn cleanup_matching_orphans(
@@ -3077,7 +3904,10 @@ fn remove_record_from_area(
     )?;
     sync_directory(&asset_parent)?;
     prune_empty_storage_directories(root, &record.storage_path)?;
-    recover_removal(root, policy)
+    // Это штатное завершение удаления, а не восстановление после сбоя: след
+    // восстановления здесь не публикуется.
+    let _ = recover_removal(root, policy)?;
+    Ok(())
 }
 
 fn validate_validation_record(
@@ -3922,7 +4752,9 @@ where
     F: FnOnce(&File, &Manifest) -> Result<(), AssetError>,
 {
     ensure_unique_consumer_filename(manifest, record)?;
-    recover_publications(root, policy)?;
+    // Внутренние восстановления относятся к уже идущей операции: её событие
+    // журнала закрывается отдельно, поэтому следы здесь не публикуются.
+    let _ = recover_publications(root, policy)?;
     let next_revision = manifest.revision.checked_add(1).ok_or_else(|| {
         AssetError::new(
             ErrorCode::ManifestCorrupt,
@@ -3962,12 +4794,12 @@ where
 
     if let Err(error) = result {
         if let Some(publication) = &publication {
-            recover_publication(root, &publication.marker_name, policy)?;
+            let _ = recover_publication(root, &publication.marker_name, policy)?;
         }
         return Err(error);
     }
     if let Some(publication) = publication {
-        recover_publication(root, &publication.marker_name, policy)?;
+        let _ = recover_publication(root, &publication.marker_name, policy)?;
     }
     Ok(())
 }
@@ -4071,14 +4903,14 @@ fn prepare_publication(
                 backup_name.as_str(),
                 AtFlags::empty(),
             ) {
-                recover_publication(root, &pending.marker_name, policy)?;
+                let _ = recover_publication(root, &pending.marker_name, policy)?;
                 return Err(AssetError::io(
                     "не удалось сохранить предыдущий asset для CAS",
                     std::io::Error::from(error),
                 ));
             }
             if !file_matches_hash(&temporary, backup_name.as_str(), &previous.sha256)? {
-                recover_publication(root, &pending.marker_name, policy)?;
+                let _ = recover_publication(root, &pending.marker_name, policy)?;
                 return Err(AssetError::new(
                     ErrorCode::IntegrityMismatch,
                     "backup предыдущего asset не прошёл SHA-256 проверку",
@@ -4176,7 +5008,10 @@ fn verify_staged_contents(staged: &StagedObject, file: File) -> Result<(), Asset
     Ok(())
 }
 
-fn recover_publications(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(), AssetError> {
+fn recover_publications(
+    root: &File,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<Vec<RecoveryFact>, AssetError> {
     let temporary = open_directory_at(root, TEMP_DIR)
         .map_err(|error| AssetError::io("не удалось открыть каталог temporary files", error))?;
     let mut markers = Vec::new();
@@ -4192,10 +5027,16 @@ fn recover_publications(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(
         }
     }
     markers.sort();
+    let mut facts = Vec::new();
     for marker in markers {
-        recover_publication(root, &marker, policy)?;
+        if let Some(fact) = recover_publication(root, &marker, policy)? {
+            facts.push(fact);
+        }
     }
-    recover_removal(root, policy)
+    if let Some(fact) = recover_removal(root, policy)? {
+        facts.push(fact);
+    }
+    Ok(facts)
 }
 
 fn write_transaction_marker(directory: &File, name: &str, bytes: &[u8]) -> Result<(), AssetError> {
@@ -4259,7 +5100,10 @@ fn clear_transition(root: &File) -> Result<(), AssetError> {
     sync_directory(&temporary)
 }
 
-fn recover_removal(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(), AssetError> {
+fn recover_removal(
+    root: &File,
+    policy: &dyn AssetDomainPolicy,
+) -> Result<Option<RecoveryFact>, AssetError> {
     let temporary = open_directory_at(root, TEMP_DIR)
         .map_err(|error| directory_entry_error(TEMP_DIR, error))?;
     let marker_file = match open_regular_at(&temporary, REMOVAL_MARKER, ErrorCode::MissingAssetFile)
@@ -4267,7 +5111,8 @@ fn recover_removal(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(), As
         Ok(file) => file,
         Err(error) if error.code == ErrorCode::MissingAssetFile => {
             unlink_if_exists(&temporary, &OsString::from(REMOVAL_BACKUP))?;
-            return sync_directory(&temporary);
+            sync_directory(&temporary)?;
+            return Ok(None);
         }
         Err(error) => return Err(error),
     };
@@ -4313,7 +5158,7 @@ fn recover_removal(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(), As
         ));
     }
     let (asset_parent, name) = open_storage_parent(root, &transaction.record.storage_path, true)?;
-    match manifest
+    let fact = match manifest
         .assets
         .iter()
         .find(|asset| asset.identity == transaction.record.identity)
@@ -4356,6 +5201,13 @@ fn recover_removal(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(), As
                 }
                 Err(error) => return Err(error),
             }
+            RecoveryFact::new(
+                transaction.record.identity.clone(),
+                Some(current.sha256.clone()),
+                Some(current.sha256.clone()),
+                Some(current.lifecycle),
+                "удаление записи откатано: manifest сохранил запись",
+            )
         }
         None => {
             remove_storage_path_if_hash(
@@ -4364,6 +5216,13 @@ fn recover_removal(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(), As
                 &transaction.record.sha256,
                 "удаляемый asset",
             )?;
+            RecoveryFact::new(
+                transaction.record.identity.clone(),
+                Some(transaction.record.sha256.clone()),
+                None,
+                None,
+                "удаление записи завершено после сбоя: bytes удалены",
+            )
         }
         Some(_) => {
             return Err(AssetError::new(
@@ -4371,7 +5230,7 @@ fn recover_removal(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(), As
                 "identity изменилась при восстановлении удаления",
             ));
         }
-    }
+    };
     remove_if_hash(
         &temporary,
         REMOVAL_BACKUP,
@@ -4380,14 +5239,15 @@ fn recover_removal(root: &File, policy: &dyn AssetDomainPolicy) -> Result<(), As
     )?;
     unlink_if_exists(&temporary, &OsString::from(REMOVAL_MARKER))?;
     sync_directory(&temporary)?;
-    prune_empty_storage_directories(root, &transaction.record.storage_path)
+    prune_empty_storage_directories(root, &transaction.record.storage_path)?;
+    Ok(Some(fact))
 }
 
 fn recover_publication(
     root: &File,
     marker_name: &OsString,
     policy: &dyn AssetDomainPolicy,
-) -> Result<(), AssetError> {
+) -> Result<Option<RecoveryFact>, AssetError> {
     let temporary = open_directory_at(root, TEMP_DIR)
         .map_err(|error| AssetError::io("не удалось открыть каталог temporary files", error))?;
     validate_publication_names(marker_name, None, None)?;
@@ -4417,7 +5277,7 @@ fn recover_publication(
         (None, None) => true,
         _ => false,
     };
-    if committed {
+    let fact = if committed {
         if !storage_file_matches_hash(
             root,
             &transaction.next.storage_path,
@@ -4438,6 +5298,16 @@ fn recover_publication(
                 "предыдущий asset",
             )?;
         }
+        RecoveryFact::new(
+            transaction.identity.clone(),
+            transaction
+                .previous
+                .as_ref()
+                .map(|previous| previous.sha256.clone()),
+            Some(transaction.next.sha256.clone()),
+            current.map(|asset| asset.lifecycle),
+            "публикация завершена после сбоя: manifest уже содержал новый asset",
+        )
     } else if previous_state {
         if let Some(previous) = &transaction.previous {
             let (previous_parent, previous_name) =
@@ -4496,12 +5366,23 @@ fn recover_publication(
                 "неподтверждённый asset",
             )?;
         }
+        let previous_sha256 = transaction
+            .previous
+            .as_ref()
+            .map(|previous| previous.sha256.clone());
+        RecoveryFact::new(
+            transaction.identity.clone(),
+            previous_sha256.clone(),
+            previous_sha256,
+            current.map(|asset| asset.lifecycle),
+            "незавершённая публикация откатана к прежнему состоянию",
+        )
     } else {
         return Err(AssetError::new(
             ErrorCode::IntegrityMismatch,
             "publication marker не соответствует текущему manifest",
         ));
-    }
+    };
 
     remove_if_exists(&temporary, OsString::from(transaction.staged_name.as_str()))?;
     if let (Some(backup_name), Some(previous)) = (
@@ -4520,7 +5401,8 @@ fn recover_publication(
         prune_empty_storage_directories(root, &previous.storage_path)?;
     }
     prune_empty_storage_directories(root, &transaction.next.storage_path)?;
-    sync_directory(&temporary)
+    sync_directory(&temporary)?;
+    Ok(Some(fact))
 }
 
 fn validate_publication_transaction(
@@ -5033,7 +5915,7 @@ fn new_store_id() -> String {
     sha256_hex(material.as_bytes())
 }
 
-fn sync_directory(directory: &File) -> Result<(), AssetError> {
+pub(crate) fn sync_directory(directory: &File) -> Result<(), AssetError> {
     directory
         .sync_all()
         .map_err(|error| AssetError::io("не удалось синхронизировать каталог store", error))
@@ -5753,3 +6635,7 @@ mod tests {
 #[cfg(test)]
 #[path = "trust_tests.rs"]
 mod trust_tests;
+
+#[cfg(test)]
+#[path = "journal_tests.rs"]
+mod journal_tests;

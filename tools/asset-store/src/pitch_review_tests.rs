@@ -1,5 +1,3 @@
-use std::io::Cursor;
-
 use crate::batch_runtime::RuntimeBlobRef;
 use crate::browser_runtime::{BrowserExecutableSource, BrowserRuntimeProvenance};
 use crate::domain::AssetDomainPolicy;
@@ -13,10 +11,8 @@ use crate::model::{
     ValidationEvidence, ValidationRecord, ValidatorIdentity,
 };
 use crate::pitch_accent::{
-    PitchAccentCaptureRect, PitchAccentCoordinateSpace, PitchAccentDarkThemeProof,
-    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentEvidence,
-    PitchAccentGraphEvidence, PitchAccentImageValidator, PitchAccentProvider,
-    PitchAccentRenderEvidence, PitchAccentRenderKind, PitchAccentResolvedForm,
+    PitchAccentDomainMetadata, PitchAccentDomainPolicy, PitchAccentImageValidator,
+    PitchAccentResolvedForm,
 };
 use crate::pitch_batch::{
     PitchAccentBatch, PitchBatchAttempt, PitchBatchConflict, PitchBatchItem, PitchBatchOutcome,
@@ -39,80 +35,17 @@ fn browser() -> BrowserRuntimeProvenance {
 }
 
 fn metadata(surface: &str) -> PitchAccentDomainMetadata {
-    PitchAccentDomainMetadata {
-        surface: surface.into(),
-        reading: "ゆうれい".into(),
-        jpdb_vocabulary_id: 123,
-        evidence: PitchAccentEvidence {
-            provider: PitchAccentProvider::Jpdb,
-            source_url: "https://jpdb.io/vocabulary/123/幽霊/ゆうれい".into(),
-            resolved_forms: vec![PitchAccentResolvedForm {
-                surface: surface.into(),
-                reading: "ゆうれい".into(),
-            }],
-            graph_count: 1,
-            render: PitchAccentRenderEvidence {
-                kind: PitchAccentRenderKind::BrowserRegionScreenshot,
-                selector: ".pitch-graph".into(),
-                graphs: vec![PitchAccentGraphEvidence {
-                    index: 0,
-                    selector: ".pitch-graph".into(),
-                    viewport_rect: PitchAccentCaptureRect {
-                        x: 10.0,
-                        y: 20.0,
-                        width: 2.0,
-                        height: 2.0,
-                    },
-                    document_rect: PitchAccentCaptureRect {
-                        x: 10.0,
-                        y: 20.0,
-                        width: 2.0,
-                        height: 2.0,
-                    },
-                }],
-                coordinate_space: PitchAccentCoordinateSpace::Document,
-                viewport_width: 1280,
-                viewport_height: 900,
-                document_width: 1280,
-                document_height: 900,
-                scroll_x: 0.0,
-                scroll_y: 0.0,
-                pixel_width: 6,
-                pixel_height: 6,
-                device_scale_factor: 3.0,
-                page_scale_factor: 1.0,
-                dark_theme: PitchAccentDarkThemeProof {
-                    document_element_classes: vec!["dark-mode".into()],
-                    prefers_color_scheme: "dark".into(),
-                    computed_color_scheme: "dark".into(),
-                    background_selector: ".pitch-section".into(),
-                    background_rgb: [24, 36, 48],
-                },
-                graph_union_rect: PitchAccentCaptureRect {
-                    x: 10.0,
-                    y: 20.0,
-                    width: 2.0,
-                    height: 2.0,
-                },
-                capture_rect: PitchAccentCaptureRect {
-                    x: 10.0,
-                    y: 20.0,
-                    width: 2.0,
-                    height: 2.0,
-                },
-            },
-            browser: browser(),
-        },
-    }
+    crate::pitch_accent::test_support::single_variant_metadata(
+        surface,
+        "ゆうれい",
+        123,
+        "https://jpdb.io/vocabulary/123/幽霊/ゆうれい".into(),
+        browser(),
+    )
 }
 
 fn png() -> Vec<u8> {
-    let image = image::RgbaImage::from_pixel(6, 6, image::Rgba([24, 36, 48, 255]));
-    let mut output = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(image)
-        .write_to(&mut output, image::ImageFormat::Png)
-        .unwrap();
-    output.into_inner()
+    crate::pitch_accent::test_support::single_variant_png(false)
 }
 
 fn candidate(
@@ -392,7 +325,9 @@ fn review_renders_every_typed_outcome_and_all_batch_statuses() {
         "Части речи",
         "Значения",
         "Канонический PNG",
-        "число графиков",
+        "вариантов графика у записи: 1",
+        "основание выбора: воспроизводимый хеш",
+        "графиков в PNG: 1",
         "статус проверки",
     ] {
         assert!(html.contains(evidence_label), "missing {evidence_label}");

@@ -24,6 +24,7 @@ pub enum ErrorCode {
     InvalidTransition,
     InvalidValidationEvidence,
     IoFailure,
+    JournalTooLarge,
     ValidatorFailure,
 }
 
@@ -50,6 +51,7 @@ impl ErrorCode {
             Self::InvalidTransition => "invalid_transition",
             Self::InvalidValidationEvidence => "invalid_validation_evidence",
             Self::IoFailure => "io_failure",
+            Self::JournalTooLarge => "journal_too_large",
             Self::ValidatorFailure => "validator_failure",
         }
     }
@@ -76,7 +78,8 @@ impl ErrorCode {
             | Self::PathTraversal
             | Self::UnexpectedPath
             | Self::MissingAssetFile
-            | Self::IntegrityMismatch => 4,
+            | Self::IntegrityMismatch
+            | Self::JournalTooLarge => 4,
             Self::IoFailure | Self::ValidatorFailure => 5,
         }
     }

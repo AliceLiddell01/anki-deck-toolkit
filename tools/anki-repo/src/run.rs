@@ -21,6 +21,7 @@ use crate::ops::edit::{EditRequest, EditSpec, STDIN_REQUEST_SOURCE};
 use crate::ops::find as find_op;
 use crate::ops::find::{FindCriteria, FindQuery, MatchMode};
 use crate::ops::inspect as inspect_op;
+use crate::ops::migrate_layout as migrate_layout_op;
 use crate::ops::migrate_media as migrate_media_op;
 use crate::ops::models as models_op;
 use crate::ops::models::ModelsQuery;
@@ -62,6 +63,10 @@ pub fn execute_cli(cli: &Cli) -> Result<Rendered, DomainError> {
 
 /// Выполняет команду и готовит результат без обращения к стандартным потокам.
 pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
+    // Граница закрытой области проверяется до предметной работы: ни одна команда
+    // не должна успеть открыть `decks/input`.
+    crate::layout::guard_command(&cli.command)?;
+
     match &cli.command {
         Command::Maintenance {
             action,
@@ -440,6 +445,19 @@ pub fn execute(cli: &Cli) -> Result<Rendered, DomainError> {
                     human::edit(&result)
                 },
                 exit: 0,
+            })
+        }
+
+        Command::MigrateLayout { root, apply } => {
+            let result = migrate_layout_op::migrate(root.as_deref(), *apply)?;
+            Ok(Rendered {
+                command: "migrate-layout",
+                stdout: if cli.json {
+                    json::migrate_layout_json(&result)
+                } else {
+                    human::migrate_layout(&result)
+                },
+                exit: result.exit_code(),
             })
         }
     }

@@ -1,6 +1,6 @@
 //! Повторно используемая среда Chromium и техническая телеметрия CDP.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::future::Future;
 use std::io::{self, Read};
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chromiumoxide::{
-    Browser, BrowserConfig, Page,
+    Browser, Page,
     cdp::browser_protocol::{
         emulation::{MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams},
         network::{
@@ -21,16 +21,21 @@ use chromiumoxide::{
         page::{EnableParams, GetFrameTreeParams},
     },
     cdp::js_protocol::runtime::{EnableParams as RuntimeEnableParams, EventExceptionThrown},
+    handler::{HandlerConfig, viewport::Viewport},
 };
 use futures::{FutureExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use url::Url;
 
+use crate::browser_process::{BrowserLaunchSpec, OwnedBrowserProcess, ProcessLaunchFailure};
 use crate::temp_workspace::TempWorkspace;
 
 const MAX_TRACKED_REQUESTS: usize = 256;
 const MAX_NETWORK_OUTCOMES: usize = 256;
+/// События ответа из кэша разделены долями миллисекунды, поэтому такой объём памяти
+/// завершённых запросов с большим запасом покрывает задержку между слушателями.
+const MAX_COMPLETED_REQUESTS: usize = 1024;
 const MAX_NETWORK_DIAGNOSTIC_ITEMS: usize = 3;
 const MAX_NETWORK_DIAGNOSTIC_PATH_CHARS: usize = 160;
 /// Максимум записей каждой коллекции в диагностическом JSON.
@@ -382,11 +387,11 @@ fn set_private_directory(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-fn build_browser_config(
+fn build_launch_spec(
     profile: &BrowserProfile,
     config: &BrowserRuntimeConfig,
     executable: Option<BrowserExecutableSelection>,
-) -> Result<BrowserConfig, String> {
+) -> Result<BrowserLaunchSpec, String> {
     let configured_temp_root =
         std::env::var_os(crate::temp_workspace::CONFIGURED_TEMP_ROOT_ENV).map(PathBuf::from);
     let current_directory = std::env::current_dir().ok();
@@ -398,19 +403,54 @@ fn build_browser_config(
     let temp_directory = temp_directory
         .to_str()
         .ok_or("browser_tmpdir_invalid: путь TMPDIR должен быть UTF-8")?;
-    let mut builder = BrowserConfig::builder()
-        .user_data_dir(&profile.path)
-        .env("TMPDIR", temp_directory)
-        .incognito()
-        .respect_https_errors()
-        .launch_timeout(config.launch_timeout)
-        .request_timeout(config.request_timeout);
-    if let Some(executable) = executable {
-        builder = builder.chrome_executable(executable.path);
+    let executable = match executable {
+        Some(executable) => executable.path,
+        None => chromiumoxide::detection::default_executable(
+            chromiumoxide::detection::DetectionOptions::default(),
+        )
+        .map_err(|error| format!("настройка браузера: {error}"))?,
+    };
+    Ok(BrowserLaunchSpec {
+        executable,
+        user_data_dir: profile.path.clone(),
+        tmpdir: temp_directory.to_owned(),
+        launch_timeout: config.launch_timeout,
+    })
+}
+
+/// Настройки обработчика CDP совпадают с прежним `Browser::launch`: ошибки HTTPS
+/// не игнорируются, а область просмотра по умолчанию остаётся 800×600.
+fn handler_config(config: &BrowserRuntimeConfig) -> HandlerConfig {
+    HandlerConfig {
+        ignore_https_errors: false,
+        ignore_invalid_messages: true,
+        viewport: Some(Viewport::default()),
+        context_ids: Vec::new(),
+        request_timeout: config.request_timeout,
+        request_intercept: false,
+        cache_enabled: true,
     }
-    builder
-        .build()
-        .map_err(|error| format!("настройка браузера: {error}"))
+}
+
+/// Запуск процесса и подключение CDP; при отказе подключения процесс уже остановлен.
+async fn launch_owned_browser(
+    spec: &BrowserLaunchSpec,
+    config: &BrowserRuntimeConfig,
+) -> Result<(OwnedBrowserProcess, Browser, chromiumoxide::Handler), ProcessLaunchFailure> {
+    let (mut process, address) = OwnedBrowserProcess::spawn(spec).await?;
+    match Browser::connect_with_config(address, handler_config(config)).await {
+        Ok((browser, handler)) => Ok((process, browser, handler)),
+        Err(error) => {
+            let stop = process.stop(Duration::from_secs(2)).await;
+            Err(ProcessLaunchFailure {
+                message: format!(
+                    "запуск браузера: подключение CDP: {}",
+                    crate::diagnostics::safe_message(&error.to_string())
+                ),
+                stop,
+            })
+        }
+    }
 }
 
 fn browser_tmpdir_value(
@@ -464,6 +504,7 @@ impl Drop for BrowserProfile {
 struct BrowserResources {
     diagnostic_session_id: u64,
     browser: Option<Browser>,
+    process: Option<OwnedBrowserProcess>,
     handler_task: Option<tokio::task::JoinHandle<()>>,
     profile: Option<BrowserProfile>,
 }
@@ -526,6 +567,12 @@ async fn profile_launch_failure(
     }
 }
 
+/// Окно самостоятельного выхода Chromium после `Browser.close`. Наблюдаемое время
+/// штатного выхода при закрытии во время активной навигации — от 0,4 до более чем
+/// 2 с под нагрузкой; прежнее окно 2 с попадало в хвост этого распределения и
+/// превращало штатный выход в принудительное завершение `browser_close_failed`.
+const BROWSER_EXIT_GRACE: Duration = Duration::from_secs(10);
+
 /// Закрытие транспорта CDP и завершение принадлежащего сессии процесса — независимые наблюдения.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BrowserTransportStop {
@@ -559,7 +606,11 @@ fn transport_stop_result(
     }
 }
 
-async fn stop_browser(browser: &mut Browser, browser_session: u64) -> BrowserStopObservation {
+async fn stop_browser(
+    browser: &mut Browser,
+    process: Option<&mut OwnedBrowserProcess>,
+    browser_session: u64,
+) -> BrowserStopObservation {
     let started = Instant::now();
     let transport = match timeout(Duration::from_secs(2), browser.close()).await {
         Ok(result) => transport_stop_result(result.map(|_| ())),
@@ -584,55 +635,63 @@ async fn stop_browser(browser: &mut Browser, browser_session: u64) -> BrowserSto
         code = transport_code,
         browser_session,
         outcome = transport_outcome,
+        failure = match &transport {
+            BrowserTransportStop::Failed(error) => Some(crate::diagnostics::safe_message(error)),
+            _ => None,
+        },
         stage_duration_ms = duration_millis(started.elapsed()),
         "Завершено наблюдение остановки транспорта CDP"
     );
     let started = Instant::now();
-    let wait = timeout(Duration::from_secs(2), browser.wait()).await;
-    let (process_stopped, process_failure, process_outcome) = if matches!(wait, Ok(Ok(_))) {
-        (true, None, "exited")
-    } else {
-        match timeout(Duration::from_secs(2), browser.kill()).await {
-            Ok(Some(Ok(()))) => {
-                let failure = if transport == BrowserTransportStop::Detached {
-                    None
-                } else {
-                    Some("browser_close_failed: потребовалось принудительное завершение".into())
-                };
-                (true, failure, "killed")
-            }
-            Ok(Some(Err(error))) => (
-                false,
-                Some(format!(
-                    "browser_kill_failed: {}",
-                    crate::diagnostics::safe_message(&error.to_string())
-                )),
-                "stop_failed",
-            ),
-            Ok(None) => (
-                false,
-                Some("browser_process_stop_unproven".into()),
-                "unproven",
-            ),
-            Err(_) => (false, Some("browser_kill_timeout".into()), "stop_failed"),
-        }
+    let process_group = process.as_ref().map(|process| process.pid());
+    let mut process = process;
+    let (process_stopped, process_failure, process_outcome) = match process.as_deref_mut() {
+        None => (
+            false,
+            Some("browser_process_stop_unproven".to_owned()),
+            "unproven",
+        ),
+        Some(process) => match process.wait_exit(BROWSER_EXIT_GRACE).await {
+            Ok(Some(_)) => (true, None, "exited"),
+            Err(error) => (false, Some(error), "stop_failed"),
+            Ok(None) => match process.kill(Duration::from_secs(2)).await {
+                Ok(()) => {
+                    let failure = if transport == BrowserTransportStop::Detached {
+                        None
+                    } else {
+                        Some("browser_close_failed: потребовалось принудительное завершение".into())
+                    };
+                    (true, failure, "killed")
+                }
+                Err(error) => (false, Some(error), "stop_failed"),
+            },
+        },
     };
-    let process_code = match process_outcome {
-        "exited" => "browser_process_exited",
-        "killed" => "browser_process_killed",
-        "unproven" => "browser_process_stop_unproven",
-        _ if process_failure.as_deref() == Some("browser_kill_timeout") => "browser_kill_timeout",
+    let process_code = match (process_outcome, process_failure.as_deref()) {
+        ("exited", _) => "browser_process_exited",
+        ("killed", _) => "browser_process_killed",
+        ("unproven", _) => "browser_process_stop_unproven",
+        (_, Some("browser_kill_timeout")) => "browser_kill_timeout",
+        (_, Some("browser_process_group_stop_unproven")) => "browser_process_group_stop_unproven",
         _ => "browser_kill_failed",
     };
+    let details = process
+        .as_deref()
+        .map(OwnedBrowserProcess::stop_details)
+        .unwrap_or_default();
     tracing::info!(
         event = "browser_lifecycle",
         stage = "browser_process_stop",
         code = process_code,
         browser_session,
+        process_group,
         outcome = process_outcome,
         process_stopped,
+        leader_wait_ms = duration_millis(details.leader_wait),
+        group_drain_ms = duration_millis(details.group_drain),
+        descendants_killed = details.descendants_killed,
         stage_duration_ms = duration_millis(started.elapsed()),
-        "Завершена проверка остановки принадлежащего браузера"
+        "Завершена проверка остановки принадлежащего браузера и его группы процессов"
     );
     BrowserStopObservation {
         transport,
@@ -683,7 +742,9 @@ impl BrowserResources {
 
     async fn close(mut self) -> Result<(), String> {
         let stopped = match self.browser.as_mut() {
-            Some(browser) => stop_browser(browser, self.diagnostic_session_id).await,
+            Some(browser) => {
+                stop_browser(browser, self.process.as_mut(), self.diagnostic_session_id).await
+            }
             None => BrowserStopObservation {
                 transport: BrowserTransportStop::Closed,
                 process_stopped: true,
@@ -713,6 +774,7 @@ impl BrowserResources {
             "Завершена остановка обработчика CDP"
         );
         drop(self.browser.take());
+        drop(self.process.take());
         let started = Instant::now();
         let cleanup = match self.profile.take() {
             Some(profile) => profile.close_after_browser_stop().await.map_err(|error| {
@@ -748,7 +810,7 @@ impl BrowserResources {
             },
             process_stopped = stopped.process_stopped,
             profile_temp_removed = cleanup.is_ok(),
-            "Проверены postconditions принадлежащих процессов и каталогов"
+            "Проверены постусловия принадлежащих процессов и каталогов"
         );
         let result = combine_browser_close_results(
             classify_browser_cleanup(stopped, cleanup),
@@ -775,9 +837,10 @@ fn combine_browser_close_results(
 impl Drop for BrowserResources {
     fn drop(&mut self) {
         let browser = self.browser.take();
+        let process = self.process.take();
         let handler = self.handler_task.take();
         let profile = self.profile.take();
-        if browser.is_none() && handler.is_none() && profile.is_none() {
+        if browser.is_none() && process.is_none() && handler.is_none() && profile.is_none() {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -786,6 +849,7 @@ impl Drop for BrowserResources {
                 let resources = BrowserResources {
                     diagnostic_session_id,
                     browser,
+                    process,
                     handler_task: handler,
                     profile,
                 };
@@ -796,6 +860,7 @@ impl Drop for BrowserResources {
                 handler.abort();
             }
             drop(browser);
+            drop(process);
             drop(profile);
         }
     }
@@ -836,29 +901,36 @@ impl BrowserSession {
             .as_ref()
             .map(|selection| selection.source)
             .unwrap_or(BrowserExecutableSource::ChromiumoxideDefault);
-        let browser_config = match build_browser_config(&profile, &config, executable) {
-            Ok(config) => config,
+        let spec = match build_launch_spec(&profile, &config, executable) {
+            Ok(spec) => spec,
             Err(message) => {
                 return Err(profile_setup_failure(profile, message));
             }
         };
-        // Если разворачивание стека прервёт получение Browser, дочерний процесс
-        // chromiumoxide применит `kill_on_drop`. `catch_browser_setup` полностью
-        // уничтожит `Future` запуска; затем ждём, пока процессы перестанут
-        // использовать временное дерево, и только после этого удаляем профиль.
-        // Это не требует обращаться к скрытому дочернему процессу через `waitpid`.
+        // Процесс принадлежит `OwnedBrowserProcess` в собственной группе: при
+        // разворачивании стека его `Drop` завершает только эту группу. Затем ждём,
+        // пока процессы перестанут использовать временное дерево, и только после
+        // этого удаляем профиль.
         let launched = catch_browser_setup(async {
-            Browser::launch(browser_config)
-                .await
-                .map_err(|error| format!("запуск браузера: {error}"))
+            Ok::<_, String>(launch_owned_browser(&spec, &config).await)
         })
         .await;
-        let (browser, mut handler) = match launched {
-            Ok(launched) => launched,
+        let (process, browser, mut handler) = match launched {
+            Ok(Ok(launched)) => launched,
+            Ok(Err(failure)) => {
+                let stop = failure.stop.map(|_| ());
+                return Err(profile_launch_failure(
+                    profile,
+                    BrowserSetupFailure::Error(failure.message),
+                )
+                .await
+                .with_cleanup(stop));
+            }
             Err(failure) => {
                 return Err(profile_launch_failure(profile, failure).await);
             }
         };
+        let process_group = process.pid();
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
                 if event.is_err() {
@@ -870,9 +942,18 @@ impl BrowserSession {
         let mut resources = BrowserResources {
             diagnostic_session_id: NEXT_BROWSER_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             browser: Some(browser),
+            process: Some(process),
             handler_task: Some(handler_task),
             profile: Some(profile),
         };
+        tracing::info!(
+            event = "browser_lifecycle",
+            stage = "browser_process_started",
+            code = "browser_process_group_owned",
+            browser_session = resources.diagnostic_session_id,
+            process_group,
+            "Браузер запущен в собственной группе процессов"
+        );
         // Перехватываем панику, пока `resources` принадлежит запуску: `Drop`
         // запускает только фоновую резервную очистку и не гарантирует её завершение.
         let setup = catch_browser_setup(async {
@@ -1019,7 +1100,7 @@ pub struct RuntimeSnapshot {
     pub stale_javascript_exceptions: u32,
 }
 
-/// Возраст запроса CDP, а не длительность server-side обработки.
+/// Возраст запроса CDP, а не длительность обработки на стороне сервера.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRequestObservation {
     pub request_id: String,
@@ -1178,6 +1259,19 @@ struct RuntimeState {
     main_frame_id: String,
     active_epoch: u64,
     next_epoch: u64,
+    // Слушатели событий CDP разных типов работают независимо, поэтому терминальное
+    // событие ответа из кэша может быть обработано раньше его `requestWillBeSent`,
+    // а `responseReceived` — позже `loadingFinished`. Завершённый запрос сохраняет
+    // эпоху и принадлежность главному кадру, чтобы поздние события не теряли их.
+    completed_requests: HashMap<String, CompletedRequest>,
+    completed_order: VecDeque<String>,
+}
+
+/// Корреляция завершённого запроса, нужная его поздним событиям.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompletedRequest {
+    epoch: u64,
+    is_top_level: bool,
 }
 
 impl RuntimeState {
@@ -1201,6 +1295,31 @@ impl RuntimeState {
             self.monitor_failed = true;
             return;
         }
+        let is_top_level = frame_id.is_some_and(|id| id == self.main_frame_id);
+        // Исход, обработанный раньше запроса, получает его URL и принадлежность кадру:
+        // без них критический сбой страницы не распознаётся как критический.
+        // Шаги перенаправления одного запроса приходят по порядку, поэтому сбой
+        // относится к последнему из них; URL ошибки HTTP взят из самого ответа.
+        for outcome in self
+            .network_failures
+            .iter_mut()
+            .filter(|outcome| outcome.request_id == request_id)
+        {
+            outcome.url = Some(url.clone());
+            outcome.is_top_level |= is_top_level;
+        }
+        for outcome in self
+            .http_errors
+            .iter_mut()
+            .filter(|outcome| outcome.request_id == request_id)
+        {
+            outcome.url.get_or_insert_with(|| url.clone());
+            outcome.is_top_level |= is_top_level;
+        }
+        if let Some(completed) = self.completed_requests.get_mut(&request_id) {
+            completed.is_top_level |= is_top_level;
+            return;
+        }
         if !self.relevant_requests.contains_key(&request_id)
             && self.relevant_requests.len() >= MAX_TRACKED_REQUESTS
         {
@@ -1208,10 +1327,8 @@ impl RuntimeState {
             return;
         }
         let epoch = self
-            .relevant_requests
-            .get(&request_id)
-            .map_or(self.active_epoch, |request| request.epoch);
-        let is_top_level = frame_id.is_some_and(|id| id == self.main_frame_id);
+            .observed_scope(&request_id)
+            .map_or(self.active_epoch, |scope| scope.epoch);
         self.request_observed_at
             .entry(request_id.clone())
             .or_insert_with(Instant::now);
@@ -1227,14 +1344,70 @@ impl RuntimeState {
         );
     }
 
+    fn record_finished(&mut self, request_id: &str) {
+        let scope = self.observed_scope(request_id);
+        self.relevant_requests.remove(request_id);
+        self.request_observed_at.remove(request_id);
+        self.remember_completed(request_id, scope);
+    }
+
+    /// Эпоха и кадр запроса по самому раннему обработанному событию с этим ID.
+    /// Раньше всех обработанное событие ближе всего к моменту отправки запроса,
+    /// поэтому смена эпохи между слушателями не переносит запрос в новую эпоху.
+    fn observed_scope(&self, request_id: &str) -> Option<CompletedRequest> {
+        if let Some(request) = self.relevant_requests.get(request_id) {
+            return Some(CompletedRequest {
+                epoch: request.epoch,
+                is_top_level: request.is_top_level,
+            });
+        }
+        if let Some(completed) = self.completed_requests.get(request_id) {
+            return Some(*completed);
+        }
+        self.network_failures
+            .iter()
+            .chain(&self.http_errors)
+            .find(|outcome| outcome.request_id == request_id)
+            .map(|outcome| CompletedRequest {
+                epoch: outcome.epoch,
+                is_top_level: outcome.is_top_level,
+            })
+    }
+
+    /// Терминальное событие окончательно: поздний `requestWillBeSent` того же запроса
+    /// (в том числе шаг перенаправления) уже не делает его ожидающим, а поздний
+    /// `responseReceived` получает эпоху и кадр завершённого запроса.
+    fn remember_completed(&mut self, request_id: &str, scope: Option<CompletedRequest>) {
+        if request_id.len() > MAX_RUNTIME_REQUEST_ID_BYTES {
+            return;
+        }
+        let scope = scope.unwrap_or(CompletedRequest {
+            epoch: self.active_epoch,
+            is_top_level: false,
+        });
+        if let Some(completed) = self.completed_requests.get_mut(request_id) {
+            completed.is_top_level |= scope.is_top_level;
+            return;
+        }
+        if self.completed_order.len() >= MAX_COMPLETED_REQUESTS
+            && let Some(oldest) = self.completed_order.pop_front()
+        {
+            self.completed_requests.remove(&oldest);
+        }
+        self.completed_requests.insert(request_id.to_owned(), scope);
+        self.completed_order.push_back(request_id.to_owned());
+    }
+
     fn record_network_failure(
         &mut self,
         request_id: String,
         event_resource_type: ResourceType,
         failure_reason: String,
     ) {
+        let scope = self.observed_scope(&request_id);
         let tracked = self.relevant_requests.remove(&request_id);
         self.request_observed_at.remove(&request_id);
+        self.remember_completed(&request_id, scope);
         if request_id.len() > MAX_RUNTIME_REQUEST_ID_BYTES
             || failure_reason.len() > MAX_RUNTIME_REASON_BYTES
         {
@@ -1253,14 +1426,12 @@ impl RuntimeState {
                 .as_ref()
                 .map(|request| request.resource_type.clone())
                 .unwrap_or(event_resource_type),
-            url: tracked.as_ref().map(|request| request.url.clone()),
+            url: tracked.map(|request| request.url),
             failure_reason: Some(failure_reason),
             request_id,
-            epoch: tracked
-                .as_ref()
-                .map_or(self.active_epoch, |request| request.epoch),
+            epoch: scope.map_or(self.active_epoch, |scope| scope.epoch),
             status_code: None,
-            is_top_level: tracked.is_some_and(|request| request.is_top_level),
+            is_top_level: scope.is_some_and(|scope| scope.is_top_level),
         });
     }
 
@@ -1270,6 +1441,7 @@ impl RuntimeState {
         resource_type: ResourceType,
         url: String,
         status_code: u16,
+        frame_id: Option<&str>,
     ) {
         if !is_relevant_resource_type(&resource_type) || status_code < 400 {
             return;
@@ -1282,15 +1454,19 @@ impl RuntimeState {
             self.monitor_failed = true;
             return;
         }
-        let tracked = self.relevant_requests.get(&request_id);
+        // `frameId` ответа сам указывает кадр, поэтому главный документ распознаётся
+        // и без `requestWillBeSent`; эпоху даёт ранее обработанное событие запроса.
+        let scope = self.observed_scope(&request_id);
+        let is_top_level = frame_id.is_some_and(|id| id == self.main_frame_id)
+            || scope.is_some_and(|scope| scope.is_top_level);
         self.http_errors.push(NetworkOutcome {
             resource_type,
             url: Some(url),
             failure_reason: None,
             request_id,
-            epoch: tracked.map_or(self.active_epoch, |request| request.epoch),
+            epoch: scope.map_or(self.active_epoch, |scope| scope.epoch),
             status_code: Some(status_code),
-            is_top_level: tracked.is_some_and(|request| request.is_top_level),
+            is_top_level,
         });
     }
 
@@ -1483,9 +1659,7 @@ impl CdpRuntimeMonitor {
             tasks.push(tokio::spawn(async move {
                 let mut events = finished_events;
                 while let Some(event) = events.next().await {
-                    let mut state = lock_state(&state);
-                    state.relevant_requests.remove(event.request_id.as_ref());
-                    state.request_observed_at.remove(event.request_id.as_ref());
+                    lock_state(&state).record_finished(event.request_id.as_ref());
                 }
                 mark_monitor_failed(&state);
             }));
@@ -1514,6 +1688,7 @@ impl CdpRuntimeMonitor {
                         event.r#type.clone(),
                         event.response.url.clone(),
                         event.response.status as u16,
+                        event.frame_id.as_ref().map(|id| id.as_ref()),
                     );
                 }
                 mark_monitor_failed(&state);
@@ -1981,21 +2156,10 @@ mod tests {
             path: PathBuf::from("/bin/true"),
             source: BrowserExecutableSource::PathLookup,
         };
-        let config =
-            build_browser_config(&profile, &BrowserRuntimeConfig::default(), Some(executable))
-                .unwrap();
-        assert_eq!(
-            config.user_data_dir.as_deref(),
-            Some(profile.path.as_path())
-        );
-        assert_eq!(
-            config
-                .process_envs
-                .as_ref()
-                .and_then(|environment| environment.get("TMPDIR"))
-                .map(String::as_str),
-            profile.temp_path.to_str()
-        );
+        let spec = build_launch_spec(&profile, &BrowserRuntimeConfig::default(), Some(executable))
+            .unwrap();
+        assert_eq!(spec.user_data_dir, profile.path);
+        assert_eq!(Some(spec.tmpdir.as_str()), profile.temp_path.to_str());
         assert!(profile.temp_path.starts_with(parent.path()));
         assert_eq!(std::env::var_os("TMPDIR"), before);
         assert!(profile.temp_path.as_os_str().as_bytes().len() < 108);
@@ -2018,13 +2182,10 @@ mod tests {
                 source: BrowserExecutableSource::PathLookup,
             };
             let result =
-                build_browser_config(&profile, &BrowserRuntimeConfig::default(), Some(executable));
+                build_launch_spec(&profile, &BrowserRuntimeConfig::default(), Some(executable));
             if let Some(expected) = temp_path.to_str() {
-                let config = result.unwrap();
-                assert_eq!(
-                    config.process_envs.unwrap().get("TMPDIR").unwrap(),
-                    expected
-                );
+                let spec = result.unwrap();
+                assert_eq!(spec.tmpdir, expected);
                 profile.close().unwrap();
             } else {
                 let message = result.unwrap_err();
@@ -2203,6 +2364,7 @@ mod tests {
                     let resources = BrowserResources {
                         diagnostic_session_id: 0,
                         browser: None,
+                        process: None,
                         handler_task: None,
                         profile: Some(profile),
                     };
@@ -2280,6 +2442,7 @@ mod tests {
         let resources = BrowserResources {
             diagnostic_session_id: 0,
             browser: None,
+            process: None,
             handler_task: Some(handler),
             profile: Some(profile),
         };
@@ -2320,6 +2483,7 @@ mod tests {
         let resources = BrowserResources {
             diagnostic_session_id: 0,
             browser: None,
+            process: None,
             handler_task: None,
             profile: Some(profile),
         };
@@ -2452,6 +2616,7 @@ mod tests {
             ResourceType::Fetch,
             "https://example.test/pending".into(),
             503,
+            None,
         );
         state.record_javascript_exception();
 
@@ -2945,6 +3110,363 @@ mod tests {
     }
 
     #[test]
+    fn completion_handled_before_its_request_does_not_leave_pending_request() {
+        // Ответ из кэша памяти браузера: `requestWillBeSent` и `loadingFinished` приходят почти
+        // одновременно, а их независимые слушатели могут обработать их в обратном порядке.
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let epoch = state.begin_epoch();
+        state.record_finished("cached-style");
+        state.record_request(
+            "cached-style".into(),
+            ResourceType::Stylesheet,
+            "https://jpdb.io/static/site.css".into(),
+            Some("main"),
+        );
+        // Шаг перенаправления после завершения тоже не воскрешает запрос.
+        state.record_request(
+            "cached-style".into(),
+            ResourceType::Stylesheet,
+            "https://jpdb.io/static/site-redirected.css".into(),
+            Some("main"),
+        );
+        let snapshot = state.snapshot(epoch);
+        assert!(snapshot.pending_requests.is_empty());
+        assert!(snapshot.stale_pending_requests.is_empty());
+        assert!(state.request_observed_at.is_empty());
+        assert!(!snapshot.monitor_failed);
+
+        // Обычный порядок по-прежнему отслеживает незавершённый запрос.
+        state.record_request(
+            "live-script".into(),
+            ResourceType::Script,
+            "https://jpdb.io/static/app.js".into(),
+            Some("main"),
+        );
+        assert_eq!(state.snapshot(epoch).pending_requests.len(), 1);
+        state.record_finished("live-script");
+        assert!(state.snapshot(epoch).pending_requests.is_empty());
+    }
+
+    #[test]
+    fn late_response_keeps_main_frame_and_epoch_of_completed_request() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let epoch = state.begin_epoch();
+        // Ответ обработан после `loadingFinished`; `frameId` ответа намеренно не передан,
+        // чтобы проверить сохранённую корреляцию, а не только поле события.
+        state.record_request(
+            "finished-first".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=a".into(),
+            Some("main"),
+        );
+        state.record_finished("finished-first");
+        state.record_http_error(
+            "finished-first".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=a".into(),
+            429,
+            None,
+        );
+        // Завершение обработано раньше запроса, ответ — последним.
+        state.record_finished("request-late");
+        state.record_request(
+            "request-late".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=b".into(),
+            Some("main"),
+        );
+        state.record_http_error(
+            "request-late".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=b".into(),
+            429,
+            None,
+        );
+        // Обычный порядок.
+        state.record_request(
+            "ordered".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=c".into(),
+            Some("main"),
+        );
+        state.record_http_error(
+            "ordered".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=c".into(),
+            503,
+            Some("main"),
+        );
+        state.record_finished("ordered");
+        // Ответ без предшествующих событий распознаётся по своему `frameId`.
+        state.record_http_error(
+            "response-only".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=d".into(),
+            429,
+            Some("main"),
+        );
+        let snapshot = state.snapshot(epoch);
+        let errors = snapshot
+            .http_errors
+            .iter()
+            .map(|error| (error.request_id.as_str(), error.is_top_level, error.epoch))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors,
+            [
+                ("finished-first", true, epoch),
+                ("request-late", true, epoch),
+                ("ordered", true, epoch),
+                ("response-only", true, epoch),
+            ]
+        );
+        assert_eq!(
+            snapshot.http_errors[0].url.as_deref(),
+            Some("https://jpdb.io/search?q=a")
+        );
+        assert!(snapshot.pending_requests.is_empty());
+        assert!(!snapshot.monitor_failed);
+    }
+
+    #[test]
+    fn late_response_after_epoch_change_stays_in_its_request_epoch() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let first = state.begin_epoch();
+        state.record_request(
+            "tracked".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=a".into(),
+            Some("main"),
+        );
+        state.record_finished("tracked");
+        state.record_finished("unseen-request");
+        let second = state.begin_epoch();
+        state.record_request(
+            "unseen-request".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=b".into(),
+            Some("main"),
+        );
+        for id in ["tracked", "unseen-request"] {
+            state.record_http_error(
+                id.into(),
+                ResourceType::Document,
+                format!("https://jpdb.io/search?q={id}"),
+                429,
+                None,
+            );
+        }
+        let current = state.snapshot(second);
+        assert!(current.http_errors.is_empty());
+        assert_eq!(current.stale_http_errors.len(), 2);
+        let previous = state.snapshot(first);
+        assert_eq!(previous.http_errors.len(), 2);
+        assert!(previous.http_errors.iter().all(|error| error.is_top_level));
+        assert!(current.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn late_subframe_document_response_is_not_promoted_to_main_frame() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let epoch = state.begin_epoch();
+        state.record_request(
+            "frame-ordered".into(),
+            ResourceType::Document,
+            "https://ads.example/a".into(),
+            Some("child"),
+        );
+        state.record_finished("frame-ordered");
+        state.record_http_error(
+            "frame-ordered".into(),
+            ResourceType::Document,
+            "https://ads.example/a".into(),
+            429,
+            Some("child"),
+        );
+        state.record_finished("frame-late");
+        state.record_request(
+            "frame-late".into(),
+            ResourceType::Document,
+            "https://ads.example/b".into(),
+            Some("child"),
+        );
+        state.record_http_error(
+            "frame-late".into(),
+            ResourceType::Document,
+            "https://ads.example/b".into(),
+            503,
+            None,
+        );
+        let snapshot = state.snapshot(epoch);
+        assert_eq!(snapshot.http_errors.len(), 2);
+        assert!(snapshot.http_errors.iter().all(|error| !error.is_top_level));
+        assert!(snapshot.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn repeated_cached_navigations_do_not_exhaust_request_tracking() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        // Больше навигаций, чем помещается в MAX_TRACKED_REQUESTS при прежней утечке.
+        for navigation in 0..MAX_TRACKED_REQUESTS {
+            let epoch = state.begin_epoch();
+            for resource in 0..8 {
+                let id = format!("{navigation}.{resource}");
+                state.record_finished(&id);
+                state.record_request(
+                    id,
+                    ResourceType::Font,
+                    format!("https://jpdb.io/static/{resource}.woff2"),
+                    Some("main"),
+                );
+            }
+            let snapshot = state.snapshot(epoch);
+            assert!(snapshot.pending_requests.is_empty());
+            assert!(snapshot.stale_pending_requests.is_empty());
+        }
+        assert!(!state.monitor_failed);
+        assert_eq!(state.completed_order.len(), MAX_COMPLETED_REQUESTS);
+        assert_eq!(state.completed_requests.len(), state.completed_order.len());
+        assert!(!state.completed_requests.contains_key("0.0"));
+        let newest = format!("{}.7", MAX_TRACKED_REQUESTS - 1);
+        assert!(state.completed_requests.contains_key(&newest));
+        assert_eq!(state.completed_order.back(), Some(&newest));
+    }
+
+    #[test]
+    fn outcome_handled_before_its_request_gets_url_and_main_frame_scope() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let epoch = state.begin_epoch();
+        state.record_network_failure(
+            "document".into(),
+            ResourceType::Document,
+            "net::ERR_CONNECTION_RESET".into(),
+        );
+        state.record_http_error(
+            "throttled".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=x".into(),
+            429,
+            None,
+        );
+        state.record_request(
+            "document".into(),
+            ResourceType::Document,
+            "https://jpdb.io/vocabulary/1/x".into(),
+            Some("main"),
+        );
+        state.record_request(
+            "throttled".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=x".into(),
+            Some("main"),
+        );
+        let snapshot = state.snapshot(epoch);
+        let failure = &snapshot.network_failures[0];
+        assert_eq!(
+            failure.url.as_deref(),
+            Some("https://jpdb.io/vocabulary/1/x")
+        );
+        assert!(failure.is_top_level);
+        assert!(snapshot.http_errors[0].is_top_level);
+        // Неудачный запрос завершён, а ответ с ошибкой ещё может получить loadingFinished.
+        assert_eq!(snapshot.pending_requests.len(), 1);
+        assert_eq!(snapshot.pending_requests[0].request_id, "throttled");
+
+        // Подкадр не становится главным кадром из-за позднего запроса.
+        state.record_network_failure(
+            "frame".into(),
+            ResourceType::Document,
+            "net::ERR_ABORTED".into(),
+        );
+        state.record_request(
+            "frame".into(),
+            ResourceType::Document,
+            "https://ads.example/frame".into(),
+            Some("child"),
+        );
+        assert!(!state.snapshot(epoch).network_failures[1].is_top_level);
+    }
+
+    #[test]
+    fn failure_handled_before_redirect_steps_gets_the_final_step_url() {
+        let mut state = RuntimeState {
+            main_frame_id: "main".into(),
+            ..RuntimeState::default()
+        };
+        let epoch = state.begin_epoch();
+        state.record_network_failure(
+            "document".into(),
+            ResourceType::Document,
+            "net::ERR_CERT_AUTHORITY_INVALID".into(),
+        );
+        for url in [
+            "http://yarxi.ru/",
+            "https://yarxi.ru/",
+            "https://www.yarxi.ru/",
+        ] {
+            state.record_request(
+                "document".into(),
+                ResourceType::Document,
+                url.into(),
+                Some("main"),
+            );
+        }
+        state.record_http_error(
+            "throttled".into(),
+            ResourceType::Document,
+            "https://jpdb.io/search?q=x".into(),
+            429,
+            None,
+        );
+        state.record_request(
+            "throttled".into(),
+            ResourceType::Document,
+            "https://jpdb.io/redirect-step".into(),
+            Some("main"),
+        );
+        let snapshot = state.snapshot(epoch);
+        assert_eq!(
+            snapshot.network_failures[0].url.as_deref(),
+            Some("https://www.yarxi.ru/")
+        );
+        assert_eq!(
+            snapshot.http_errors[0].url.as_deref(),
+            Some("https://jpdb.io/search?q=x")
+        );
+
+        let monitor = CdpRuntimeMonitor::from_snapshot_for_test(snapshot);
+        assert!(!monitor.clear_exact_network_failure(
+            "document",
+            "http://yarxi.ru/",
+            "net::ERR_CERT_AUTHORITY_INVALID",
+        ));
+        assert!(monitor.clear_exact_network_failure(
+            "document",
+            "https://www.yarxi.ru/",
+            "net::ERR_CERT_AUTHORITY_INVALID",
+        ));
+        assert!(monitor.snapshot(epoch).network_failures.is_empty());
+    }
+
+    #[test]
     fn bootstrap_javascript_is_counted_once_across_epochs() {
         let mut state = RuntimeState::default();
         state.record_javascript_exception();
@@ -2994,6 +3516,7 @@ mod tests {
                 ResourceType::Fetch,
                 "https://example.test/old-http".into(),
                 503,
+                None,
             );
             assert_eq!(state.snapshot(old_epoch).javascript_exceptions, 2);
             state.begin_epoch();
@@ -3023,7 +3546,7 @@ mod tests {
 
         // Завершение старого потока после создания нового монитора должно
         // пометить отказавшимся только прежнее состояние. Ждём задачу слушателя,
-        // поэтому проверка не зависит от scheduling или задержек по времени.
+        // поэтому проверка не зависит от планирования выполнения задач или задержек по времени.
         drop(old_requests);
         while !old.tasks[0].is_finished() {
             tokio::task::yield_now().await;
@@ -3103,6 +3626,7 @@ mod tests {
             ResourceType::Fetch,
             "https://example.test/old".into(),
             503,
+            None,
         );
         state.record_network_failure(
             "old".into(),
@@ -3124,6 +3648,7 @@ mod tests {
             ResourceType::Fetch,
             "https://example.test/current".into(),
             404,
+            None,
         );
         let snapshot = state.snapshot(epoch);
         assert!(snapshot.network_failures.is_empty());

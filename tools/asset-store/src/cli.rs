@@ -6,6 +6,9 @@ use std::str::FromStr;
 
 use crate::error::{AssetError, ErrorCode};
 use crate::hashing::sha256_hex;
+use crate::journal_cli::{
+    JournalCommand, JournalKind, JournalReport, parse_operation, report_text,
+};
 use crate::kanji_domain::parse_kanji_character;
 use crate::kanji_validator::KanjiImageValidator;
 use crate::model::{
@@ -21,6 +24,9 @@ use crate::validation::SemanticValidator;
 use crate::yarxi::{AcquiredMedia, SelectionResult, acquire_many};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+
+#[path = "review_ui.rs"]
+mod review_ui;
 
 #[path = "batch_cli.rs"]
 mod batch_cli;
@@ -102,6 +108,11 @@ pub enum Command {
     Validate {
         #[arg(long, value_enum)]
         mode: ModeArg,
+    },
+    /// Читает и проверяет локальный журнал операций этого хранилища.
+    Journal {
+        #[command(subcommand)]
+        command: JournalCommand,
     },
 }
 
@@ -218,6 +229,9 @@ struct Response {
     error: Option<ErrorSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     validator_available: Option<bool>,
+    /// Машиночитаемая часть ответа команд `journal`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    journal: Option<JournalReport>,
 }
 
 /// Обработанный ответ CLI и код завершения процесса.
@@ -270,7 +284,9 @@ pub fn execute(cli: Cli) -> CliOutput {
             .collect::<Result<Vec<_>, _>>()
             .map(|_| (None, None))
             .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message)),
-        Command::Batch { command } => batch_cli::prevalidate(command).map(|_| (None, None)),
+        Command::Batch { command } => batch_cli::prevalidate(command)
+            .and_then(|()| batch_cli::prevalidate_output(command, cli.output))
+            .map(|_| (None, None)),
         Command::Validate { .. } => Ok((None, None)),
         _ => Ok((None, None)),
     };
@@ -300,10 +316,17 @@ pub fn execute(cli: Cli) -> CliOutput {
         Command::List
             | Command::Plan { .. }
             | Command::Validate { .. }
+            | Command::Journal { .. }
             | Command::Batch {
                 command: BatchCommand::Run { .. }
                     | BatchCommand::Status { .. }
                     | BatchCommand::Review { .. }
+                    | BatchCommand::Revalidate { .. }
+                    | BatchCommand::ReviewExport { .. }
+                    | BatchCommand::Ocr { .. }
+                    | BatchCommand::ReviewConfirmMatches { .. }
+                    | BatchCommand::ReviewApply { .. }
+                    | BatchCommand::ReviewInteractive { .. }
                     | BatchCommand::Decide { .. }
                     | BatchCommand::Retry { .. }
             }
@@ -484,6 +507,7 @@ impl Command {
             Self::Plan { .. } => "plan",
             Self::Ensure { .. } => "ensure",
             Self::Validate { .. } => "validate",
+            Self::Journal { command } => command.operation_name(),
             Self::Batch { command } => command.operation(),
         }
     }
@@ -631,6 +655,7 @@ fn execute_with_store(
             ErrorCode::InvalidTransition,
             "команда batch должна выполняться через отдельный адаптер CLI",
         )),
+        Command::Journal { command } => execute_journal(store, store_summary, command),
         Command::Validate { mode } => {
             let selection_mode: SelectionMode = mode.into();
             let validator = KanjiImageValidator::new();
@@ -692,6 +717,101 @@ fn execute_with_store(
             response.blockers = blockers.clone();
             response.validator_available = Some(true);
             Ok((response, if blockers.is_empty() { 0 } else { 3 }))
+        }
+    }
+}
+
+/// Выполняет команду журнала поверх уже открытого хранилища.
+fn execute_journal(
+    store: &AssetStore,
+    store_summary: StoreSummary,
+    command: JournalCommand,
+) -> Result<(Response, u8), AssetError> {
+    let opened_change = store.did_mutate_on_open();
+    match command {
+        JournalCommand::List {
+            limit,
+            identity,
+            operation,
+        } => {
+            let operation = operation.as_deref().map(parse_operation).transpose()?;
+            let events = store.journal_events(limit, identity.as_deref(), operation)?;
+            let mut response = response(
+                "journal_list",
+                store_summary,
+                None,
+                Vec::new(),
+                opened_change,
+                "listed",
+            );
+            response.journal = Some(JournalReport {
+                kind: JournalKind::List,
+                events,
+                ..JournalReport::default()
+            });
+            Ok((response, 0))
+        }
+        JournalCommand::Check => {
+            let check = store.journal_check()?;
+            let problems = check.problems.clone();
+            let mut response = response(
+                "journal_check",
+                store_summary,
+                None,
+                Vec::new(),
+                opened_change,
+                if problems.is_empty() {
+                    "checked"
+                } else {
+                    "problems_found"
+                },
+            );
+            response.blockers = problems.clone();
+            response.journal = Some(JournalReport {
+                kind: JournalKind::Check,
+                check: Some(check),
+                ..JournalReport::default()
+            });
+            Ok((response, if problems.is_empty() { 0 } else { 3 }))
+        }
+        JournalCommand::Reconcile => {
+            let appended = store.reconcile_journal()?;
+            let changed = !appended.is_empty() || opened_change;
+            let mut response = response(
+                "journal_reconcile",
+                store_summary,
+                None,
+                Vec::new(),
+                changed,
+                if appended.is_empty() {
+                    "no_op"
+                } else {
+                    "reconciled"
+                },
+            );
+            response.journal = Some(JournalReport {
+                kind: JournalKind::Reconcile,
+                appended,
+                ..JournalReport::default()
+            });
+            Ok((response, 0))
+        }
+        JournalCommand::Baseline => {
+            let baseline = store.journal_baseline()?;
+            let mut response = response(
+                "journal_baseline",
+                store_summary,
+                None,
+                Vec::new(),
+                true,
+                "baseline_recorded",
+            );
+            response.journal = Some(JournalReport {
+                kind: JournalKind::Baseline,
+                baseline: Some(baseline),
+                ..JournalReport::default()
+            });
+            Ok((response, 0))
         }
     }
 }
@@ -986,6 +1106,7 @@ fn response(
         outcome: outcome.to_owned(),
         error: None,
         validator_available: None,
+        journal: None,
     }
 }
 
@@ -1029,6 +1150,7 @@ fn render_error(
             details: error.details.clone(),
         }),
         validator_available: None,
+        journal: None,
     };
     if is_conflict {
         response.conflicts.push(ConflictSummary {
@@ -1095,6 +1217,9 @@ fn render_response(response: Response, output: OutputFormat, exit_code: u8) -> C
                         .validation_status
                         .map_or("нет решения", |status| status.as_str())
                 ));
+            }
+            if let Some(journal) = &response.journal {
+                text.push_str(&report_text(journal));
             }
             for blocker in &response.blockers {
                 text.push_str(&format!("Препятствие: {blocker}\n"));

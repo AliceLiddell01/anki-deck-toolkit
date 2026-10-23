@@ -18,19 +18,23 @@ image = { version = "0.25.10", default-features = false, features = ["gif", "png
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.11"
-rustix = { version = "1.1", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "signal", "process", "io-util"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "fmt", "json"] }
 url = "2"
+reqwest = { version = "0.13.5", default-features = false }
 resvg = { version = "0.47.0", default-features = false, features = ["text"], optional = true }
 zip = { version = "9.0.0", default-features = false }
 
 [features]
 reference-generator = ["dep:resvg"]
 session-rotation-acceptance = []
+
+[dev-dependencies]
+gif = "=0.14.2"
 
 [lib]
 name = "asset_store"

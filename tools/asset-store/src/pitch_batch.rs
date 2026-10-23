@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +35,7 @@ use crate::pitch_accent::{
 use crate::validation::SemanticValidator;
 
 /// Версия формата предметного состояния пакета.
-pub const PITCH_BATCH_SCHEMA_VERSION: u32 = 2;
+pub const PITCH_BATCH_SCHEMA_VERSION: u32 = 3;
 /// Версия внешней схемы нормализованного плана pitch.
 pub const PITCH_PLAN_SCHEMA_VERSION: u32 = 1;
 /// Максимальный размер причины точечного действия.
@@ -280,7 +281,7 @@ pub struct PitchBatchItemToken {
     pub request_fingerprint: String,
 }
 
-/// Полный неизменяемый снимок владельца, полученный только после успешной проверки целостности store.
+/// Полный неизменяемый снимок владельца, полученный только после успешной проверки целостности хранилища.
 #[derive(Debug, Clone, Default)]
 pub struct PitchBatchOwnerSnapshot {
     records: BTreeMap<AssetIdentity, AssetRecord>,
@@ -706,7 +707,7 @@ impl PitchAccentBatch {
     }
 
     /// Сохраняет намерение публикации до побочного эффекта у владельца.
-    /// Не принимает `REJECTED`, `CORRUPT`, неполные или устаревшие свидетельства validator.
+    /// Не принимает `REJECTED`, `CORRUPT`, неполные или устаревшие свидетельства валидатора.
     pub fn begin_publication(
         &mut self,
         surface: &str,
@@ -1374,6 +1375,14 @@ impl PitchAccentBatchRuntime {
         self.runtime.batch_id()
     }
 
+    /// Каталог производного снимка проверки под блокировкой пакета.
+    pub(crate) fn artifact_directory(
+        &self,
+        name: &str,
+    ) -> Result<crate::batch_runtime::ArtifactDirectory, AssetError> {
+        self.runtime.artifact_directory(name)
+    }
+
     pub fn load(&mut self) -> Result<Option<PitchAccentBatch>, AssetError> {
         self.runtime.load()
     }
@@ -1580,6 +1589,35 @@ impl RuntimeBatchState for PitchAccentBatch {
 
     fn validate(&self) -> Result<(), AssetError> {
         PitchAccentBatch::validate(self)
+    }
+
+    /// Состояние прежней схемы хранит свидетельства прежнего валидатора; оно не
+    /// разбирается и не переносит доверие, а требует нового пакета. Отсутствующие
+    /// или нетиповые поля версии — повреждение, а не прежняя схема: они уходят в
+    /// типизированный разбор и дают `ManifestCorrupt`.
+    fn check_stored_compatibility(raw: &serde_json::Value) -> Result<(), AssetError> {
+        if let Some(version) = raw["schema_version"].as_u64()
+            && version != u64::from(PITCH_BATCH_SCHEMA_VERSION)
+        {
+            return Err(AssetError::new(
+                ErrorCode::UnsupportedSchemaVersion,
+                format!(
+                    "версия состояния пакета pitch-accent {version} не поддерживается (текущая {PITCH_BATCH_SCHEMA_VERSION}); создайте новый пакет"
+                ),
+            ));
+        }
+        let current = PitchAccentImageValidator::validator_identity();
+        if let (Some(id), Some(version)) = (
+            raw["validator"]["id"].as_str(),
+            raw["validator"]["version"].as_str(),
+        ) && (id != current.id || version != current.version)
+        {
+            return Err(AssetError::new(
+                ErrorCode::UnsupportedSchemaVersion,
+                "состояние пакета pitch-accent использует устаревший валидатор; автоматическое доверие не переносится, создайте новый пакет",
+            ));
+        }
+        Ok(())
     }
 
     fn referenced_blobs(&self) -> Vec<RuntimeBlobRef> {
@@ -1984,6 +2022,13 @@ fn validate_candidate_bytes(
             "контекст проверки кандидата pitch-accent не совпадает с метаданными или свидетельствами",
         ));
     }
+    let key = (
+        candidate.validation_context_sha256.clone(),
+        validator.clone(),
+    );
+    if verified_candidate_contexts().contains(&key) {
+        return Ok(());
+    }
     let identity = AssetIdentity::new("pitch_accent", candidate.metadata.surface.clone())
         .map_err(|message| AssetError::new(ErrorCode::InvalidIdentity, message))?;
     let fresh = validate_candidate(&identity, &candidate.metadata, bytes, validator)?;
@@ -1993,10 +2038,34 @@ fn validate_candidate_bytes(
             "результат PitchAccentImageValidator не совпадает с сохранёнными точными свидетельствами",
         ));
     }
+    verified_candidate_contexts().insert(key);
     Ok(())
 }
 
-fn with_validation_context(
+/// Контексты кандидатов, уже подтверждённые `PitchAccentImageValidator` в этом процессе.
+///
+/// Контекст фиксирует SHA-256 и длину байтов, метаданные и сохранённое решение
+/// валидатора, а байты, длина, сигнатура PNG и сам контекст сверяются при каждом
+/// вызове. Поэтому повторный прогон детерминированного валидатора на тех же входах
+/// ничего не доказывает, но при каждой загрузке пакета стоил O(числа кандидатов)
+/// декодирований PNG. Новый процесс, в том числе `resume`, проверяет кандидатов заново.
+fn verified_candidate_contexts() -> MutexGuard<'static, BTreeSet<(String, ValidatorIdentity)>> {
+    static CONTEXTS: Mutex<BTreeSet<(String, ValidatorIdentity)>> = Mutex::new(BTreeSet::new());
+    CONTEXTS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+pub(crate) fn candidate_context_is_verified(
+    candidate: &PitchBatchCandidate,
+    validator: &ValidatorIdentity,
+) -> bool {
+    verified_candidate_contexts().contains(&(
+        candidate.validation_context_sha256.clone(),
+        validator.clone(),
+    ))
+}
+
+pub(crate) fn with_validation_context(
     mut candidate: PitchBatchCandidate,
 ) -> Result<PitchBatchCandidate, AssetError> {
     candidate.validation_context_sha256 = candidate_context(&candidate)?;

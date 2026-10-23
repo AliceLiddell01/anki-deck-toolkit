@@ -80,7 +80,7 @@ fn identity() -> AssetIdentity {
     AssetIdentity::new("pitch_accent", "幽霊").expect("тестовый идентификатор корректен")
 }
 
-fn v4_approved_store(root: &Path) -> (AssetStore, AssetIdentity, Vec<u8>) {
+fn previous_version_approved_store(root: &Path) -> (AssetStore, AssetIdentity, Vec<u8>) {
     let store = AssetStore::open_with_policy(StoreOptions::new(root), PitchAccentDomainPolicy)
         .expect("хранилище pitch-accent открывается");
     let identity = identity();
@@ -98,11 +98,11 @@ fn v4_approved_store(root: &Path) -> (AssetStore, AssetIdentity, Vec<u8>) {
                 replace_expected_sha256: None,
             },
             &FixtureValidator {
-                version: "4",
+                version: "5",
                 status: SemanticStatus::Verified,
             },
         )
-        .expect("тестовый ресурс с проверкой v4 публикуется")
+        .expect("тестовый ресурс с проверкой прежней версии v5 публикуется")
         .asset
         .expect("проверенный тестовый ресурс существует");
     store
@@ -116,15 +116,15 @@ fn v4_approved_store(root: &Path) -> (AssetStore, AssetIdentity, Vec<u8>) {
     (store, identity, bytes)
 }
 
-fn expected_v5() -> ValidatorIdentity {
+fn expected_current() -> ValidatorIdentity {
     PitchAccentImageValidator::validator_identity()
 }
 
 #[test]
-fn pitch_corpus_gate_rejects_v4_evidence_even_with_current_sha_human_approval() {
-    let temp = TempDir::new("gate-v4-approved");
+fn pitch_corpus_gate_rejects_previous_validator_evidence_even_with_current_sha_human_approval() {
+    let temp = TempDir::new("gate-previous-approved");
     let root = temp.path().join(".asset-store/pitch-accent");
-    let (_store, _identity, _bytes) = v4_approved_store(&root);
+    let (_store, _identity, _bytes) = previous_version_approved_store(&root);
 
     let output = Command::new(env!("CARGO_BIN_EXE_pitch-corpus-gate"))
         .current_dir(temp.path())
@@ -148,10 +148,10 @@ fn pitch_corpus_gate_rejects_v4_evidence_even_with_current_sha_human_approval() 
 
 #[test]
 fn pitch_read_and_same_sha_ingest_require_current_automated_validation() {
-    let temp = TempDir::new("read-ingest-v4-approved");
+    let temp = TempDir::new("read-ingest-previous-approved");
     let root = temp.path().join("pitch-accent");
-    let (store, identity, bytes) = v4_approved_store(&root);
-    let expected = expected_v5();
+    let (store, identity, bytes) = previous_version_approved_store(&root);
+    let expected = expected_current();
 
     let read_error = AssetStore::read_verified_with_policy(
         &root,
@@ -159,7 +159,7 @@ fn pitch_read_and_same_sha_ingest_require_current_automated_validation() {
         &expected,
         &PitchAccentDomainPolicy,
     )
-    .expect_err("чтение отвергает одобрение поверх проверки v4");
+    .expect_err("чтение отвергает одобрение поверх проверки прежней версии v5");
     assert_eq!(
         read_error.code,
         asset_store::ErrorCode::InvalidValidationEvidence
@@ -182,7 +182,7 @@ fn pitch_read_and_same_sha_ingest_require_current_automated_validation() {
                 replace_expected_sha256: None,
             },
             &FixtureValidator {
-                version: "5",
+                version: PitchAccentImageValidator::VALIDATOR_VERSION,
                 status: SemanticStatus::Verified,
             },
         )
@@ -203,7 +203,7 @@ fn pitch_read_and_same_sha_ingest_require_current_automated_validation() {
             &PitchAccentDomainPolicy,
         )
         .is_ok(),
-        "чтение принимает валидатор v5 после перепроверки"
+        "чтение принимает текущий валидатор v6 после перепроверки"
     );
 }
 
@@ -216,7 +216,7 @@ fn same_sha_metadata_refresh_requires_exact_cas_and_commits_current_metadata() {
     let identity = identity();
     let bytes = pitch_png();
     let validator = FixtureValidator {
-        version: "5",
+        version: PitchAccentImageValidator::VALIDATOR_VERSION,
         status: SemanticStatus::Verified,
     };
     let first = store
@@ -325,7 +325,7 @@ fn pitch_corpus_gate_rejects_human_approval_of_current_non_verified_decision() {
         .validate(
             SelectionMode::Full,
             &FixtureValidator {
-                version: "5",
+                version: PitchAccentImageValidator::VALIDATOR_VERSION,
                 status: SemanticStatus::Rejected,
             },
         )

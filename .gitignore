@@ -5,40 +5,27 @@
 # репозитория, поэтому build output принадлежит корневому `target/`.
 /target
 
-# В Git попадает только verified-only canonical corpus поддерживаемых domains.
-# Candidate и quarantine manifests/bytes лежат в локальном runtime overlay.
-/.asset-store/*
-!/.asset-store/kanji/
-!/.asset-store/pitch-accent/
-/.asset-store/kanji/*
-!/.asset-store/kanji/.owner.json
-!/.asset-store/kanji/manifest.json
-!/.asset-store/kanji/assets/
-/.asset-store/kanji/assets/*
-!/.asset-store/kanji/assets/gif/
-!/.asset-store/kanji/assets/png/
-/.asset-store/kanji/assets/gif/*
-!/.asset-store/kanji/assets/gif/*.gif
-# Gitignore сопоставляет пути: каталоги с разрешённым суффиксом тоже запрещены.
-/.asset-store/kanji/assets/gif/*.gif/
-/.asset-store/kanji/assets/png/*
-!/.asset-store/kanji/assets/png/*.png
-/.asset-store/kanji/assets/png/*.png/
-/.asset-store/kanji/.runtime/
-/.asset-store/kanji/.lock
-/.asset-store/kanji/.tmp/
-/.asset-store/pitch-accent/*
-!/.asset-store/pitch-accent/.owner.json
-!/.asset-store/pitch-accent/manifest.json
-!/.asset-store/pitch-accent/assets/
-/.asset-store/pitch-accent/assets/*
-!/.asset-store/pitch-accent/assets/png/
-/.asset-store/pitch-accent/assets/png/*
-!/.asset-store/pitch-accent/assets/png/*.png
-/.asset-store/pitch-accent/assets/png/*.png/
-/.asset-store/pitch-accent/.runtime/
-/.asset-store/pitch-accent/.lock
-/.asset-store/pitch-accent/.tmp/
+# Кеш байт-кода Python от проверок `.github/scripts/`: локальный артефакт запуска,
+# а не часть репозитория.
+__pycache__/
+*.pyc
+
+# Пользовательские данные репозитория не публикуются через Git — ни целиком, ни
+# частично. Исключений для VERIFIED-корпусов нет: owner-маркер, манифест и байты
+# ресурсов существуют только в рабочей копии пользователя, поэтому отсутствие
+# корпуса в чистом clone — нормальное состояние, а не повод что-то публиковать.
+#
+#   `decks/`        — пользовательские данные целиком: `decks/input/` — закрытая
+#                     область будущего доверенного загрузчика, которую агент не
+#                     читает, не просматривает и не изменяет; `decks/output/` —
+#                     плоский список рабочих локальных колод, с которыми
+#                     работают команды `anki-repo`. Отслеживаемым внутри
+#                     `decks/` не может быть ни один путь, а не только эти две
+#                     области: прежняя раскладка с каталогами группировки —
+#                     состояние прошлых ревизий, а не контракт;
+#   `.asset-store/` — локальное доверенное хранилище ресурсов.
+/decks/
+/.asset-store/
 
 # Каталог статического отчёта `anki-repo visual-report`: это результат единичного
 # прогона (сотни файлов превью и копий media), а не данные репозитория. Каталог
@@ -52,4 +39,3 @@
 # текущего PR (`/.codex/local/pr/<task>/body.md`). Это не публикуемый контракт
 # репозитория и не tracked: процедуру владеет `.agents/skills/anki-git-workflow/`.
 /.codex/local/
-

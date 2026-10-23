@@ -47,6 +47,7 @@ jobs:
         run: |
           python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
           python3 .github/scripts/check_skill_contracts.py
+          python3 .github/scripts/check_documentation_i18n.py
 
       - name: Установить Rust из rust-toolchain.toml
         run: |
@@ -59,7 +60,7 @@ jobs:
         run: python3 .github/scripts/check_rust_toolchain.py
 
       - name: Восстановить кэш Rust
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Проверить форматирование
         run: cargo fmt --all --check
@@ -101,69 +102,35 @@ jobs:
           version: v0.18.0
 
       - name: Восстановить кэш Rust
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Всё задание использует один специализированный профиль (тесты и `cargo run`),
           # поэтому используем отдельное поколение кэша зависимостей.
           key: unified-ci-v1
 
       - name: Собрать и выполнить тесты
-        # В рабочей области нет тестов, ограниченных возможностями Cargo. Единственная возможность
-        # `reference-generator` включает resvg только для двух служебных
-        # исполняемых файлов генератора; сборку всех целей и возможностей уже проверяют
-        # задания Clippy и MSRV параллельно.
+        # Шаг собирает тесты без дополнительных возможностей Cargo. `reference-generator`
+        # включает resvg только для двух служебных исполняемых файлов генератора; тесты
+        # их общего модуля публикации входят в интеграционную цель asset-store и
+        # исполняются здесь. Тесты возможности `session-rotation-acceptance` этот шаг
+        # не исполняет. Сборку всех целей и возможностей проверяют задания Clippy и MSRV.
         run: cargo test --workspace --locked --profile ci
 
-      - name: Проверить подтверждённые записи корпуса кандзи
-        # Ветка без отслеживаемого корпуса допустима. Если хранилище присутствует
-        # (в том числе как символическая ссылка), проверка только для чтения
-        # обязана подтвердить, что все записи корпуса проверены.
-        run: |
-          if [ -e .asset-store/kanji ] || [ -L .asset-store/kanji ]; then
-            cargo run --quiet --locked --profile ci --bin kanji-corpus-gate
-          else
-            echo "Канонический корпус кандзи отсутствует; проверка пропущена"
-          fi
-
-      - name: Проверить корпус pitch-accent на записи только со статусом VERIFIED
-        # Отсутствующий каталог допустим. Если хранилище присутствует (в том числе
-        # как символическая ссылка), проверка только для чтения подтверждает, что
-        # все записи корпуса прошли обязательную автоматическую проверку.
-        run: |
-          if [ -e .asset-store/pitch-accent ] || [ -L .asset-store/pitch-accent ]; then
-            cargo run --quiet --locked --profile ci --bin pitch-corpus-gate
-          else
-            echo "Канонический корпус pitch-accent отсутствует; проверка пропущена"
-          fi
-
-      - name: Проверить найденные CrowdAnki-экспорты
-        # Шаг сам находит экспорты внутри `decks/` и ничего не знает о конкретных
-        # колодах, уровнях, моделях заметок и именах полей. Отсутствие экспортов —
-        # не ошибка, поэтому состав данных может меняться без правки CI. Но каждый
-        # фактически найденный экспорт обязан проходить `validate`: структурно
-        # невалидное содержимое коммита делает шаг красным.
-        run: |
-          set -euo pipefail
-          status=0
-          found=0
-          # Отсутствие `decks/` — допустимое состояние, а не ошибка шага.
-          if [ -d decks ]; then
-            # Список собирается в файл: ошибка обхода не должна теряться внутри
-            # process substitution, иначе часть экспортов молча выпадет из
-            # проверки, а шаг останется зелёным. Поэтому обход идёт отдельной
-            # командой под `set -e`, а его диагностика не подавляется.
-            deck_list=$(mktemp)
-            trap 'rm -f "$deck_list"' EXIT
-            find decks -name deck.json -print0 > "$deck_list"
-            while IFS= read -r -d '' deck_json; do
-              found=$((found + 1))
-              export_dir=$(dirname "$deck_json")
-              echo "Проверяю экспорт: $export_dir"
-              cargo run --quiet --locked --profile ci --bin anki-repo -- validate "$export_dir" || status=1
-            done < "$deck_list"
-          fi
-          echo "Найдено экспортов: $found"
-          exit "$status"
+      - name: Проверить, что пользовательские данные не отслеживаются Git
+        # Постоянная граница: колоды и локальное доверенное хранилище ресурсов
+        # живут только в игнорируемых областях `decks/` (целиком) и
+        # `.asset-store/`. Одного `.gitignore` мало — он не отменяет уже
+        # добавленный индекс и обходится `git add -f`, поэтому проверка идёт по
+        # фактическому индексу и дополнительно подтверждает, что правила
+        # игнорирования на месте и не ослаблены повторным включением.
+        #
+        # Проверок содержимого пользовательских областей здесь нет намеренно: в
+        # чистом clone этих областей не существует, и шаг, который «проверил» бы
+        # их отсутствие, выдал бы пустоту за проверку личных колод. Локальные
+        # проверки своего хранилища (`kanji-corpus-gate`, `pitch-corpus-gate`) и
+        # своих экспортов (`anki-repo validate`) описаны в
+        # `tools/asset-store/README.md` и `tools/anki-repo/README.md`.
+        run: python3 .github/scripts/check_local_data_untracked.py
 
       - name: Показать статистику sccache
         if: always()
@@ -191,7 +158,7 @@ jobs:
         run: python3 .github/scripts/check_rust_toolchain.py
 
       - name: Восстановить кэш Rust для MSRV
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: msrv
 

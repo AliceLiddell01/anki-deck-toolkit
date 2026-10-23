@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
-    AtFlags, FlockOperation, Mode, OFlags, flock, mkdirat, open, openat, renameat, unlinkat,
+    AtFlags, FlockOperation, Mode, OFlags, RenameFlags, flock, mkdirat, open, openat, renameat,
+    renameat_with, unlinkat,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,12 @@ pub trait RuntimeBatchState: Serialize + DeserializeOwned {
     fn revision(&self) -> u64;
     fn validate(&self) -> Result<(), AssetError>;
     fn referenced_blobs(&self) -> Vec<RuntimeBlobRef>;
+
+    /// Отклоняет сохранённое состояние несовместимой версии до типизированного
+    /// разбора, чтобы старая схема получила явный отказ, а не сообщение о повреждении.
+    fn check_stored_compatibility(_raw: &serde_json::Value) -> Result<(), AssetError> {
+        Ok(())
+    }
 
     /// Доменные состояния могут сохранить более строгий лимит, чем общий runtime.
     fn maximum_blob_bytes(&self) -> u64 {
@@ -92,7 +99,38 @@ pub struct SafeBatchRuntime {
     verified_blob_keys: BTreeSet<(String, String, u64, Option<String>)>,
 }
 
+/// Изолированный каталог производных артефактов. Все имена — одиночные
+/// компоненты, чтение ограничено и не следует символическим ссылкам.
+pub(crate) struct ArtifactDirectory {
+    directory: File,
+    pub path: PathBuf,
+}
+
+impl ArtifactDirectory {
+    pub fn write(&self, name: &str, bytes: &[u8]) -> Result<(), AssetError> {
+        atomic_write(&self.directory, name, bytes, MAX_RUNTIME_STATE_BYTES)
+    }
+
+    /// Атомарно создаёт артефакт, только если имя ещё свободно.
+    pub fn write_if_absent(&self, name: &str, bytes: &[u8]) -> Result<bool, AssetError> {
+        atomic_write_if_absent(&self.directory, name, bytes, MAX_RUNTIME_STATE_BYTES)
+    }
+
+    pub fn read(&self, name: &str) -> Result<Vec<u8>, AssetError> {
+        validate_leaf_name(name)?;
+        read_file(&self.directory, name, MAX_RUNTIME_STATE_BYTES)
+    }
+}
+
 impl SafeBatchRuntime {
+    pub(crate) fn artifact_directory(&self, name: &str) -> Result<ArtifactDirectory, AssetError> {
+        self.require_lock()?;
+        validate_leaf_name(name)?;
+        Ok(ArtifactDirectory {
+            directory: ensure_directory(&self.directory, name)?,
+            path: self.directory_path.join(name),
+        })
+    }
     /// Корень должен принадлежать вызывающему владельцу хранилища.
     pub fn open(store_root: &Path, batch_id: &str) -> Result<Self, AssetError> {
         validate_batch_id(batch_id)?;
@@ -315,6 +353,15 @@ impl SafeBatchRuntime {
             }
             Err(error) => return Err(error),
         };
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            AssetError::new(
+                ErrorCode::ManifestCorrupt,
+                format!("JSON runtime-пакета повреждён: {error}"),
+            )
+        })?;
+        S::check_stored_compatibility(&raw)?;
+        // Типизированный разбор идёт по исходным байтам: `Value` молча схлопывает
+        // повторные ключи, а разбор структуры их отвергает.
         let state: S = serde_json::from_slice(&bytes).map_err(|error| {
             AssetError::new(
                 ErrorCode::ManifestCorrupt,
@@ -593,8 +640,8 @@ fn validate_leaf_name(name: &str) -> Result<(), AssetError> {
         || name == ".."
         || name.starts_with(".tmp-")
         || name
-            .bytes()
-            .any(|byte| !byte.is_ascii_alphanumeric() && !b"._-".contains(&byte))
+            .chars()
+            .any(|character| !character.is_alphanumeric() && !"._-".contains(character))
     {
         return Err(path_error());
     }
@@ -712,6 +759,60 @@ fn atomic_write(parent: &File, name: &str, bytes: &[u8], maximum: u64) -> Result
         Ok(())
     })();
     if result.is_err() {
+        let _ = unlinkat(parent, temporary.as_str(), AtFlags::empty());
+    }
+    result
+}
+
+fn atomic_write_if_absent(
+    parent: &File,
+    name: &str,
+    bytes: &[u8],
+    maximum: u64,
+) -> Result<bool, AssetError> {
+    validate_leaf_name(name)?;
+    if bytes.len() as u64 > maximum {
+        return Err(AssetError::new(
+            ErrorCode::BoundaryViolation,
+            "запись runtime превышает ограничение размера",
+        ));
+    }
+    let temporary = format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let descriptor = openat(
+        parent,
+        temporary.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(boundary_io)?;
+    let result = (|| {
+        let mut file = File::from(descriptor);
+        file.write_all(bytes)
+            .map_err(|error| AssetError::io("запись runtime-файла", error))?;
+        file.sync_all()
+            .map_err(|error| AssetError::io("синхронизация runtime-файла", error))?;
+        match renameat_with(
+            parent,
+            temporary.as_str(),
+            parent,
+            name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {
+                parent
+                    .sync_all()
+                    .map_err(|error| AssetError::io("синхронизация каталога runtime", error))?;
+                Ok(true)
+            }
+            Err(error) if error == rustix::io::Errno::EXIST => Ok(false),
+            Err(error) => Err(boundary_io(error)),
+        }
+    })();
+    if matches!(&result, Ok(false) | Err(_)) {
         let _ = unlinkat(parent, temporary.as_str(), AtFlags::empty());
     }
     result
