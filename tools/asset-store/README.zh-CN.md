@@ -471,7 +471,7 @@ ZIP 必需项：`summary.md`、`manifest.sha256`、`raw-evidence/events.jsonl`�
 
 ## 语义验证器与校准测试
 
-`KanjiImageValidator` 分析 PNG/GIF 的**真实像素**，不根据文件名、URL、DOM 文本或来源说明进行判断。PNG 完整解码。`GifDecoder::into_frames()` 按 GIF 帧替换规则合成帧；逐帧检查后选择前景图形面积最大的帧。
+`KanjiImageValidator` 分析 PNG/GIF 的**真实像素**，不根据文件名、URL、DOM 文本或来源说明进行判断。PNG 完整解码。`GifDecoder::into_frames()` 按 GIF 帧替换规则合成帧；逐帧检查后选择前景图形面积最大的帧。没有前景的帧（例如笔顺动画中的空白帧）会被跳过，而不会导致整个 GIF 被拒绝；所有帧都没有前景时，GIF 被拒绝。
 
 汉字验证器和领域批处理适配器限制图片最大 **8 MiB**。公共批处理运行时为状态和内容文件规定 **64 MiB** 上限，领域适配器可以进一步降低。人工批准时采用当前领域策略限制，未定义则为 8 MiB。读取最多允许上限再加一个字节，用于在不无限分配内存的情况下检测超限，之后仍必须检查完整性并完整解码。
 
@@ -512,6 +512,7 @@ cargo test -p asset-store offline_threshold_calibration -- --nocapture
 - Noto Serif JP 风格、带边框的 Yarxi 深色方块，以及对错误 Unicode 身份的拒绝。
 - 指定比例的深色方块和近似但错误字符的拒绝。
 - Yarxi GIF 的“完整帧 → 逐步描绘 → 完整帧”，检查最终完整的语义遮罩，而非选择了第几帧。
+- 含空白首帧或中间帧的 GIF 在验证和 OCR 准备中都选择完整帧，仅由空白帧组成的 GIF 被拒绝。
 - 视觉相近但错误的 Unicode 字符。
 - 笔画变粗和裁剪帧。
 - 损坏签名/帧流、空图与缺失参考。
@@ -784,7 +785,7 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
 
 默认提示词为 `config/prompts/kanji_ocr.txt`；与答复格式指令组合后逐字再现 Structure 研究的 `structure-v1` 指令，其 SHA-256 有测试固定。模型**仅接收**提示词和 PNG，绝不发送期望 Unicode、路径、原文件名或文章上下文。答复是只有一个字符串字段 `observed` 的 JSON；仅接受**一个**受支持 Han/CJK 字符或 `?`，不对 Unicode 字形变体规范化。多余字段、解释文字、多字符 `observed`、不完整答复以及因 token 上限截断都记为建议拒绝。
 
-准备输入时使用已保存的原始字节与 SHA。受限的汉字验证器解码器（自 v6 起未变，因此转换版本为 `v6-representative-…`）选择完整的代表性 GIF 帧，再通过第二次有界解码获取该合成帧；PNG 必须完全解码。透明内容合成到白色背景，Rust `image` 使用 Lanczos3 **放大两倍**并编码单张 PNG。这是独立 Rust Lanczos3 实现，**不保证**与历史 PowerShell/System.Drawing 像素一致。源文件最大 **8 MiB**，单边最长 **2048** 像素，GIF 最多 **512 帧**，解码上限 **32 MiB**；输出最大 **4096×4096** 和 **8 MiB**。
+准备输入时使用已保存的原始字节与 SHA。受限的 v7 汉字验证器解码器选择完整的代表性 GIF 帧，并跳过没有前景的帧（因此转换版本为 `v7-representative-…`：v6 会整体拒绝此类 GIF，先前缓存的准备失败不适用于新键），再通过第二次有界解码获取该合成帧；PNG 必须完全解码。透明内容合成到白色背景，Rust `image` 使用 Lanczos3 **放大两倍**并编码单张 PNG。这是独立 Rust Lanczos3 实现，**不保证**与历史 PowerShell/System.Drawing 像素一致。源文件最大 **8 MiB**，单边最长 **2048** 像素，GIF 最多 **512 帧**，解码上限 **32 MiB**；输出最大 **4096×4096** 和 **8 MiB**。
 
 建议只存于 `.runtime/batches/<id>/ocr/suggestions.json`。缓存键和来源记录包括身份、原始 SHA、任务、答复契约、转换版本、组合后提示词的 SHA 及其来源、后端及其模式和版本、模型配置档与名称、权重文件 SHA-256（Ollama 为 digest）、projector SHA-256、加载与生成参数。其中任何一项变化都会产生新键：旧记录绝不会被当作另一模型或提示词的结果。大型 GGUF 的 SHA-256 按路径、大小和修改时间缓存在状态目录中。检查缓存需要已准备好的后端：托管服务器会被启动，之后命中缓存时进行 **0 次**模型请求。每次请求前后都重新读取模型身份：扫描过程中模型变化时存为 `model_changed_during_scan` 拒绝。后端准备失败会为每个候选以权重 `unavailable` 保存；稍后成功启动则产生不同的键。命中缓存要求模型身份可验证（见 `mode = "external"`）。同配置下重试拒绝需要 `--rescan`。模型工作期间释放运行时锁；返回后检查当前 SHA、世代和候选，丢弃过期结果。
 

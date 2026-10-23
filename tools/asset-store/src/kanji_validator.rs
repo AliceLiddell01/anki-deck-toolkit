@@ -377,7 +377,11 @@ fn decode_gif(bytes: &[u8]) -> Result<RasterEvidence, String> {
             return Err(format!("число кадров GIF превышает {MAX_GIF_FRAMES}"));
         }
         let buffer = frame.into_buffer();
-        let normalized = rgba_to_mask(&buffer)?;
+        // Анимация порядка черт может содержать пустые кадры; выбирается самый
+        // содержательный из остальных.
+        let Some(normalized) = foreground_mask(&buffer)? else {
+            continue;
+        };
         let foreground_pixels = normalized.foreground_pixels;
         if best
             .as_ref()
@@ -386,8 +390,11 @@ fn decode_gif(bytes: &[u8]) -> Result<RasterEvidence, String> {
             best = Some((count - 1, normalized));
         }
     }
-    let Some((representative_frame, normalized)) = best else {
+    if count == 0 {
         return Err("GIF не содержит декодируемых кадров".into());
+    }
+    let Some((representative_frame, normalized)) = best else {
+        return Err("ни в одном кадре GIF нет переднего плана".into());
     };
     let foreground_pixels = normalized.foreground_pixels;
     if foreground_pixels < 24 {
@@ -412,6 +419,12 @@ fn image_to_mask(image: &DynamicImage) -> Result<NormalizedMask, String> {
 }
 
 fn rgba_to_mask(image: &image::RgbaImage) -> Result<NormalizedMask, String> {
+    foreground_mask(image)?
+        .ok_or_else(|| "после нормализации в изображении нет переднего плана".to_owned())
+}
+
+/// `None` — в изображении нет переднего плана; ошибка — недопустимые размеры.
+fn foreground_mask(image: &image::RgbaImage) -> Result<Option<NormalizedMask>, String> {
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
         return Err(format!("недопустимые размеры {width}×{height}"));
@@ -437,19 +450,20 @@ fn rgba_to_mask(image: &image::RgbaImage) -> Result<NormalizedMask, String> {
     for pixel in &mut foreground {
         *pixel = u8::from(*pixel == 3);
     }
-    let mask = normalize_binary_mask(&foreground, width as usize, height as usize)
-        .ok_or_else(|| "после нормализации в изображении нет переднего плана".to_owned())?;
+    let Some(mask) = normalize_binary_mask(&foreground, width as usize, height as usize) else {
+        return Ok(None);
+    };
     let foreground_pixels = count_ink(&mask);
     if foreground_pixels == 0 {
-        return Err("после нормализации изображение пусто".into());
+        return Ok(None);
     }
-    Ok(NormalizedMask {
+    Ok(Some(NormalizedMask {
         mask,
         foreground_pixels,
         background_luma,
         foreground_polarity,
         excluded_border_components,
-    })
+    }))
 }
 
 fn composited_luma(pixel: [u8; 4]) -> f32 {
@@ -1189,6 +1203,42 @@ mod tests {
             semantic_status_for(&animation.mask, '魔'),
             SemanticStatus::Verified
         );
+    }
+
+    #[test]
+    fn gif_with_empty_frames_uses_most_informative_frame() {
+        let full = reference('佐');
+        let empty = [0; MASK_BYTES];
+        for frames in [
+            vec![
+                empty,
+                progressive_top_rows_with_full_bounds(&full, 24),
+                full,
+            ],
+            vec![
+                full,
+                empty,
+                progressive_top_rows_with_full_bounds(&full, 24),
+            ],
+        ] {
+            let representative = frames.iter().position(|frame| *frame == full);
+            let gif = gif_for(frames.clone());
+            let animation = decode_media(&gif).expect("пустой кадр не отвергает весь GIF");
+            assert_eq!(animation.frame_count, frames.len());
+            assert_eq!(Some(animation.representative_frame), representative);
+            assert_eq!(
+                semantic_status_for(&animation.mask, '佐'),
+                SemanticStatus::Verified
+            );
+
+            let prepared = prepare_ocr_image(&gif).expect("GIF подготавливается для OCR");
+            assert_eq!(Some(prepared.frame), representative);
+        }
+
+        let blank = gif_for(vec![empty, empty]);
+        let error = decode_media(&blank).expect_err("GIF без переднего плана отвергается");
+        assert!(error.contains("ни в одном кадре"), "{error}");
+        assert!(prepare_ocr_image(&blank).is_err());
     }
 
     #[test]
