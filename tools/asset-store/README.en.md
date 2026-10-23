@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 641e14e227085d49c7e675fa595c42d1d920b5aa -->
+<!-- i18n-source-git-blob: 9203dbe7747e8dcaf294a73dc2c45e5b971057de -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -477,13 +477,15 @@ Kanji validator and batch adapter limit images to **8 MiB**. Shared batch runtim
 
 The main reference catalog is based on KanjiVG release `r20250816`, commit `bd13ffbcc9d85cb86ae98bbbf001d9069220b901`. Unicode-codepoint SVGs are normalized into 64×64 binary masks; **6,430** characters are embedded in compressed `src/data/kanjivg-r20250816.maskdb.zlib`, SHA-256 `5581e65d5a681cdf8e441be04c1cea5f6ec61342ce8830ed083ba417d83a88ff`. KanjiVG uses CC BY-SA 3.0; attribution, release version and source-archive SHA-256 are in `src/data/kanjivg-ATTRIBUTION.txt`.
 
-Dark tiles also use Noto Serif JP—the font Yarxi actually uses in `.font-sample`. The pinned TTF has SHA-256 `e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8`; it generates **6,428** normalized masks in `src/data/yarxi-noto-serif-jp-r1.maskdb.zlib`, SHA-256 `ea6231b13f23ed16705839b8c3e911f89fea67b91b6b315f3f562f75c7b0531c`. The source TTF is **not** committed. Provenance and source license are in `src/data/yarxi-noto-serif-jp-ATTRIBUTION.txt`.
+Dark tiles also use an additional pixel reference from the publicly released Noto Serif JP Regular 1.001 font: `ofl/notoserifjp/NotoSerifJP-Regular.otf` from the `google/fonts` repository at pinned commit `beff1d8226e598dfaf06f9f8312c01021f70e9d2`, SHA-256 `a12875dcde3979f7901cd52c6f750f763e5ad2824cf3c27019a61dd5de5a8d9d`, licensed under the SIL Open Font License 1.1. It is an independent source, not the font file formerly served by the Yarxi site: that TTF is unavailable, and neither the site nor its data is an input to generation anymore. The font yields **6,428** normalized masks in `src/data/noto-serif-jp-1.001-regular.maskdb.zlib`, SHA-256 `cce25df61382ccb8e14d1eca181609916aac483b4949fcbf637f4fb5ac353608`; the font itself is **not** committed. Source, license and the regeneration command are in `src/data/noto-serif-jp-ATTRIBUTION.txt`.
 
-Reference generators use `resvg` only behind the `reference-generator` feature; the runtime validator reads the embedded catalogs and does not depend on the `resvg` version. The KanjiVG catalog reproduces byte-for-byte on both `resvg 0.47.0` and `0.48.1`. The Noto Serif JP catalog reproduces only on `resvg 0.47.0`: since `0.48.0` fonts are handled by `skrifa`/`harfrust`, and the same pinned TTF yields a different catalog. Moving the generator to `resvg 0.48+` is therefore a semantic validator migration, not a dependency bump: a new catalog is acceptable only after regeneration from the same TTF with a SHA-256 check, a comparison of every mask, threshold recalibration and a new validator version. Without the source TTF the migration is not performed, and Renovate keeps `resvg` below `0.48.0`. The `embedded_reference_catalogs_match_registered_identity_and_attribution` test binds the SHA-256 of both embedded catalogs to the validator version and the attribution files, so replacing a catalog without a matching validator identity change fails the check.
+The `build-noto-font-reference` generator checks the font SHA-256 and uses only those characters of the pinned KanjiVG catalog that are present in the font's cmap. For a character outside the cmap `resvg` draws the `.notdef` glyph, and one and the same box would become the reference of several unrelated Unicode characters; U+55BB and U+27491 are therefore skipped. The `noto_catalog_has_no_notdef_templates` test allows identical masks only for canonically equivalent characters (CJK compatibility ideographs and their unified forms).
+
+Reference generators use `resvg` and `skrifa` only behind the `reference-generator` feature; the runtime validator reads the embedded catalogs and does not depend on the `resvg` version. Both catalogs reproduce byte-for-byte on `resvg 0.48.1` and match the `resvg 0.47.0` output for the same inputs. The new Noto catalog differs from the previous catalog based on the Yarxi TTF in 6,257 of 6,428 masks (median 7 of 4,096 pixels) and was therefore accepted only under a new validator version. The `embedded_reference_catalogs_match_registered_identity_and_attribution` test binds the SHA-256 of both embedded catalogs and of the source font to the validator version and the attribution files, so replacing a catalog without a matching validator identity change fails the check.
 
 Validation estimates the background from image corners, determines contrast polarity, removes frame-connected components at the edge, and extracts the foreground glyph mask. Reference generators and runtime use the same `kanji_mask::normalize_binary_mask`: crop to nonempty foreground, fit inside 56×56, center in 64×64. Each destination pixel chooses the closest-to-center source-cell pixel using `(2*i+1)*source_size/(2*output_size)`. Thus KanjiVG, Noto and candidates share one normalization algorithm.
 
-A symmetric Chamfer distance is calculated between centered masks: mean nearest-pixel distance in both directions, normalized to mask size. Dark-background PNG candidates are compared against both KanjiVG and Noto Serif JP; the smaller distance wins. The nearest **different** Unicode character is searched across the union of applicable pinned catalogs so expected and rival glyphs have equivalent font coverage. Validator version: `kanjivg-r20250816-5581e65d-noto-serif-jp-24fc2d26-ea6231b1-mask64-v6`.
+A symmetric Chamfer distance is calculated between centered masks: mean nearest-pixel distance in both directions, normalized to mask size. Dark-background PNG candidates are compared against both KanjiVG and Noto Serif JP; the smaller distance wins. The nearest **different** Unicode character is searched across the union of applicable pinned catalogs so expected and rival glyphs have equivalent font coverage. Validator version: `kanjivg-r20250816-5581e65d-noto-serif-jp-1.001-a12875dc-cce25df6-mask64-v7`.
 
 Thresholds are contractual:
 
@@ -500,9 +502,9 @@ Offline reproducible calibration:
 cargo test -p asset-store offline_threshold_calibration -- --nocapture
 ```
 
-The test selects **16** glyphs evenly by Unicode order from the pinned Noto catalog, renders synthetic 142 px tiles, and measures true-identity distances, margins and statuses. It also evaluates each sample under the nearest competing Unicode identity and forbids `VERIFIED` for it. Output reports counts by status, maximum true distance, minimum margin, maximum competing-identity difference, and competing status results. It is entirely pinned/offline, independent of manual image review and current character plans.
+The test selects **64** glyphs evenly by Unicode order from the pinned Noto catalog, renders synthetic 142 px tiles, and measures true-identity distances, margins and statuses. It also evaluates each sample under the nearest competing Unicode identity and forbids `VERIFIED` for it. Output reports counts by status, maximum true distance, minimum margin, maximum competing-identity difference, and competing status results. It is entirely pinned/offline, independent of manual image review and current character plans.
 
-For current validator v6, **12/16** positive synthetic cases were `VERIFIED`, **4/16** `UNCERTAIN`, **0** `REJECTED`; maximum reference distance `0.002642`, minimum margin `0.001648`. All **16** nearest-competing identities were `UNCERTAIN` (zero `VERIFIED`/`REJECTED`), maximum difference `0.012586`. These observed results do **not** change thresholds.
+For current validator v7, **58/64** positive synthetic cases were `VERIFIED`, **6/64** `UNCERTAIN`, **0** `REJECTED`; maximum reference distance `0.004004`, minimum margin `0.001969`. For the nearest competing identities **0** were `VERIFIED`, **5** `REJECTED` and **59** `UNCERTAIN`, maximum difference `0.022829`. The previous validator v6 gives the same 58/6/0 and 0/5/59 on this sample. The sample was enlarged from 16 to 64 glyphs: on 16 glyphs the v6 result sat exactly at the 75 % boundary and a single glyph changed the outcome, while the `VERIFIED` share over all 6,428 references is about 92 % for both v6 and v7. These observed results do **not** change thresholds.
 
 Deterministic tests with embedded Unicode catalogs and synthetic raster bytes cover:
 
@@ -536,7 +538,7 @@ cargo run --locked --bin kanji-assets -- --output json validate --mode full
 cargo run --locked --bin kanji-assets -- --output json list
 cargo run --locked --bin kanji-assets -- --output json plan \
   --mode new --validator-id kanjivg-pixel-chamfer \
-  --validator-version kanjivg-r20250816-5581e65d-noto-serif-jp-24fc2d26-ea6231b1-mask64-v6
+  --validator-version kanjivg-r20250816-5581e65d-noto-serif-jp-1.001-a12875dc-cce25df6-mask64-v7
 
 # Manually import a local candidate (it stays in the pending state).
 cargo run --locked --bin kanji-assets -- --output json ingest \
@@ -666,7 +668,7 @@ Old `kanji-distinct-mean-v2` batches remain readable under their prior rules. Ex
 
 ### Local inference: llama.cpp and Ollama
 
-Two optional tasks use a local vision model: blind OCR of saved uncertain kanji candidates (`kanji_ocr`) and a visual check of saved JPDB PNGs (`jpdb_pitch_review`). Ordinary `start`, `run`, `status`, `review`, verified reads and publication never call a model. A model result is only a **suggestion** for a human: it never grants `AutoVerified` or `HumanVerified` and never changes a candidate, decision, trust or the v6 validator.
+Two optional tasks use a local vision model: blind OCR of saved uncertain kanji candidates (`kanji_ocr`) and a visual check of saved JPDB PNGs (`jpdb_pitch_review`). Ordinary `start`, `run`, `status`, `review`, verified reads and publication never call a model. A model result is only a **suggestion** for a human: it never grants `AutoVerified` or `HumanVerified` and never changes a candidate, decision, trust or the kanji validator.
 
 #### Configuration
 
@@ -745,7 +747,7 @@ The address is HTTP without credentials, path, query or fragment. **Anything oth
 
 #### Kanji OCR
 
-`batch ocr` processes an **already saved** batch sequentially. The owner first checks canonical-store integrity and current trust, reusing verified assets. OCR is permitted **only** for current, technically valid `awaiting_human` candidates with validator-v6 `Uncertain`. `Verified`, `Rejected`, `Corrupt` and resolved entries never start a model. No Yarxi refetch occurs.
+`batch ocr` processes an **already saved** batch sequentially. The owner first checks canonical-store integrity and current trust, reusing verified assets. OCR is permitted **only** for current, technically valid `awaiting_human` candidates with kanji-validator `Uncertain`. `Verified`, `Rejected`, `Corrupt` and resolved entries never start a model. No Yarxi refetch occurs.
 
 ```bash
 # The ordinary path, without OCR:
@@ -780,7 +782,7 @@ After applying a matching group, create a new `review-export` for the remaining 
 
 The default prompt is `config/prompts/kanji_ocr.txt`; together with the answer-format instruction it reproduces the `structure-v1` instruction of the Structure study verbatim, and its SHA-256 is pinned by a test. The model receives only the prompt and a PNG: expected Unicode, paths, source filenames and article context are **not** sent. The answer is JSON with a sole string `observed`; exactly one supported Han/CJK character or `?` is accepted, without Unicode variant normalization. Extra fields, explanatory text, multi-character values, incomplete responses and a token-limit cut-off are recorded as refused suggestions.
 
-Preparation uses exact saved source bytes/SHA. A bounded v6 decoder chooses the full representative GIF frame, and a second bounded decode materializes that composited frame; PNG is fully decoded. Alpha is composited onto white; Rust `image` resizes 2× with Lanczos3 and encodes one PNG. This is independent Rust Lanczos3, **not** promised pixel-identical to historical PowerShell/System.Drawing. Source: at most 8 MiB, 2048-pixel sides, 512 GIF frames, 32 MiB decode; output at most 4096×4096 and 8 MiB.
+Preparation uses exact saved source bytes/SHA. The bounded kanji-validator decoder (unchanged since v6, hence the `v6-representative-…` transform version) chooses the full representative GIF frame, and a second bounded decode materializes that composited frame; PNG is fully decoded. Alpha is composited onto white; Rust `image` resizes 2× with Lanczos3 and encodes one PNG. This is independent Rust Lanczos3, **not** promised pixel-identical to historical PowerShell/System.Drawing. Source: at most 8 MiB, 2048-pixel sides, 512 GIF frames, 32 MiB decode; output at most 4096×4096 and 8 MiB.
 
 Suggestions live **only** at `.runtime/batches/<id>/ocr/suggestions.json`. The cache key and provenance include identity, source SHA, task, answer contract, transformation version, the composed prompt SHA and its source, backend with its mode and version, model profile and name, weights file SHA-256 (the digest for Ollama), projector SHA-256, load and generation parameters. Changing any of them yields a new key: an old record is never presented as the result of another model or prompt. SHA-256 of large GGUF files is cached in the state directory by path, size and modification time. Checking the cache needs a prepared backend: the managed server is started, and a cache hit then makes **zero** model requests. Model identity is re-read before and after each request: a model change during a scan is stored as the `model_changed_during_scan` refusal. A backend preparation failure is stored for each candidate with weights `unavailable`; a later successful start has another key. A cache hit requires a verifiable model identity (see `mode = "external"`). Retrying a refusal with the same settings requires `--rescan`. The runtime lock is released while the model works; on return current SHA, generation and candidate are checked and stale results discarded.
 

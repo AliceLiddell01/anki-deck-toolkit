@@ -23,11 +23,12 @@ use crate::validation::{SemanticValidator, ValidatorFailure};
 
 const VALIDATOR_ID: &str = "kanjivg-pixel-chamfer";
 const VALIDATOR_VERSION: &str =
-    "kanjivg-r20250816-5581e65d-noto-serif-jp-24fc2d26-ea6231b1-mask64-v6";
+    "kanjivg-r20250816-5581e65d-noto-serif-jp-1.001-a12875dc-cce25df6-mask64-v7";
 const REFERENCE_DB: &[u8] = include_bytes!("data/kanjivg-r20250816.maskdb.zlib");
-const YARXI_FONT_REFERENCE_DB: &[u8] = include_bytes!("data/yarxi-noto-serif-jp-r1.maskdb.zlib");
+const NOTO_FONT_REFERENCE_DB: &[u8] =
+    include_bytes!("data/noto-serif-jp-1.001-regular.maskdb.zlib");
 const KANJIVG_REFERENCE_VERSION: &str = "KanjiVG r20250816 @ bd13ffbcc9d85cb86ae98bbbf001d9069220b901; normalization=center-sampled-mask64-v2; maskdb_sha256=5581e65d5a681cdf8e441be04c1cea5f6ec61342ce8830ed083ba417d83a88ff";
-const YARXI_FONT_REFERENCE_VERSION: &str = "Noto Serif JP /fonts/noto-serif-jp.24fc2d26.ttf sha256=e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8; normalization=center-sampled-mask64-v2; maskdb_sha256=ea6231b13f23ed16705839b8c3e911f89fea67b91b6b315f3f562f75c7b0531c";
+const NOTO_FONT_REFERENCE_VERSION: &str = "Noto Serif JP Regular 1.001 google/fonts@beff1d8226e598dfaf06f9f8312c01021f70e9d2 ofl/notoserifjp/NotoSerifJP-Regular.otf sha256=a12875dcde3979f7901cd52c6f750f763e5ad2824cf3c27019a61dd5de5a8d9d; renderer=resvg-0.48.1; cmap-only; normalization=center-sampled-mask64-v2; maskdb_sha256=cce25df61382ccb8e14d1eca181609916aac483b4949fcbf637f4fb5ac353608";
 /// Единственный предел размера входного изображения Kanji; доменная политика
 /// использует это же значение при проверке ресурсов и манифеста.
 pub(crate) const MAX_MEDIA_BYTES: usize = 8 * 1024 * 1024;
@@ -63,7 +64,7 @@ struct ReferenceTemplate {
 }
 
 static REFERENCE_CATALOG: OnceLock<Result<ReferenceMap, String>> = OnceLock::new();
-static YARXI_FONT_REFERENCE_CATALOG: OnceLock<Result<FontReferenceMap, String>> = OnceLock::new();
+static NOTO_FONT_REFERENCE_CATALOG: OnceLock<Result<FontReferenceMap, String>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq)]
 struct RasterEvidence {
@@ -198,7 +199,7 @@ impl SemanticValidator for KanjiImageValidator {
         };
 
         let font_catalog = if raster.foreground_polarity == ForegroundPolarity::LightOnDark {
-            match YARXI_FONT_REFERENCE_CATALOG.get_or_init(load_yarxi_font_reference_catalog) {
+            match NOTO_FONT_REFERENCE_CATALOG.get_or_init(load_noto_font_reference_catalog) {
                 Ok(catalog) => Some(catalog),
                 Err(reason) => {
                     return Ok(decision(
@@ -260,7 +261,7 @@ impl SemanticValidator for KanjiImageValidator {
                 "foreground_polarity": raster.foreground_polarity.as_str(),
                 "excluded_border_components": raster.excluded_border_components,
                 "reference_version": KANJIVG_REFERENCE_VERSION,
-                "font_reference_version": font_catalog.map(|_| YARXI_FONT_REFERENCE_VERSION),
+                "font_reference_version": font_catalog.map(|_| NOTO_FONT_REFERENCE_VERSION),
                 "comparison": "симметричное расстояние Шамфера между центрированными бинарными масками переднего плана 64×64; при уменьшении кандидата выбираются центры ячеек пикселей; ожидаемое расстояние и расстояние до ближайшего другого символа ищутся по всем применимым закреплённым пиксельным каталогам эталонов",
                 "segmentation": "оценка фона по медиане в углах, адаптивный выбор полярности, подавление компонентов рамки у края",
             }),
@@ -601,8 +602,8 @@ fn load_reference_catalog() -> Result<ReferenceMap, String> {
     Ok(map)
 }
 
-fn load_yarxi_font_reference_catalog() -> Result<FontReferenceMap, String> {
-    let mut decoder = ZlibDecoder::new(YARXI_FONT_REFERENCE_DB);
+fn load_noto_font_reference_catalog() -> Result<FontReferenceMap, String> {
+    let mut decoder = ZlibDecoder::new(NOTO_FONT_REFERENCE_DB);
     let mut bytes = Vec::new();
     decoder
         .read_to_end(&mut bytes)
@@ -1228,9 +1229,9 @@ mod tests {
     }
 
     #[test]
-    fn dark_yarxi_font_reference_verifies_pixels_but_not_a_wrong_identity() {
-        let font_catalog = YARXI_FONT_REFERENCE_CATALOG
-            .get_or_init(load_yarxi_font_reference_catalog)
+    fn dark_noto_font_reference_verifies_pixels_but_not_a_wrong_identity() {
+        let font_catalog = NOTO_FONT_REFERENCE_CATALOG
+            .get_or_init(load_noto_font_reference_catalog)
             .as_ref()
             .expect("закреплённый каталог Noto Serif JP декодируется");
         let font_mask = font_catalog
@@ -1251,7 +1252,7 @@ mod tests {
         assert_eq!(evidence["foreground_polarity"], "light_on_dark");
         assert_eq!(
             evidence["font_reference_version"],
-            YARXI_FONT_REFERENCE_VERSION
+            NOTO_FONT_REFERENCE_VERSION
         );
         assert!(evidence["noto_font_expected_distance"].as_f64().unwrap() < 0.020);
         assert!((evidence["max_distance"].as_f64().unwrap() - 0.020).abs() < 1e-7);
@@ -1266,10 +1267,10 @@ mod tests {
 
     #[test]
     fn offline_threshold_calibration_measures_positive_and_confusable_cases() {
-        const SAMPLE_COUNT: usize = 16;
+        const SAMPLE_COUNT: usize = 64;
         let kanjivg = test_catalog();
-        let font_catalog = YARXI_FONT_REFERENCE_CATALOG
-            .get_or_init(load_yarxi_font_reference_catalog)
+        let font_catalog = NOTO_FONT_REFERENCE_CATALOG
+            .get_or_init(load_noto_font_reference_catalog)
             .as_ref()
             .expect("закреплённый каталог Noto Serif JP декодируется");
         let font_entries = font_catalog.iter().collect::<Vec<_>>();
@@ -1338,6 +1339,9 @@ mod tests {
             }
         }
 
+        eprintln!(
+            "офлайн-калибровка: источник=Noto Serif JP, размер синтетической плитки=142 px; стратифицированная выборка={SAMPLE_COUNT}; положительные случаи: verified={positive_verified}, uncertain={positive_uncertain}, rejected={positive_rejected}, максимальное расстояние до ожидаемого эталона={max_positive_distance:.6}, минимальный отрыв={min_positive_margin:.6}; ближайшие конкурирующие символы: rejected={negative_rejected}, uncertain={negative_uncertain}, максимальный разрыв={max_wrong_identity_gap:.6}"
+        );
         assert_eq!(
             positive_verified + positive_uncertain + positive_rejected,
             SAMPLE_COUNT
@@ -1351,15 +1355,12 @@ mod tests {
             positive_rejected, 0,
             "совпадающие закреплённые reference masks не должны получать REJECTED"
         );
-        eprintln!(
-            "офлайн-калибровка: источник=Noto Serif JP, размер синтетической плитки=142 px; стратифицированная выборка={SAMPLE_COUNT}; положительные случаи: verified={positive_verified}, uncertain={positive_uncertain}, rejected={positive_rejected}, максимальное расстояние до ожидаемого эталона={max_positive_distance:.6}, минимальный отрыв={min_positive_margin:.6}; ближайшие конкурирующие символы: rejected={negative_rejected}, uncertain={negative_uncertain}, максимальный разрыв={max_wrong_identity_gap:.6}"
-        );
     }
 
     #[test]
     fn dark_font_reference_confusables_remain_fail_closed() {
-        let font_catalog = YARXI_FONT_REFERENCE_CATALOG
-            .get_or_init(load_yarxi_font_reference_catalog)
+        let font_catalog = NOTO_FONT_REFERENCE_CATALOG
+            .get_or_init(load_noto_font_reference_catalog)
             .as_ref()
             .expect("закреплённый каталог эталонов Noto Serif JP декодируется");
         let validator = KanjiImageValidator::new();
@@ -1561,14 +1562,14 @@ mod tests {
         // Замена встроенного каталога без согласованной смены версии валидатора
         // выдала бы новые маски за прежнее автоматическое решение.
         let kanjivg_sha256 = crate::hashing::sha256_hex(REFERENCE_DB);
-        let font_sha256 = crate::hashing::sha256_hex(YARXI_FONT_REFERENCE_DB);
+        let font_sha256 = crate::hashing::sha256_hex(NOTO_FONT_REFERENCE_DB);
         assert!(
             KANJIVG_REFERENCE_VERSION.ends_with(&format!("maskdb_sha256={kanjivg_sha256}")),
             "KANJIVG_REFERENCE_VERSION не описывает встроенный каталог {kanjivg_sha256}"
         );
         assert!(
-            YARXI_FONT_REFERENCE_VERSION.ends_with(&format!("maskdb_sha256={font_sha256}")),
-            "YARXI_FONT_REFERENCE_VERSION не описывает встроенный каталог {font_sha256}"
+            NOTO_FONT_REFERENCE_VERSION.ends_with(&format!("maskdb_sha256={font_sha256}")),
+            "NOTO_FONT_REFERENCE_VERSION не описывает встроенный каталог {font_sha256}"
         );
         for sha256 in [&kanjivg_sha256, &font_sha256] {
             assert!(
@@ -1582,7 +1583,7 @@ mod tests {
                 &kanjivg_sha256,
             ),
             (
-                include_str!("data/yarxi-noto-serif-jp-ATTRIBUTION.txt"),
+                include_str!("data/noto-serif-jp-ATTRIBUTION.txt"),
                 &font_sha256,
             ),
         ] {
@@ -1594,12 +1595,57 @@ mod tests {
 
         let kanjivg = load_reference_catalog().expect("встроенный каталог KanjiVG читается");
         let font =
-            load_yarxi_font_reference_catalog().expect("встроенный каталог Noto Serif JP читается");
+            load_noto_font_reference_catalog().expect("встроенный каталог Noto Serif JP читается");
         assert_eq!(kanjivg.len(), 6_430);
         assert_eq!(font.len(), 6_428);
         assert!(
             font.keys().all(|character| kanjivg.contains_key(character)),
             "генератор Noto Serif JP берёт символы только из каталога KanjiVG"
         );
+
+        let font_attribution = include_str!("data/noto-serif-jp-ATTRIBUTION.txt");
+        let source_font_sha256 = attribution_value_after(font_attribution, "Source font SHA-256:")
+            .expect("в атрибуции Noto Serif JP указан SHA-256 исходного шрифта");
+        assert!(
+            NOTO_FONT_REFERENCE_VERSION.contains(&format!("sha256={source_font_sha256};")),
+            "NOTO_FONT_REFERENCE_VERSION не описывает исходный шрифт {source_font_sha256}"
+        );
+        assert!(
+            VALIDATOR_VERSION.contains(&format!("-{}-", &source_font_sha256[..8])),
+            "версия валидатора {VALIDATOR_VERSION} не ссылается на исходный шрифт"
+        );
+    }
+
+    #[test]
+    fn noto_catalog_has_no_notdef_templates() {
+        use unicode_normalization::UnicodeNormalization;
+
+        // Символ вне cmap шрифта resvg рисует глифом `.notdef`: одна и та же рамка
+        // оказалась бы эталоном нескольких несвязанных Unicode. Одинаковые маски
+        // допустимы только у канонически эквивалентных символов (совместимые
+        // иероглифы CJK и их унифицированные формы).
+        let font =
+            load_noto_font_reference_catalog().expect("встроенный каталог Noto Serif JP читается");
+        let mut by_mask = BTreeMap::<Mask, Vec<char>>::new();
+        for (&character, template) in &font {
+            by_mask.entry(template.mask).or_default().push(character);
+        }
+        for characters in by_mask.values().filter(|characters| characters.len() > 1) {
+            let canonical = characters
+                .iter()
+                .map(|character| character.to_string().nfc().collect::<String>())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                canonical.len(),
+                1,
+                "одна маска Noto Serif JP у неэквивалентных символов {characters:?}"
+            );
+        }
+        for missing in ['\u{55BB}', '\u{27491}'] {
+            assert!(
+                !font.contains_key(&missing),
+                "символа {missing} нет в cmap исходного шрифта, эталона быть не должно"
+            );
+        }
     }
 }
