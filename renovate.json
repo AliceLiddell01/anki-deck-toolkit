@@ -24,15 +24,6 @@
   "rebaseWhen": "behind-base-branch",
   "packageRules": [
     {
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchPackageNames": [
-        "resvg"
-      ],
-      "allowedVersions": "<0.48.0"
-    },
-    {
       "description": "Обе версии Rust должны обновляться совместно, без beta/nightly и без захвата crates",
       "matchManagers": [
         "rust-toolchain",

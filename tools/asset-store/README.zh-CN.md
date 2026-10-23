@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 90d89556401bcdabd815f995ef5a55696860d633 -->
+<!-- i18n-source-git-blob: 4bb9664bedd154f8b56e7a9dce9f1a142f39aca1 -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -471,17 +471,21 @@ ZIP 必需项：`summary.md`、`manifest.sha256`、`raw-evidence/events.jsonl`�
 
 ## 语义验证器与校准测试
 
-`KanjiImageValidator` 分析 PNG/GIF 的**真实像素**，不根据文件名、URL、DOM 文本或来源说明进行判断。PNG 完整解码。`GifDecoder::into_frames()` 按 GIF 帧替换规则合成帧；逐帧检查后选择前景图形面积最大的帧。
+`KanjiImageValidator` 分析 PNG/GIF 的**真实像素**，不根据文件名、URL、DOM 文本或来源说明进行判断。PNG 完整解码。`GifDecoder::into_frames()` 按 GIF 帧替换规则合成帧；逐帧检查后选择前景图形面积最大的帧。没有前景的帧（例如笔顺动画中的空白帧）会被跳过，而不会导致整个 GIF 被拒绝；所有帧都没有前景时，GIF 被拒绝。
 
 汉字验证器和领域批处理适配器限制图片最大 **8 MiB**。公共批处理运行时为状态和内容文件规定 **64 MiB** 上限，领域适配器可以进一步降低。人工批准时采用当前领域策略限制，未定义则为 8 MiB。读取最多允许上限再加一个字节，用于在不无限分配内存的情况下检测超限，之后仍必须检查完整性并完整解码。
 
 主要参考字形库来自 KanjiVG 发布版 `r20250816`，提交 `bd13ffbcc9d85cb86ae98bbbf001d9069220b901`。按 Unicode 码点查找的 SVG 被规范化为 64×64 二值遮罩，包含 **6,430** 个字符，压缩于 `src/data/kanjivg-r20250816.maskdb.zlib`，SHA-256 为 `5581e65d5a681cdf8e441be04c1cea5f6ec61342ce8830ed083ba417d83a88ff`。KanjiVG 使用 CC BY-SA 3.0；版权归属、版本与原始档案 SHA-256 见 `src/data/kanjivg-ATTRIBUTION.txt`。
 
-深色方块另采用 Yarxi `.font-sample` 实际使用的 Noto Serif JP 字体。固定 TTF 的 SHA-256 是 `e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8`；由它生成 **6,428** 个规范遮罩，存于 `src/data/yarxi-noto-serif-jp-r1.maskdb.zlib`，SHA-256 `ea6231b13f23ed16705839b8c3e911f89fea67b91b6b315f3f562f75c7b0531c`。原始 TTF **未提交**仓库，来源及许可见 `src/data/yarxi-noto-serif-jp-ATTRIBUTION.txt`。
+深色方块另采用公开发布的 Noto Serif JP Regular 1.001 字体作为附加像素参考：`google/fonts` 仓库固定提交 `beff1d8226e598dfaf06f9f8312c01021f70e9d2` 中的 `ofl/notoserifjp/NotoSerifJP-Regular.otf`，SHA-256 为 `a12875dcde3979f7901cd52c6f750f763e5ad2824cf3c27019a61dd5de5a8d9d`，许可为 SIL Open Font License 1.1。这是独立来源，而不是 Yarxi 网站过去提供的字体文件：那个 TTF 已无法获取，网站及其数据也不再是生成输入。由该字体生成 **6,428** 个规范遮罩，存于 `src/data/noto-serif-jp-1.001-regular.maskdb.zlib`，SHA-256 `cce25df61382ccb8e14d1eca181609916aac483b4949fcbf637f4fb5ac353608`；字体本身**未提交**仓库。来源、许可和重新生成命令见 `src/data/noto-serif-jp-ATTRIBUTION.txt`。
+
+生成器 `build-noto-font-reference` 校验字体 SHA-256，只使用固定 KanjiVG 字形库中同时存在于字体 cmap 的字符。对 cmap 之外的字符，`resvg` 会绘制 `.notdef` 字形，同一个方框会成为多个无关 Unicode 字符的参考；因此跳过 U+55BB 和 U+27491。测试 `noto_catalog_has_no_notdef_templates` 只允许规范等价的字符（CJK 兼容表意文字及其统一形式）具有相同遮罩。
+
+参考库生成器仅在 `reference-generator` 功能中使用 `resvg` 和 `skrifa`；生产验证器读取已嵌入的字形库，与 `resvg` 版本无关。两个字形库在 `resvg 0.48.1` 上均可逐字节复现，并与 `resvg 0.47.0` 在相同输入上的结果一致。新的 Noto 字形库与先前基于 Yarxi TTF 的字形库在 6,428 个遮罩中有 6,257 个不同（中位数为 4,096 个像素中的 7 个），因此只在新的验证器版本下被接受。测试 `embedded_reference_catalogs_match_registered_identity_and_attribution` 将两个嵌入字形库及原始字体的 SHA-256 与验证器版本及版权归属文件绑定，未同步更换验证器标识就替换字形库将无法通过检查。
 
 验证器先从图像四角估计背景，通过对比度决定极性，删除边缘相连的边框成分，并提取前景字形遮罩。参考库生成器和生产验证器共用 `kanji_mask::normalize_binary_mask`：裁剪到非空前景，缩放适配到 56×56，再居中放入 64×64。每个输出像素按照 `(2*i+1)*source_size/(2*output_size)` 选择原始网格中心最近的像素。因此 KanjiVG、Noto 和候选图都采用相同规范化算法。
 
-在居中遮罩之间计算**对称 Chamfer 距离**：两个方向分别求像素到对方最近像素的平均距离，再按遮罩大小归一化。深色 PNG 同时与 KanjiVG 和 Noto Serif JP 比较，取较小距离。最近的**其他** Unicode 字符在所有适用的固定字形库并集中查找，确保目标和竞争字符接受相同字体覆盖。验证器版本为 `kanjivg-r20250816-5581e65d-noto-serif-jp-24fc2d26-ea6231b1-mask64-v6`。
+在居中遮罩之间计算**对称 Chamfer 距离**：两个方向分别求像素到对方最近像素的平均距离，再按遮罩大小归一化。深色 PNG 同时与 KanjiVG 和 Noto Serif JP 比较，取较小距离。最近的**其他** Unicode 字符在所有适用的固定字形库并集中查找，确保目标和竞争字符接受相同字体覆盖。验证器版本为 `kanjivg-r20250816-5581e65d-noto-serif-jp-1.001-a12875dc-cce25df6-mask64-v7`。
 
 阈值属于正式验证契约：
 
@@ -498,9 +502,9 @@ ZIP 必需项：`summary.md`、`manifest.sha256`、`raw-evidence/events.jsonl`�
 cargo test -p asset-store offline_threshold_calibration -- --nocapture
 ```
 
-测试从 Noto 字形库按 Unicode 顺序均匀选取 **16** 个字形，渲染成 142 px 的合成方块，计算正确身份的距离、区分边际和状态。每个样本还作为最近的竞争 Unicode 字符进行验证，禁止竞争者得到 `VERIFIED`。输出按状态统计数量、最大正确距离、最小边际、最大竞争差值及其验证状态。数据完全固定、离线，不依赖人工验收或当前字符计划。
+测试从 Noto 字形库按 Unicode 顺序均匀选取 **64** 个字形，渲染成 142 px 的合成方块，计算正确身份的距离、区分边际和状态。每个样本还作为最近的竞争 Unicode 字符进行验证，禁止竞争者得到 `VERIFIED`。输出按状态统计数量、最大正确距离、最小边际、最大竞争差值及其验证状态。数据完全固定、离线，不依赖人工验收或当前字符计划。
 
-当前 v6 验证器中，16 个正向合成案例有 **12 个 `VERIFIED`**、**4 个 `UNCERTAIN`**、**0 个 `REJECTED`**；最大参考距离 `0.002642`，最小区分边际 `0.001648`。全部 **16** 个最近竞争字符均为 `UNCERTAIN`（`VERIFIED` 和 `REJECTED` 都为 0），最大差值 `0.012586`。这些统计**不修改阈值**。
+当前 v7 验证器中，64 个正向合成案例有 **58 个 `VERIFIED`**、**6 个 `UNCERTAIN`**、**0 个 `REJECTED`**；最大参考距离 `0.004004`，最小区分边际 `0.001969`。最近竞争字符中 **0** 个 `VERIFIED`、**5** 个 `REJECTED`、**59** 个 `UNCERTAIN`，最大差值 `0.022829`。先前的 v6 验证器在同一样本上得到相同的 58/6/0 和 0/5/59。样本从 16 个扩大到 64 个字形：在 16 个字形上 v6 的结果恰好位于 75 % 边界，更换一个字形就会改变结论；而在全部 6,428 个参考上，v6 和 v7 的 `VERIFIED` 比例都约为 92 %。这些统计**不修改阈值**。
 
 使用内置 Unicode 参考和合成像素的确定性回归测试涵盖：
 
@@ -508,6 +512,7 @@ cargo test -p asset-store offline_threshold_calibration -- --nocapture
 - Noto Serif JP 风格、带边框的 Yarxi 深色方块，以及对错误 Unicode 身份的拒绝。
 - 指定比例的深色方块和近似但错误字符的拒绝。
 - Yarxi GIF 的“完整帧 → 逐步描绘 → 完整帧”，检查最终完整的语义遮罩，而非选择了第几帧。
+- 含空白首帧或中间帧的 GIF 在验证和 OCR 准备中都选择完整帧，仅由空白帧组成的 GIF 被拒绝。
 - 视觉相近但错误的 Unicode 字符。
 - 笔画变粗和裁剪帧。
 - 损坏签名/帧流、空图与缺失参考。
@@ -534,7 +539,7 @@ cargo run --locked --bin kanji-assets -- --output json validate --mode full
 cargo run --locked --bin kanji-assets -- --output json list
 cargo run --locked --bin kanji-assets -- --output json plan \
   --mode new --validator-id kanjivg-pixel-chamfer \
-  --validator-version kanjivg-r20250816-5581e65d-noto-serif-jp-24fc2d26-ea6231b1-mask64-v6
+  --validator-version kanjivg-r20250816-5581e65d-noto-serif-jp-1.001-a12875dc-cce25df6-mask64-v7
 
 # 手动导入本地候选文件（它将保持 pending 状态）。
 cargo run --locked --bin kanji-assets -- --output json ingest \
@@ -666,7 +671,7 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch review-appl
 
 ### 本地推理：llama.cpp 与 Ollama
 
-两个可选任务使用本地视觉模型：对已保存的不确定汉字候选进行盲识别 OCR（`kanji_ocr`），以及对已保存的 JPDB PNG 进行视觉检查（`jpdb_pitch_review`）。普通 `start`、`run`、`status`、`review`、已验证资源读取和发布从不调用模型。模型结果只是给人的**建议**：它从不授予 `AutoVerified` 或 `HumanVerified`，也不改变候选、决定、信任或 v6 验证器。
+两个可选任务使用本地视觉模型：对已保存的不确定汉字候选进行盲识别 OCR（`kanji_ocr`），以及对已保存的 JPDB PNG 进行视觉检查（`jpdb_pitch_review`）。普通 `start`、`run`、`status`、`review`、已验证资源读取和发布从不调用模型。模型结果只是给人的**建议**：它从不授予 `AutoVerified` 或 `HumanVerified`，也不改变候选、决定、信任或汉字验证器。
 
 #### 配置
 
@@ -745,7 +750,7 @@ Ctrl+C 中断当前请求、停止服务器并以退出码 `130` 返回 `interru
 
 #### 汉字 OCR
 
-`batch ocr` 按顺序处理**已经保存**的批次。首先核对规范资源库完整性和现行信任，复用已经确认的资源。只有当前技术有效、处于 `awaiting_human` 且 v6 验证器为 `Uncertain` 的候选可使用 OCR。`Verified`、`Rejected`、`Corrupt` 和已经解决的项目不会启动模型，也不会重新访问 Yarxi。
+`batch ocr` 按顺序处理**已经保存**的批次。首先核对规范资源库完整性和现行信任，复用已经确认的资源。只有当前技术有效、处于 `awaiting_human` 且汉字验证器为 `Uncertain` 的候选可使用 OCR。`Verified`、`Rejected`、`Corrupt` 和已经解决的项目不会启动模型，也不会重新访问 Yarxi。
 
 ```bash
 # 常规路径，不使用 OCR：
@@ -780,7 +785,7 @@ cargo run --quiet --locked --bin kanji-assets -- --output json batch ocr \
 
 默认提示词为 `config/prompts/kanji_ocr.txt`；与答复格式指令组合后逐字再现 Structure 研究的 `structure-v1` 指令，其 SHA-256 有测试固定。模型**仅接收**提示词和 PNG，绝不发送期望 Unicode、路径、原文件名或文章上下文。答复是只有一个字符串字段 `observed` 的 JSON；仅接受**一个**受支持 Han/CJK 字符或 `?`，不对 Unicode 字形变体规范化。多余字段、解释文字、多字符 `observed`、不完整答复以及因 token 上限截断都记为建议拒绝。
 
-准备输入时使用已保存的原始字节与 SHA。受限 v6 解码器选择完整的代表性 GIF 帧，再通过第二次有界解码获取该合成帧；PNG 必须完全解码。透明内容合成到白色背景，Rust `image` 使用 Lanczos3 **放大两倍**并编码单张 PNG。这是独立 Rust Lanczos3 实现，**不保证**与历史 PowerShell/System.Drawing 像素一致。源文件最大 **8 MiB**，单边最长 **2048** 像素，GIF 最多 **512 帧**，解码上限 **32 MiB**；输出最大 **4096×4096** 和 **8 MiB**。
+准备输入时使用已保存的原始字节与 SHA。受限的 v7 汉字验证器解码器选择完整的代表性 GIF 帧，并跳过没有前景的帧（因此转换版本为 `v7-representative-…`：v6 会整体拒绝此类 GIF，先前缓存的准备失败不适用于新键），再通过第二次有界解码获取该合成帧；PNG 必须完全解码。透明内容合成到白色背景，Rust `image` 使用 Lanczos3 **放大两倍**并编码单张 PNG。这是独立 Rust Lanczos3 实现，**不保证**与历史 PowerShell/System.Drawing 像素一致。源文件最大 **8 MiB**，单边最长 **2048** 像素，GIF 最多 **512 帧**，解码上限 **32 MiB**；输出最大 **4096×4096** 和 **8 MiB**。
 
 建议只存于 `.runtime/batches/<id>/ocr/suggestions.json`。缓存键和来源记录包括身份、原始 SHA、任务、答复契约、转换版本、组合后提示词的 SHA 及其来源、后端及其模式和版本、模型配置档与名称、权重文件 SHA-256（Ollama 为 digest）、projector SHA-256、加载与生成参数。其中任何一项变化都会产生新键：旧记录绝不会被当作另一模型或提示词的结果。大型 GGUF 的 SHA-256 按路径、大小和修改时间缓存在状态目录中。检查缓存需要已准备好的后端：托管服务器会被启动，之后命中缓存时进行 **0 次**模型请求。每次请求前后都重新读取模型身份：扫描过程中模型变化时存为 `model_changed_during_scan` 拒绝。后端准备失败会为每个候选以权重 `unavailable` 保存；稍后成功启动则产生不同的键。命中缓存要求模型身份可验证（见 `mode = "external"`）。同配置下重试拒绝需要 `--rescan`。模型工作期间释放运行时锁；返回后检查当前 SHA、世代和候选，丢弃过期结果。
 

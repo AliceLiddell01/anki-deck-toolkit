@@ -1,0 +1,54 @@
+Noto Serif JP reference data attribution
+========================================
+
+The compressed Unicode-addressed mask catalog in this directory is derived
+from rendered glyphs of the publicly released Noto Serif JP Regular font. It is
+an independent reference for light-on-dark kanji tiles. It is not the font file
+historically served by Yarxi (that TTF had a different SHA-256 and is not used),
+and it does not reproduce the previous catalog.
+
+Project: https://github.com/google/fonts
+Pinned commit: beff1d8226e598dfaf06f9f8312c01021f70e9d2
+Source font:
+  https://raw.githubusercontent.com/google/fonts/beff1d8226e598dfaf06f9f8312c01021f70e9d2/ofl/notoserifjp/NotoSerifJP-Regular.otf
+Source font SHA-256:
+  a12875dcde3979f7901cd52c6f750f763e5ad2824cf3c27019a61dd5de5a8d9d
+
+Font metadata identifies the family as Noto Serif JP, version 1.001. Noto Serif
+CJK was developed by Adobe and Google. At the pinned commit the font is
+distributed in `ofl/notoserifjp` under the SIL Open Font License, Version 1.1
+(`OFL.txt` and `license: "OFL"` in `METADATA.pb` of the same directory):
+
+  https://raw.githubusercontent.com/google/fonts/beff1d8226e598dfaf06f9f8312c01021f70e9d2/ofl/notoserifjp/OFL.txt
+  https://openfontlicense.org/
+
+The Noto CJK upstream history is available at:
+
+  https://github.com/notofonts/noto-cjk/blob/main/Serif/HISTORY.md
+
+This repository does not redistribute the font. The generated catalog contains
+6,428 normalized 64x64 binary glyph masks for the Unicode characters that are
+present both in the pinned KanjiVG catalog and in the font's character map.
+U+55BB and U+27491 are absent from the character map and are skipped instead of
+being rendered as the `.notdef` box. `build_noto_font_reference.rs` checks the
+source font hash before generating these masks with the locked `resvg`
+dependency (resvg 0.48.1; resvg 0.47.0 renders the same font into a
+byte-identical catalog) and the shared `normalize_binary_mask` routine. It crops
+binary foreground bounds, aspect-fits within 56x56, centers the mask in a 64x64
+canvas, and samples nearest-neighbor pixels from source-cell centers using
+`floor((2 * output_index + 1) * source_size / (2 * output_size))`.
+
+Generated file: noto-serif-jp-1.001-regular.maskdb.zlib
+Generated file SHA-256:
+  cce25df61382ccb8e14d1eca181609916aac483b4949fcbf637f4fb5ac353608
+
+To regenerate, download the source font above, check its SHA-256 and run from
+the workspace root:
+
+  cargo run --locked -p asset-store --features reference-generator \
+    --bin build-noto-font-reference -- \
+    --font-file ./NotoSerifJP-Regular.otf \
+    --output tools/asset-store/src/data/noto-serif-jp-1.001-regular.maskdb.zlib
+
+The source hash is checked by the generator and the compressed output hash must
+match the value above.

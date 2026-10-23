@@ -13,12 +13,15 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use resvg::usvg::{self, fontdb};
+use skrifa::{FontRef, MetadataProvider};
 
 use asset_store::hashing::sha256_hex;
 use asset_store::kanji_mask::{MASK_BYTES, Mask, normalize_binary_mask};
 
 const KANJIVG_DB: &[u8] = include_bytes!("../data/kanjivg-r20250816.maskdb.zlib");
-const PINNED_FONT_SHA256: &str = "e6cffcd5cae6a298ddfd17173b42d64888913976b2d7053024a9ecf0cf5d3fe8";
+// Noto Serif JP Regular 1.001 из google/fonts (`ofl/notoserifjp`, закреплённый коммит),
+// SIL Open Font License 1.1. Источник и проверка — в файле атрибуции каталога.
+const PINNED_FONT_SHA256: &str = "a12875dcde3979f7901cd52c6f750f763e5ad2824cf3c27019a61dd5de5a8d9d";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let (font_path, output) = arguments()?;
@@ -30,9 +33,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    let characters = kanjivg_codepoints()?;
+    // Для символа вне cmap resvg рисует глиф `.notdef`; такая рамка не может быть
+    // эталоном ни одного Unicode, поэтому символ пропускается до отрисовки.
+    let charmap = FontRef::new(&font_bytes)
+        .map_err(|error| format!("исходный шрифт не разбирается как OpenType: {error}"))?
+        .charmap();
+    let mut missing = Vec::new();
+    let characters = kanjivg_codepoints()?
+        .into_iter()
+        .filter(|&codepoint| {
+            let mapped = charmap.map(codepoint).is_some();
+            if !mapped {
+                missing.push(format!("U+{codepoint:04X}"));
+            }
+            mapped
+        })
+        .collect::<Vec<_>>();
     let mut fontdb = fontdb::Database::new();
-    fontdb.load_font_data(font_bytes);
+    fontdb.load_font_data(font_bytes.clone());
     if fontdb.faces().next().is_none() {
         return Err("в исходном шрифте не найдено пригодное начертание".into());
     }
@@ -73,9 +91,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let compressed = encoder.finish()?;
     reference_output::publish(&output, &compressed)?;
     println!(
-        "templates={} font_sha256={} raw_bytes={} compressed_bytes={} output_sha256={}",
+        "templates={} font_sha256={} missing_in_cmap={} raw_bytes={} compressed_bytes={} output_sha256={}",
         raw.len().saturating_sub(8) / (4 + MASK_BYTES),
         font_sha256,
+        missing.join(","),
         raw.len(),
         compressed.len(),
         sha256_hex(&compressed),
@@ -95,7 +114,7 @@ fn arguments() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
         }
     }
     Ok((
-        font.ok_or("обязательный аргумент: --font-file <закреплённый шрифт Noto Serif JP TTF>")?,
+        font.ok_or("обязательный аргумент: --font-file <закреплённый NotoSerifJP-Regular.otf>")?,
         output.ok_or("обязательный аргумент: --output <maskdb.zlib>")?,
     ))
 }

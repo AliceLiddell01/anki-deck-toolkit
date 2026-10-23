@@ -29,7 +29,7 @@ use crate::kanji_validator::prepare_ocr_image;
 use crate::model::{AssetIdentity, DetectedFormat, SemanticStatus};
 use crate::{AssetError, ErrorCode};
 
-pub(crate) const TRANSFORM_VERSION: &str = "v6-representative-white-lanczos3-2x-image025-v1";
+pub(crate) const TRANSFORM_VERSION: &str = "v7-representative-white-lanczos3-2x-image025-v1";
 const CONTRACT_ID: &str = "kanji-observed-v1";
 const CONTRACT_INSTRUCTION: &str =
     "Return ONLY a JSON object with one string field named \"observed\". No explanation.";
