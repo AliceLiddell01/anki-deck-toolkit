@@ -328,7 +328,27 @@ pub(crate) fn scan(
         contract(),
         TRANSFORM_VERSION,
     ));
-    runtime.reacquire_lock()?;
+    if let Err(lock_error) = runtime.reacquire_lock() {
+        // Подготовленный сервер нельзя бросать на Drop: сначала доказанная остановка.
+        let (stop_unproven, session_report) = match prepared {
+            Ok(session) => {
+                let finished = executor.block_on(session.finish());
+                (
+                    finished.stop.as_ref().is_some_and(|stop| !stop.proven()),
+                    finished,
+                )
+            }
+            Err(error) => {
+                let (failure, session_report) = *error;
+                (failure.stop_unproven(), session_report)
+            }
+        };
+        return Err(crate::inference::with_session_evidence(
+            lock_error,
+            stop_unproven,
+            Some(&session_report),
+        ));
+    }
     let mut report = OcrScanReport::default();
     let (mut session, provenance, preparation_failure) = match prepared {
         Ok(session) => {

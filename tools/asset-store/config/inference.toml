@@ -10,7 +10,8 @@
 #
 # Схема строгая: неизвестные ключи, неверные типы и диапазоны отклоняются до
 # запуска модели. Пустая строка в пути или имени модели означает «не настроено»:
-# задача вернёт типизированный отказ `model_not_configured` и подсказку.
+# задача вернёт типизированный отказ `inference_unavailable` с причиной
+# `backend_not_configured`, `model_not_configured` или `projector_not_configured`.
 schema_version = 1
 
 [runtime]
