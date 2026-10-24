@@ -1432,6 +1432,16 @@ cargo run --locked --bin kanji-assets -- --output json batch import \
 (`reference_unavailable`, `font_reference_unavailable`) даёт запись с `error` и
 код `3`, остальные файлы обрабатываются.
 
+Ответ `identify` не следует общей форме JSON-ответа хранилища: в нём
+`schema_version`, `operation`, `outcome` (`completed` или
+`completed_with_errors`), `method_version`, `validator`, `counts` (число записей
+по статусу и `error`) и `items[]` в порядке аргументов. Запись содержит `path`
+и либо `sha256`, `byte_length`, `oversized`, `identification` (отчёт с `status`,
+`reason`, `proposed`, `margin`, `candidates`, `raster`), либо `error` с `code` и
+`message`. `--top` по умолчанию равен 5 (от 1 до 20). Статусы `ambiguous`,
+`unknown` и `corrupt` сами по себе завершают команду с кодом `0`; код `3` —
+только при записи с `error`.
+
 `batch import --batch-id ID --source-dir DIR` проходит текущую границу обхода
 пакета и для каждой идентичности ищет ровно один обычный файл `<символ>.gif` или
 `<символ>.png` без symlink. Каталог не может лежать внутри `decks/`; файлы только

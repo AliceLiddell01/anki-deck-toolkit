@@ -1945,6 +1945,50 @@ mod tests {
     }
 
     #[test]
+    fn identify_reports_ambiguous_unknown_and_light_on_dark_ranking() {
+        // Наложение двух близких эталонов: оба рядом, отрыв меньше порога.
+        let mut overlay = reference('未');
+        for (ink, other) in overlay.iter_mut().zip(reference('末').iter()) {
+            *ink |= *other;
+        }
+        let mut dots = [0; MASK_BYTES];
+        for y in (0..MASK_SIDE).step_by(8) {
+            for x in (0..MASK_SIDE).step_by(8) {
+                set_ink(&mut dots, x, y);
+            }
+        }
+        for (bytes, expected) in [
+            (png_for(&overlay), IdentificationStatus::Ambiguous),
+            (png_for(&dots), IdentificationStatus::Unknown),
+        ] {
+            let report = identify_media(&bytes, 5).unwrap();
+            assert_eq!(report.status, expected);
+            assert!(report.proposed.is_none());
+            let best = report.candidates[0].character.chars().next().unwrap();
+            assert_ne!(validator_status(&bytes, best), SemanticStatus::Verified);
+        }
+
+        let dark = png_for_image(dark_tile_for(&reference('元'), true));
+        let report = identify_media(&dark, 5).unwrap();
+        let raster = report.raster.as_ref().unwrap();
+        assert_eq!(raster["foreground_polarity"], "light_on_dark");
+        assert_eq!(
+            raster["font_reference_version"],
+            NOTO_FONT_REFERENCE_VERSION
+        );
+        let best = &report.candidates[0];
+        assert_eq!(best.character, "元");
+        let (Some(kanjivg), Some(font)) = (best.kanjivg_distance, best.noto_font_distance) else {
+            panic!("для тёмной плитки считаются обе дистанции");
+        };
+        assert_eq!(best.distance, kanjivg.min(font));
+        assert_eq!(
+            report.status == IdentificationStatus::Proposed,
+            validator_status(&dark, '元') == SemanticStatus::Verified
+        );
+    }
+
+    #[test]
     fn identify_reports_corrupt_bytes_and_bounds_candidate_count() {
         let corrupt = identify_media(b"GIF89a\x01\x00", 5).unwrap();
         assert_eq!(corrupt.status, IdentificationStatus::Corrupt);

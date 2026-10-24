@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 82ae0340188a9e718be832f7169c157794676a71 -->
+<!-- i18n-source-git-blob: 9a4441ccde70e963672793a2eef1238e3ff6d7cf -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -602,6 +602,16 @@ independent confirmation. A read error for one file, or an unavailable built-in
 reference catalog (`reference_unavailable`, `font_reference_unavailable`),
 yields an entry with `error` and exit code `3`; the other files are still
 processed.
+
+The `identify` response does not follow the store's general JSON response
+shape: it has `schema_version`, `operation`, `outcome` (`completed` or
+`completed_with_errors`), `method_version`, `validator`, `counts` (entries per
+status and `error`) and `items[]` in argument order. An entry holds `path` and
+either `sha256`, `byte_length`, `oversized`, `identification` (a report with
+`status`, `reason`, `proposed`, `margin`, `candidates`, `raster`) or `error`
+with `code` and `message`. `--top` defaults to 5 (1 to 20). The `ambiguous`,
+`unknown` and `corrupt` statuses on their own exit with code `0`; code `3`
+appears only when an entry has `error`.
 
 `batch import --batch-id ID --source-dir DIR` walks the batch's current frontier
 and for each identity looks for exactly one regular `<character>.gif` or
