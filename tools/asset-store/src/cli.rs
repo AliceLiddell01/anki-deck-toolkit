@@ -460,10 +460,13 @@ fn identify_files(
                     crate::kanji_validator::IdentificationStatus::Corrupt => "corrupt",
                 };
                 *counts.entry(status).or_default() += 1;
+                // Сверх предела прочитан лишь префикс: его хеш и длина не описывают файл.
+                let oversized = bytes.len() > crate::kanji_validator::MAX_MEDIA_BYTES;
                 items.push(serde_json::json!({
                     "path": path.display().to_string(),
-                    "sha256": sha256_hex(&bytes),
-                    "byte_length": bytes.len(),
+                    "sha256": (!oversized).then(|| sha256_hex(&bytes)),
+                    "byte_length": (!oversized).then_some(bytes.len()),
+                    "oversized": oversized,
                     "identification": report,
                 }));
             }

@@ -534,6 +534,8 @@ fn identify_reads_sources_without_a_store_and_respects_the_decks_boundary() {
     let value = json(&output);
     assert_eq!(value["operation"], "identify");
     assert_eq!(value["items"][0]["sha256"], sha256_hex(&before));
+    assert_eq!(value["items"][0]["byte_length"], before.len());
+    assert_eq!(value["items"][0]["oversized"], false);
     assert_eq!(value["items"][0]["identification"]["status"], "corrupt");
     assert_eq!(value["items"][1]["error"]["code"], "boundary_violation");
     assert!(value["items"][1].get("sha256").is_none());
@@ -541,6 +543,25 @@ fn identify_reads_sources_without_a_store_and_respects_the_decks_boundary() {
     assert_eq!(value["counts"]["error"], 1);
     assert_eq!(fs::read(&broken).unwrap(), before);
     assert!(!temp.path().join("owned-store").exists());
+}
+
+#[test]
+fn identify_does_not_report_a_prefix_hash_for_an_oversized_file() {
+    let temp = TempDir::new();
+    let oversized = temp.path().join("archive/0_1.gif");
+    fs::create_dir_all(oversized.parent().unwrap()).unwrap();
+    let mut bytes = b"GIF89a".to_vec();
+    bytes.resize(8 * 1024 * 1024 + 1, 0);
+    fs::write(&oversized, &bytes).unwrap();
+
+    let output = cli(&temp, &["identify", oversized.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let item = &json(&output)["items"][0];
+    assert_eq!(item["oversized"], true);
+    assert!(item["sha256"].is_null());
+    assert!(item["byte_length"].is_null());
+    assert_eq!(item["identification"]["status"], "corrupt");
 }
 
 #[test]

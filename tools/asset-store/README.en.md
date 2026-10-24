@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: e4831e09940d81405c8fced9e0b2a18bc32173e4 -->
+<!-- i18n-source-git-blob: 6f5d75ee38773ca04f218bdb0952757c5ddad7b6 -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -589,7 +589,9 @@ cargo run --locked --bin kanji-assets -- --output json batch import \
 `identify FILE...` reads files outside `decks/` within the owner limits (8 MiB,
 the same decoder and representative-frame selection as the validator) and for
 each returns the full SHA-256, raster details and up to 20 nearest characters
-with their template distance. The distance is the one `KanjiImageValidator`
+with their template distance. A file larger than 8 MiB gets `oversized: true`,
+with `sha256` and `byte_length` set to `null` (only a prefix is read), and the
+status `corrupt`. The distance is the one `KanjiImageValidator`
 uses: KanjiVG, plus Noto Serif JP for a dark tile. Status
 (`kanji-identify-rank-v1`): `proposed` — the first character passes the
 registered `VERIFIED` thresholds against all others, `ambiguous` — distance is
