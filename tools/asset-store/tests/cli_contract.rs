@@ -508,3 +508,171 @@ fn default_store_resolves_symlinked_repository_root_with_parent_components() {
         expected.display().to_string()
     );
 }
+
+#[test]
+fn identify_reads_sources_without_a_store_and_respects_the_decks_boundary() {
+    let temp = TempDir::new();
+    let outside = temp.path().join("archive");
+    fs::create_dir_all(&outside).unwrap();
+    let broken = outside.join("0_1.gif");
+    fs::write(&broken, b"GIF89a\x01\x00").unwrap();
+    let protected = temp.path().join("repository/decks/media/0_2.gif");
+    fs::create_dir_all(protected.parent().unwrap()).unwrap();
+    fs::write(&protected, b"GIF89a").unwrap();
+    let before = fs::read(&broken).unwrap();
+
+    let output = cli(
+        &temp,
+        &[
+            "identify",
+            broken.to_str().unwrap(),
+            protected.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(3));
+    let value = json(&output);
+    assert_eq!(value["operation"], "identify");
+    assert_eq!(value["items"][0]["sha256"], sha256_hex(&before));
+    assert_eq!(value["items"][0]["byte_length"], before.len());
+    assert_eq!(value["items"][0]["oversized"], false);
+    assert_eq!(value["items"][0]["identification"]["status"], "corrupt");
+    assert_eq!(value["items"][1]["error"]["code"], "boundary_violation");
+    assert!(value["items"][1].get("sha256").is_none());
+    assert_eq!(value["counts"]["corrupt"], 1);
+    assert_eq!(value["counts"]["error"], 1);
+    assert_eq!(fs::read(&broken).unwrap(), before);
+    assert!(!temp.path().join("owned-store").exists());
+}
+
+#[test]
+fn identify_does_not_report_a_prefix_hash_for_an_oversized_file() {
+    let temp = TempDir::new();
+    let oversized = temp.path().join("archive/0_1.gif");
+    fs::create_dir_all(oversized.parent().unwrap()).unwrap();
+    let mut bytes = b"GIF89a".to_vec();
+    bytes.resize(8 * 1024 * 1024 + 1, 0);
+    fs::write(&oversized, &bytes).unwrap();
+
+    let output = cli(&temp, &["identify", oversized.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let item = &json(&output)["items"][0];
+    assert_eq!(item["oversized"], true);
+    assert!(item["sha256"].is_null());
+    assert!(item["byte_length"].is_null());
+    assert_eq!(item["identification"]["status"], "corrupt");
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_import_fails_closed_when_the_decks_boundary_cannot_be_resolved() {
+    let temp = TempDir::new();
+    let source = temp.path().join("staged");
+    fs::create_dir_all(&source).unwrap();
+    let repository = temp.path().join("repository");
+    fs::create_dir_all(&repository).unwrap();
+    let _ = fs::remove_dir_all(repository.join("decks"));
+    // Цикл symlink: canonicalize отказывает не с NotFound, лексическая проверка молчит.
+    std::os::unix::fs::symlink("decks", repository.join("decks")).unwrap();
+
+    let output = cli(
+        &temp,
+        &[
+            "batch",
+            "import",
+            "--batch-id",
+            "local",
+            "--source-dir",
+            source.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(json(&output)["error"]["code"], "io_failure");
+    assert!(!temp.path().join("owned-store").exists());
+}
+
+#[test]
+fn batch_import_rejects_a_source_directory_under_decks_before_opening_the_store() {
+    let temp = TempDir::new();
+    let protected = temp.path().join("repository/decks/media");
+    fs::create_dir_all(&protected).unwrap();
+
+    let output = cli(
+        &temp,
+        &[
+            "batch",
+            "import",
+            "--batch-id",
+            "local",
+            "--source-dir",
+            protected.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(json(&output)["error"]["code"], "boundary_violation");
+    assert!(!temp.path().join("owned-store").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_import_rejects_a_symlink_to_decks_before_opening_the_store() {
+    let temp = TempDir::new();
+    let protected = temp.path().join("repository/decks/media");
+    fs::create_dir_all(&protected).unwrap();
+    let link = temp.path().join("staged");
+    std::os::unix::fs::symlink(&protected, &link).unwrap();
+
+    let output = cli(
+        &temp,
+        &[
+            "batch",
+            "import",
+            "--batch-id",
+            "local",
+            "--source-dir",
+            link.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(json(&output)["error"]["code"], "boundary_violation");
+    assert!(!temp.path().join("owned-store").exists());
+}
+
+#[test]
+fn batch_import_reads_a_checked_safe_directory_through_the_cli() {
+    let temp = TempDir::new();
+    let source = temp.path().join("staged");
+    fs::create_dir_all(&source).unwrap();
+    let start = cli(&temp, &["batch", "start", "--batch-id", "local", "水"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stdout)
+    );
+
+    let output = cli(
+        &temp,
+        &[
+            "batch",
+            "import",
+            "--batch-id",
+            "local",
+            "--source-dir",
+            source.to_str().unwrap(),
+        ],
+    );
+
+    // Технический отказ попытки, а не отказ команды: дескриптор проверенного
+    // каталога дошёл до импорта.
+    assert_eq!(output.status.code(), Some(3));
+    let value = json(&output);
+    assert_eq!(value["outcome"], "partial_progress");
+    assert_eq!(
+        value["batch"]["items"][0]["attempts"][0]["result"]["code"],
+        "local_source_missing"
+    );
+}
