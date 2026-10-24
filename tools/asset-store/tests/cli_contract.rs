@@ -564,6 +564,35 @@ fn identify_does_not_report_a_prefix_hash_for_an_oversized_file() {
     assert_eq!(item["identification"]["status"], "corrupt");
 }
 
+#[cfg(unix)]
+#[test]
+fn batch_import_fails_closed_when_the_decks_boundary_cannot_be_resolved() {
+    let temp = TempDir::new();
+    let source = temp.path().join("staged");
+    fs::create_dir_all(&source).unwrap();
+    let repository = temp.path().join("repository");
+    fs::create_dir_all(&repository).unwrap();
+    let _ = fs::remove_dir_all(repository.join("decks"));
+    // Цикл symlink: canonicalize отказывает не с NotFound, лексическая проверка молчит.
+    std::os::unix::fs::symlink("decks", repository.join("decks")).unwrap();
+
+    let output = cli(
+        &temp,
+        &[
+            "batch",
+            "import",
+            "--batch-id",
+            "local",
+            "--source-dir",
+            source.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(json(&output)["error"]["code"], "io_failure");
+    assert!(!temp.path().join("owned-store").exists());
+}
+
 #[test]
 fn batch_import_rejects_a_source_directory_under_decks_before_opening_the_store() {
     let temp = TempDir::new();

@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 6f5d75ee38773ca04f218bdb0952757c5ddad7b6 -->
+<!-- i18n-source-git-blob: 82ae0340188a9e718be832f7169c157794676a71 -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -585,7 +585,7 @@ cargo run --locked --bin kanji-assets -- --output json batch import \
   --batch-id local --source-dir ./staged
 ```
 
-`identify FILE...` 在所有者限制内（8 MiB，与验证器相同的解码器和代表帧选择）读取 `decks/` 之外的文件，并为每个文件返回完整 SHA-256、栅格信息以及最多 20 个最近字符及其模板距离。大于 8 MiB 的文件得到 `oversized: true`，`sha256` 与 `byte_length` 为 `null`（只读取了前缀），状态为 `corrupt`。距离与 `KanjiImageValidator` 使用的相同：KanjiVG，深色图块另加 Noto Serif JP。状态（`kanji-identify-rank-v1`）：`proposed` 表示第一个字符相对其他所有字符通过已登记的 `VERIFIED` 阈值；`ambiguous` 表示距离在阈值内但间隔较小；`unknown` 表示未达阈值；`corrupt` 表示字节无法解码。这只是建议而非证明：用同一验证器检验以此方式选出的字符，并不构成第二个独立确认。单个文件读取失败会得到带 `error` 的条目和退出码 `3`，其余文件照常处理。
+`identify FILE...` 在所有者限制内（8 MiB，与验证器相同的解码器和代表帧选择）读取 `decks/` 之外的文件，并为每个文件返回完整 SHA-256、栅格信息以及最多 20 个最近字符及其模板距离。大于 8 MiB 的文件得到 `oversized: true`，`sha256` 与 `byte_length` 为 `null`（只读取了前缀），状态为 `corrupt`。距离与 `KanjiImageValidator` 使用的相同：KanjiVG，深色图块另加 Noto Serif JP。状态（`kanji-identify-rank-v1`）：`proposed` 表示第一个字符相对其他所有字符通过已登记的 `VERIFIED` 阈值；`ambiguous` 表示距离在阈值内但间隔较小；`unknown` 表示未达阈值；`corrupt` 表示字节无法解码。这只是建议而非证明：用同一验证器检验以此方式选出的字符，并不构成第二个独立确认。单个文件读取失败或内置模板目录不可用（`reference_unavailable`、`font_reference_unavailable`）会得到带 `error` 的条目和退出码 `3`，其余文件照常处理。
 
 `batch import --batch-id ID --source-dir DIR` 遍历批次当前边界，为每个身份查找恰好一个不经 symlink 的普通文件 `<字符>.gif` 或 `<字符>.png`。目录不得位于 `decks/` 内；文件只读。字节由与 Yarxi 获取相同的验证器检查：`VERIFIED` 由所有者发布，其他技术上有效的候选进入 `awaiting_human`，再经 `batch ocr`、`review-export` 和人工决定处理。缺少文件（`local_source_missing`）、GIF 与 PNG 并存（`local_source_ambiguous`）、签名与扩展名不符（`media_format_mismatch`）以及空文件或超大文件，都作为技术尝试保存，并受同样的五轮限制。每个结果单独保存，因此中断的导入在下次调用时继续，不会重新处理已记录的字符。候选来源记为 `local_source`（`provider: local-directory`、文件名）；在清单中表现为 `source_kind: local-directory` 和 `domain_metadata.local_source`。文件名只说明以哪个身份读取该文件。
 

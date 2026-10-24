@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 6f5d75ee38773ca04f218bdb0952757c5ddad7b6 -->
+<!-- i18n-source-git-blob: 82ae0340188a9e718be832f7169c157794676a71 -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -598,8 +598,10 @@ registered `VERIFIED` thresholds against all others, `ambiguous` — distance is
 within the threshold but the margin is smaller, `unknown` — the threshold is not
 reached, `corrupt` — the bytes do not decode. This is a proposal, not proof:
 validating a character chosen this way with the same validator is not a second
-independent confirmation. A read error for one file yields an entry with
-`error` and exit code `3`; the other files are still processed.
+independent confirmation. A read error for one file, or an unavailable built-in
+reference catalog (`reference_unavailable`, `font_reference_unavailable`),
+yields an entry with `error` and exit code `3`; the other files are still
+processed.
 
 `batch import --batch-id ID --source-dir DIR` walks the batch's current frontier
 and for each identity looks for exactly one regular `<character>.gif` or

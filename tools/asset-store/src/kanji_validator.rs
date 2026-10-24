@@ -776,10 +776,21 @@ pub struct IdentificationReport {
     pub raster: Option<serde_json::Value>,
 }
 
+/// Сбой встроенного каталога эталонов: байты здесь ни при чём, поэтому это не
+/// `Corrupt`, а ошибка самой процедуры.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentificationFailure {
+    pub code: &'static str,
+    pub message: String,
+}
+
 /// Ранжирует все символы закреплённых каталогов по тому же расстоянию, что и
 /// валидатор: для каждого символа берётся меньшая из дистанций KanjiVG и
 /// (для тёмной плитки) Noto Serif JP. Имя файла и происхождение не используются.
-pub fn identify_media(bytes: &[u8], top: usize) -> IdentificationReport {
+pub fn identify_media(
+    bytes: &[u8],
+    top: usize,
+) -> Result<IdentificationReport, IdentificationFailure> {
     let top = top.clamp(1, MAX_IDENTIFY_CANDIDATES);
     let corrupt = |reason: String| IdentificationReport {
         method_version: IDENTIFY_METHOD_VERSION,
@@ -792,22 +803,30 @@ pub fn identify_media(bytes: &[u8], top: usize) -> IdentificationReport {
         raster: None,
     };
     if bytes.len() > MAX_MEDIA_BYTES {
-        return corrupt(format!(
+        return Ok(corrupt(format!(
             "размер изображения превышает предел декодирования {MAX_MEDIA_BYTES} байт"
-        ));
+        )));
     }
     let raster = match decode_media(bytes) {
         Ok(raster) => raster,
-        Err(reason) => return corrupt(reason),
+        Err(reason) => return Ok(corrupt(reason)),
     };
-    let catalog = match REFERENCE_CATALOG.get_or_init(load_reference_catalog) {
-        Ok(catalog) => catalog,
-        Err(reason) => return corrupt(format!("reference_unavailable: {reason}")),
-    };
+    let catalog = REFERENCE_CATALOG
+        .get_or_init(load_reference_catalog)
+        .as_ref()
+        .map_err(|reason| IdentificationFailure {
+            code: "reference_unavailable",
+            message: reason.clone(),
+        })?;
     let font_catalog = if raster.foreground_polarity == ForegroundPolarity::LightOnDark {
         match NOTO_FONT_REFERENCE_CATALOG.get_or_init(load_noto_font_reference_catalog) {
             Ok(catalog) => Some(catalog),
-            Err(reason) => return corrupt(format!("font_reference_unavailable: {reason}")),
+            Err(reason) => {
+                return Err(IdentificationFailure {
+                    code: "font_reference_unavailable",
+                    message: reason.clone(),
+                });
+            }
         }
     } else {
         None
@@ -878,7 +897,7 @@ pub fn identify_media(bytes: &[u8], top: usize) -> IdentificationReport {
     };
     let proposed = (status == IdentificationStatus::Proposed).then(|| ranked[0].character.clone());
     ranked.truncate(top);
-    IdentificationReport {
+    Ok(IdentificationReport {
         method_version: IDENTIFY_METHOD_VERSION,
         validator: KanjiImageValidator::validator_identity(),
         status,
@@ -900,7 +919,7 @@ pub fn identify_media(bytes: &[u8], top: usize) -> IdentificationReport {
             "max_distance": VERIFIED_MAX_DISTANCE,
             "minimum_margin": VERIFIED_MIN_MARGIN,
         })),
-    }
+    })
 }
 
 fn symmetric_distance_quantized(
@@ -1897,10 +1916,10 @@ mod tests {
         for character in ['元', '木', '漢', '語', '亜'] {
             let mask = reference(character);
             for bytes in [png_for(&mask), gif_for(vec![[0; MASK_BYTES], mask, mask])] {
-                let report = identify_media(&bytes, 5);
+                let report = identify_media(&bytes, 5).unwrap();
                 assert_eq!(
                     report,
-                    identify_media(&bytes, 5),
+                    identify_media(&bytes, 5).unwrap(),
                     "ранжирование детерминировано"
                 );
                 assert_eq!(report.candidates.len(), 5);
@@ -1927,15 +1946,16 @@ mod tests {
 
     #[test]
     fn identify_reports_corrupt_bytes_and_bounds_candidate_count() {
-        let corrupt = identify_media(b"GIF89a\x01\x00", 5);
+        let corrupt = identify_media(b"GIF89a\x01\x00", 5).unwrap();
         assert_eq!(corrupt.status, IdentificationStatus::Corrupt);
         assert!(corrupt.candidates.is_empty() && corrupt.proposed.is_none());
-        let empty = identify_media(&png_for(&[0; MASK_BYTES]), 5);
+        let empty = identify_media(&png_for(&[0; MASK_BYTES]), 5).unwrap();
         assert_eq!(empty.status, IdentificationStatus::Corrupt);
-        let oversized = identify_media(&vec![0; MAX_MEDIA_BYTES + 1], 5);
+        let oversized = identify_media(&vec![0; MAX_MEDIA_BYTES + 1], 5).unwrap();
         assert_eq!(oversized.status, IdentificationStatus::Corrupt);
         assert_eq!(
             identify_media(&png_for(&reference('元')), 99)
+                .unwrap()
                 .candidates
                 .len(),
             MAX_IDENTIFY_CANDIDATES

@@ -443,16 +443,22 @@ fn identify_files(
     let mut counts = std::collections::BTreeMap::<&'static str, usize>::new();
     let mut items = Vec::with_capacity(files.len());
     for path in files {
-        let read = validate_explicit_source(path, protected_roots).and_then(|file| {
-            let mut bytes = Vec::new();
-            file.take(crate::kanji_validator::MAX_MEDIA_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|error| AssetError::io("не удалось прочитать исходный файл", error))?;
-            Ok(bytes)
-        });
+        let read = validate_explicit_source(path, protected_roots)
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(crate::kanji_validator::MAX_MEDIA_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| AssetError::io("не удалось прочитать исходный файл", error))?;
+                Ok(bytes)
+            })
+            .map_err(|error| (error.code.as_str(), error.message))
+            .and_then(|bytes| {
+                crate::kanji_validator::identify_media(&bytes, usize::from(top))
+                    .map(|report| (bytes, report))
+                    .map_err(|failure| (failure.code, failure.message))
+            });
         match read {
-            Ok(bytes) => {
-                let report = crate::kanji_validator::identify_media(&bytes, usize::from(top));
+            Ok((bytes, report)) => {
                 let status = match report.status {
                     crate::kanji_validator::IdentificationStatus::Proposed => "proposed",
                     crate::kanji_validator::IdentificationStatus::Ambiguous => "ambiguous",
@@ -470,11 +476,11 @@ fn identify_files(
                     "identification": report,
                 }));
             }
-            Err(error) => {
+            Err((code, message)) => {
                 *counts.entry("error").or_default() += 1;
                 items.push(serde_json::json!({
                     "path": path.display().to_string(),
-                    "error": {"code": error.code.as_str(), "message": error.message},
+                    "error": {"code": code, "message": message},
                 }));
             }
         }
@@ -561,7 +567,16 @@ fn validate_source_directory(
     }
     for protected_root in protected_roots {
         let lexical_root = normalize_absolute_path(protected_root)?;
-        let canonical_root = std::fs::canonicalize(protected_root).ok();
+        let canonical_root = match std::fs::canonicalize(protected_root) {
+            Ok(root) => Some(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(AssetError::io(
+                    "не удалось проверить защищённый каталог decks",
+                    error,
+                ));
+            }
+        };
         if lexical_source.starts_with(&lexical_root)
             || canonical_root.is_some_and(|root| canonical_source.starts_with(root))
         {
