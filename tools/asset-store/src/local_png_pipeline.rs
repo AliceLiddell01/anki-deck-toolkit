@@ -661,11 +661,10 @@ pub(crate) fn run(store: &AssetStore, options: RunOptions) -> Result<Value, Asse
             taken <= limit
         });
     }
+    // Сведения о составе хранилища остаются в инвентаре, а не в журнале хода.
     work.log(&format!(
-        "local-png run: целей {} (доверенных GIF {}, PNG {}), браузеров {}",
+        "local-png run: целей {}, браузеров {}",
         states.len(),
-        inventory_now.trusted_gif_characters,
-        inventory_now.png_records,
         options.browsers
     ));
 
