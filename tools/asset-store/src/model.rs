@@ -5,7 +5,16 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// Версия формата постоянного манифеста.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 5;
+///
+/// Схема 6 разрешает домену с форматными вариантами (`kanji`) хранить для одной
+/// идентичности по одной независимой записи на формат (`漢.gif` и `漢.png`).
+/// Раскладка файлов и поля записи совпадают со схемой 5.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 6;
+
+/// Первая схема с вложенной канонической раскладкой и закреплённым `domain_id`.
+/// Схемы 3/4 до неё переносятся миграцией раскладки; схема 5 отличается от
+/// текущей только правилом уникальности записей.
+pub const NESTED_LAYOUT_SCHEMA_VERSION: u32 = 5;
 
 /// Логический идентификатор ресурса; имя файла в нём не участвует.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -56,7 +65,7 @@ impl fmt::Display for AssetIdentity {
 }
 
 /// Формат, определённый по сигнатуре байтов независимо от расширения исходника.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectedFormat {
     Png,

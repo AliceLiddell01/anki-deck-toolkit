@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: c90c40b3aca25b5b3a6a9fd3550c94275ca69cc1 -->
+<!-- i18n-source-git-blob: 7993c5c3eab69b2a618a88c7bbcbea9e66e758f2 -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -54,11 +54,11 @@
 
 深色主题证据关联浏览器配色设置、文档类、计算得到的背景颜色与 PNG 像素。至少一个背景像素与观察到的颜色在**每个 RGB 通道**上相差不超过 **8**；至少八个图形像素在至少一个通道上相差**超过 16**。PNG **所有**像素必须 `alpha=255`。此外，所选图形绘制区域之外的所有像素（允许其边缘有一个物理像素的抗锯齿）都必须在同样的容差 8 内与观察到的背景一致：由此实际字节证明边距干净、相邻变体和按钮未被截入、线条和字符不接触 PNG 边缘。边距是原生截图中页面的真实背景，而不是后期绘制的边框。必须有浏览器来源证据。验证器 v6 实现现行绘制/证据契约；早期版本的证据不会继承可信状态，不完整证据或早期形式的证据（例如带有版本 5 的 `graph_count` 和 `graph_union_rect`）返回 `UNCERTAIN`。
 
-清单版本为 `5`。每条记录包括 SHA-256、字节大小、格式、状态、来源、语义判断及 `consumer_filename`；存储整体包括 `domain_id`。自动 `ValidationRecord` 与可选 `HumanAttestation` 绑定准确身份和 SHA。对于音高重音，人的 `Approve` 不能取代自动 `ValidationRecord` 记录：相同字节仍需要一条状态为 `VERIFIED`、且 `validator.id`/`validator.version` 符合 `PitchAccentImageValidator` v6 预期的记录。人工批准无法使旧版、不完整证据或 `REJECTED`、`CORRUPT` 变得可信；汉字领域原有人工批准规则不变。新 SHA 不继承旧字节的决定；替换记录必须按预期旧 SHA 做 compare-and-swap。
+清单版本为 `6`。每条记录包括 SHA-256、字节大小、格式、状态、来源、语义判断及 `consumer_filename`；存储整体包括 `domain_id`。记录按槽位寻址：在汉字领域中槽位是（身份，格式）对，因此同一字符的 `漢.gif` 与 `漢.png` 独立存在，各自拥有 SHA-256、来源、证据和状态。在没有格式变体的领域（音高重音）中，槽位仍等于身份。版本 `5` 的清单在写入模式打开时通过原子替换清单升级为 `6`：只改变 `schema_version` 和修订号，记录、字节、SHA 和决定保持不变。自动 `ValidationRecord` 与可选 `HumanAttestation` 绑定准确身份和 SHA。对于音高重音，人的 `Approve` 不能取代自动 `ValidationRecord` 记录：相同字节仍需要一条状态为 `VERIFIED`、且 `validator.id`/`validator.version` 符合 `PitchAccentImageValidator` v6 预期的记录。人工批准无法使旧版、不完整证据或 `REJECTED`、`CORRUPT` 变得可信；汉字领域原有人工批准规则不变。新 SHA 不继承旧字节的决定；替换记录必须按预期旧 SHA 做 compare-and-swap。它只在槽位内生效：同一身份另一格式记录的预期 SHA 以 `identity_conflict` 拒绝，因此发布 PNG 既不会替换 GIF，也不会撤销对它的信任。
 
 旧版 v3/v4 清单和原先平铺的汉字目录仍可读取。以写入模式打开时会在独占锁内执行版本迁移：通过硬链接保留旧字节、验证 SHA-256、原子更新清单，再删除旧平铺链接。`.tmp/` 中的事务标记允许中断后继续或回滚。未变化的 SHA、`ValidationRecord`、`HumanAttestation` 均保留，无需重新下载。完成后新旧规范路径不会同时存在。CLI JSON 报告 `store.layout_migrated_on_open`。
 
-`AssetStore::read_verified` 仍是兼容读取的汉字 API。其他领域使用 `read_verified_with_policy`；该 API 可通过旧映射读取 v3/v4，并返回明确的消费者文件名，**不修改清单、不创建状态或锁文件、不迁移布局或触发恢复**。只有写入模式打开才会迁移；读取时验证精确字节、校验和、大小、格式、验证器身份及人工决定。
+`AssetStore::read_verified` 仍是兼容读取的汉字 API；对具有两种可信格式的字符返回首选格式：先 GIF，后 PNG。`read_verified_variants_with_policy` 同时读取字符的所有可信格式。其他领域使用 `read_verified_with_policy`；该 API 可通过旧映射读取 v3/v4，并返回明确的消费者文件名，**不修改清单、不创建状态或锁文件、不迁移布局或触发恢复**。只有写入模式打开才会迁移；读取时验证精确字节、校验和、大小、格式、验证器身份及人工决定。
 
 公共批处理运行时负责 `.runtime/batches/<batch-id>` 下安全的文件机制：`NOFOLLOW`、锁、修订号/CAS、原子状态写入、有界读取和按 SHA 寻址的内容。它不依赖 `KanjiBatch`、`KanjiMetrics`、Yarxi 数据或 HTML 报告，这些都由领域适配器负责。纯文本测试状态验证重新打开和读取内容，无需汉字或图片规则。
 
@@ -110,6 +110,7 @@ cargo run --quiet --locked -p asset-store --bin pitch-corpus-gate
 | `intent_id` | 结束事件所引用的意图事件 `event_id` |
 | `manifest_revision` | 规范清单与 `.runtime` 清单的合计修订号 |
 | `previous_sha256`, `new_sha256`, `previous_lifecycle`, `new_lifecycle` | 事件前后的真实状态 |
+| `format` | 具有格式变体的领域中的槽位格式（`gif`、`png`）；其他领域不存在，也不计入 `event_key` |
 | `verified` | 事件后已验证则 `true`，未验证或已删除则 `false`，非单条记录事件为 `null` |
 | `run_id`, `batch_id` | 可选的执行上下文 |
 | `provenance` | 不含路径的 `source_kind:source_name` |
@@ -590,6 +591,50 @@ cargo run --locked --bin kanji-assets -- --output json batch import \
 `identify` 的应答不遵循存储的通用 JSON 应答形式：包含 `schema_version`、`operation`、`outcome`（`completed` 或 `completed_with_errors`）、`method_version`、`validator`、`counts`（按状态与 `error` 统计的条目数）以及按参数顺序排列的 `items[]`。每个条目包含 `path`，以及 `sha256`、`byte_length`、`oversized`、`identification`（含 `status`、`reason`、`proposed`、`margin`、`candidates`、`raster` 的报告）或带 `code` 与 `message` 的 `error` 之一。`--top` 默认为 5（1 到 20）。`ambiguous`、`unknown` 和 `corrupt` 状态本身以退出码 `0` 结束；仅当存在带 `error` 的条目时退出码为 `3`。
 
 `batch import --batch-id ID --source-dir DIR` 遍历批次当前边界，为每个身份查找恰好一个不经 symlink 的普通文件 `<字符>.gif` 或 `<字符>.png`。目录不得位于 `decks/` 内；文件只读。边界在打开存储之前针对已打开的目录描述符检查，文件只相对于该描述符打开：检查之后替换 `DIR` 或其父级路径组件不会重定向读取。字节由与 Yarxi 获取相同的验证器检查：`VERIFIED` 由所有者发布，其他技术上有效的候选进入 `awaiting_human`，再经 `batch ocr`、`review-export` 和人工决定处理。缺少文件（`local_source_missing`）、GIF 与 PNG 并存（`local_source_ambiguous`）、签名与扩展名不符（`media_format_mismatch`）以及空文件或超大文件，都作为技术尝试保存，并受同样的五轮限制。每个结果单独保存，因此中断的导入在下次调用时继续，不会重新处理已记录的字符。候选来源记为 `local_source`（`provider: local-directory`、文件名）；在清单中表现为 `source_kind: local-directory` 和 `domain_metadata.local_source`。文件名只说明以哪个身份读取该文件。
+
+### 本地生成 PNG：`local-png`
+
+`kanji-assets local-png` 在不使用 Yarxi、网络和外部解释器的情况下生成 Yarxi 风格的 174×174 汉字 PNG：系统 Chromium 通过 CDP 使用本地 Noto Serif JP 文件绘制字符，截图以原生 174×174 获取，不做缩放。字体不包含在仓库中；默认只接受已校准的 `NotoSerifJP-Regular.otf` 1.001 版（SHA-256 记录在 `local_render::CALIBRATED_FONT_SHA256`）。其他文件只能通过 `render --allow-uncalibrated-font` 使用，结果标记为未校准；`run` 和发布不接受它。
+
+```bash
+# 在 decks/ 之外的新目录中生成 PNG；存储不变。
+cargo run --locked --bin kanji-assets -- --output json local-png render \
+  --font ./NotoSerifJP-Regular.otf --out ./local-png 亜漢 --raw
+
+# 可恢复的语料库运行：渲染、验证器、盲 OCR、发布。
+cargo run --locked --bin kanji-assets -- --output json local-png run \
+  --font ./NotoSerifJP-Regular.otf --work-dir ./local-png-run --from-corpus --ocr --publish
+
+# 运行后的存储检查及工作目录的 HTML 报告。
+cargo run --locked --bin kanji-assets -- --output json local-png report --work-dir ./local-png-run
+
+# 未通过关卡字符的审查快照及其决定的应用。
+cargo run --locked --bin kanji-assets -- --output json local-png review-export --work-dir ./local-png-run
+cargo run --locked --bin kanji-assets -- --output json local-png review-apply \
+  --work-dir ./local-png-run --review-id <review_id>
+
+# 两个 <字符>.png 目录的相似度指标。
+cargo run --locked --bin kanji-assets -- --output json local-png compare \
+  --reference ./reference --generated ./local-png
+```
+
+算法 `kanji-local-png-v1` 对所有字符使用同一套几何参数，没有按字符的表：字号 70 CSS px，`line-height: 1`，字形偏移 (+0.3125; −4) CSS px，背景 `#222`，1 px `#808080` 边框，字形 `#fff`，`deviceScaleFactor` 2.175。配置 `b`（图块起点 (21.0625; 0.0625) CSS px）为默认；配置 `a`（5.0625; 4.9375）只能通过显式 `--profile a` 选择。随后对边框内的通道应用指数为 1.10 的覆盖率校正。该指数针对 Chromium 的 Linux 光栅化，在冻结的校准字符集上校准，并在独立的保留集上检验；边框不校正。`--raw` 另外保存未校正的截图用于诊断。每张图像都附带证据：字体 SHA-256 与版本、Chromium 版本、配置、几何、校正以及 `CSS.getPlatformFontsForNode` 的结果——字符必须恰好由一个自定义字体绘制。`cmap` 中缺少字形时在启动浏览器之前给出 `glyph_missing`；回退到系统字体、页面发起网络请求、浏览器故障、透明或截图尺寸不符都会产生该字符的错误，而不是图像。`--browsers`（1–4）设置浏览器池。
+
+`run --work-dir DIR` 将每个码位的状态原子写入单独文件 `items/U+XXXX.json`，因此中断的运行可用同一调用继续，不会重做已完成的阶段；`--limit N` 限制每次调用处理的未完成字符数，`progress.log` 显示阶段进度。算法参数记录在 `run.json` 中：以不同字体或配置复用该目录会被拒绝。目标为显式字符，以及使用 `--from-corpus` 时所有具有可信 GIF 或历史 PNG 的字符；`inventory-before.json` 记录首次运行前的存储状态。阶段：
+
+1. 渲染；
+2. 对 PNG 字节运行 `KanjiImageValidator`；
+3. 对有历史 PNG 的字符，与原件副本进行对照比较；存储中的原件不变；
+4. 使用 `--ocr` 时进行盲 OCR：模型只收到图像，预期字符不在请求中，在回答之后才比较；拒绝结果只在 `--rescan` 时重试；
+5. 使用 `--publish`（需要 `--ocr`）时发布——仅当验证器返回 `VERIFIED` 且 OCR 恰好识别出预期字符。
+
+OCR 是附加检查，而不是信任来源：信任来自验证器，OCR 只拦截不一致。`?`、其他字符、超时、`UNCERTAIN` 或 `REJECTED` 进入问题登记且不会自动发布：由下文的第三阶段处理。发布通过 `ingest_verified` 写入空的 PNG 槽位：来源 `source_kind: local-render`，`domain_metadata.local_render` 包含证据和 `not_yarxi_capture: true`。已有的历史 PNG 保留（`existing_original_kept`），被其他 PNG 占用的槽位不会被覆盖（`png_slot_occupied`），GIF 不参与 `compare-and-swap`。对已发布字符重复执行既不改变修订号，也不改变日志。
+
+未通过两个自动阶段的字符进入第三阶段——与 GIF 批次相同，对精确字节作出决定。`review-export` 创建快照 `review/<review_id>/`，其中按组包含 `decisions.tsv` 和 `index.html`：`validator_doubt_ocr_match`（验证器不确定，OCR 一致）、`ocr_mismatch`、`ocr_unrecognized`、`ocr_failed` 和 `validator_doubt_ocr_mismatch`。PNG 槽位已被占用或已作出决定的字符不会进入快照；`review_id` 由行集合（码位与 SHA-256）导出。`decision` 列填写 `approve`、`reject` 或 `-`，空值表示没有决定；`approve` 和 `reject` 需要在 `reason` 中给出依据。`review-apply` 在第一次修改之前检查整个文件：快照、当前渲染的 SHA-256 以及该字符仍需审查。`approve` 与批次中人工决定走同一存储路径：带 `local-render` 来源的 `pending` 候选、精确自动检查以及针对精确 SHA-256 的 `HumanAttestation` `Approve`；字符结果为 `published_after_review`。`reject` 不改变存储（`review_rejected`）。重复已应用的快照不会改变任何内容；发布出错时退出码为 `3`。
+
+`report` 在运行后检查存储：完整性、所有 GIF 和历史 PNG 的 SHA 相对 `inventory-before.json` 未变、GIF 与已发布 PNG 可同时读取、尺寸 174×174 以及日志一致性。它写出 `report/summary.json`、`report/issues.json`（Unicode、预期与识别字符、SHA-256、验证器状态、产物路径）和 `report/index.html`，其中包含对照字符的预览、放大片段和差异图。任一检查失败时退出码为 `3`。工作目录和 `render --out` 目录不能位于 `decks/` 内。
+
+`ensure` 和 `batch` 仍将具有任一可信格式的字符视为就绪并优先使用 GIF：本地 PNG 不会替代 GIF，也不会由普通获取创建。
 
 ### 汉字批处理
 

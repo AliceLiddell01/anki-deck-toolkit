@@ -813,27 +813,29 @@ fn open_existing_recreates_ignored_service_files() {
 }
 
 #[test]
-fn kanji_filename_is_stable_across_cas_and_format_changes_without_duplicate_identity() {
+fn kanji_gif_and_png_are_independent_records_with_format_scoped_cas() {
     let temp = TempDir::new("kanji-stable-cas");
     let root = temp.path().join("store");
     let store = open_kanji_store(&root);
     let identity = AssetIdentity::new("kanji", "元").unwrap();
     let validator = FixedValidator::new(SemanticStatus::Verified);
-    let ingest_verified = |bytes: Vec<u8>, expected: Option<String>, name: &str| {
-        store
-            .ingest_verified(
-                VerifiedIngestRequest {
-                    identity: identity.clone(),
-                    bytes,
-                    provenance: Provenance {
-                        source_kind: "fixture".into(),
-                        source_name: name.into(),
-                    },
-                    domain_metadata: Some(serde_json::json!({ "character": "元" })),
-                    replace_expected_sha256: expected,
+    let publish = |bytes: Vec<u8>, expected: Option<String>, name: &str| {
+        store.ingest_verified(
+            VerifiedIngestRequest {
+                identity: identity.clone(),
+                bytes,
+                provenance: Provenance {
+                    source_kind: "fixture".into(),
+                    source_name: name.into(),
                 },
-                &validator,
-            )
+                domain_metadata: Some(serde_json::json!({ "character": "元" })),
+                replace_expected_sha256: expected,
+            },
+            &validator,
+        )
+    };
+    let ingest_verified = |bytes: Vec<u8>, expected: Option<String>, name: &str| {
+        publish(bytes, expected, name)
             .expect("verified CAS publication succeeds")
             .asset
             .expect("verified asset is canonical")
@@ -841,62 +843,87 @@ fn kanji_filename_is_stable_across_cas_and_format_changes_without_duplicate_iden
 
     let first = ingest_verified(b"GIF89a first bytes".to_vec(), None, "first.gif");
     assert_eq!(first.storage_path, "assets/gif/元.gif");
-    let same_format = ingest_verified(
+    let gif = ingest_verified(
         b"GIF89a replacement bytes".to_vec(),
         Some(first.sha256.clone()),
         "second.gif",
     );
-    assert_eq!(same_format.storage_path, first.storage_path);
-    assert_ne!(same_format.sha256, first.sha256);
+    assert_eq!(gif.storage_path, first.storage_path);
+    assert_ne!(gif.sha256, first.sha256);
     assert_eq!(
-        same_format.validation.as_ref().unwrap().content_sha256,
-        same_format.sha256,
+        gif.validation.as_ref().unwrap().content_sha256,
+        gif.sha256,
         "new semantic evidence remains bound to replacement bytes"
     );
 
-    let png_bytes = [b"\x89PNG\r\n\x1a\n".as_slice(), b"replacement png"].concat();
-    let changed_format = ingest_verified(
-        png_bytes.clone(),
-        Some(same_format.sha256.clone()),
-        "third.png",
-    );
-    assert_eq!(changed_format.format, DetectedFormat::Png);
-    assert_eq!(changed_format.storage_path, "assets/png/元.png");
-    assert_ne!(changed_format.sha256, same_format.sha256);
-    assert!(!root.join("assets/gif/元.gif").exists());
-    assert_eq!(
-        fs::read(root.join(&changed_format.storage_path)).unwrap(),
-        png_bytes
-    );
+    // CAS с SHA записи другого формата — ошибка, а не разрешение заменить GIF.
+    let png_bytes = [b"\x89PNG\r\n\x1a\n".as_slice(), b"independent png"].concat();
+    let cross = publish(png_bytes.clone(), Some(gif.sha256.clone()), "cross.png")
+        .expect_err("CAS другого формата отклоняется");
+    assert_eq!(cross.code, ErrorCode::IdentityConflict);
+    assert_eq!(cross.details["existing_format"], "gif");
 
-    let stale_cas = store
-        .ingest_verified(
-            VerifiedIngestRequest {
-                identity: identity.clone(),
-                bytes: b"GIF89a stale update".to_vec(),
-                provenance: Provenance {
-                    source_kind: "fixture".into(),
-                    source_name: "stale.gif".into(),
-                },
-                domain_metadata: None,
-                replace_expected_sha256: Some(first.sha256),
-            },
-            &validator,
-        )
-        .expect_err("устаревший expected hash блокируется CAS");
+    // Без CAS PNG становится отдельной записью; GIF и его SHA не меняются.
+    let png = ingest_verified(png_bytes.clone(), None, "third.png");
+    assert_eq!(png.format, DetectedFormat::Png);
+    assert_eq!(png.storage_path, "assets/png/元.png");
+    assert_eq!(png.consumer_filename, "元.png");
+    assert_eq!(
+        fs::read(root.join(&gif.storage_path)).unwrap(),
+        b"GIF89a replacement bytes"
+    );
+    assert_eq!(fs::read(root.join(&png.storage_path)).unwrap(), png_bytes);
+
+    // Повтор тех же PNG-байтов — no-op, а не вторая запись.
+    let repeated = publish(png_bytes.clone(), None, "third.png").unwrap();
+    assert!(!repeated.changed);
+
+    let stale_cas = publish(
+        b"GIF89a stale update".to_vec(),
+        Some(first.sha256.clone()),
+        "stale.gif",
+    )
+    .expect_err("устаревший expected hash блокируется CAS");
     assert_eq!(stale_cas.code, ErrorCode::IdentityConflict);
 
     let records = store
         .verify_integrity()
         .expect("canonical state remains valid");
-    assert_eq!(records.len(), 1, "identity сохраняется уникальной");
-    assert_eq!(records[0].storage_path, "assets/png/元.png");
-    assert_eq!(records[0].sha256, changed_format.sha256);
-    let filenames: Vec<_> = fs::read_dir(root.join("assets"))
+    assert_eq!(records.len(), 2, "по одной записи на формат");
+    let formats: Vec<_> = records.iter().map(|record| record.format).collect();
+    assert!(formats.contains(&DetectedFormat::Gif) && formats.contains(&DetectedFormat::Png));
+    let mut directories: Vec<_> = fs::read_dir(root.join("assets"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(filenames, ["png"]);
+    directories.sort();
+    assert_eq!(directories, ["gif", "png"]);
+
+    // Чтение без формата предпочитает подлинный GIF; явный формат даёт PNG.
+    let preferred = AssetStore::read_verified(
+        &root,
+        std::slice::from_ref(&identity),
+        &validator.identity(),
+    )
+    .unwrap();
+    assert_eq!(preferred[0].record.sha256, gif.sha256);
+    let explicit = AssetStore::read_verified_variants_with_policy(
+        &root,
+        &[
+            (identity.clone(), DetectedFormat::Png),
+            (identity.clone(), DetectedFormat::Gif),
+        ],
+        &validator.identity(),
+        &asset_store::KanjiDomainPolicy,
+    )
+    .unwrap();
+    assert_eq!(explicit[0].bytes, png_bytes);
+    assert_eq!(explicit[1].record.sha256, gif.sha256);
+
+    // Повторное открытие сохраняет обе записи.
+    drop(store);
+    let reopened = open_kanji_store(&root);
+    assert_eq!(reopened.verify_integrity().unwrap().len(), 2);
 }
 
 #[test]
@@ -1250,7 +1277,7 @@ fn flat_kanji_schema_v3_v4_migrate_without_reacquisition_or_trust_loss() {
         assert_eq!(fs::read(nested_path).unwrap(), VALID_GIF);
         let migrated_manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        assert_eq!(migrated_manifest["schema_version"], 5);
+        assert_eq!(migrated_manifest["schema_version"], 6);
         assert_eq!(migrated_manifest["domain_id"], "kanji");
     }
 }
@@ -1289,7 +1316,7 @@ fn empty_legacy_schema_v4_is_kanji_only_and_migrates_once() {
     assert!(migrated.layout_migrated_on_open());
     let migrated_manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    assert_eq!(migrated_manifest["schema_version"], serde_json::json!(5));
+    assert_eq!(migrated_manifest["schema_version"], serde_json::json!(6));
     assert_eq!(migrated_manifest["domain_id"], "kanji");
     drop(migrated);
 
@@ -1768,4 +1795,171 @@ fn verified_without_nonempty_evidence_is_rejected() {
     let record = open_store(&root).verify_integrity().unwrap().remove(0);
     assert_eq!(record.lifecycle, LifecycleState::Pending);
     assert!(record.validation.is_none());
+}
+
+fn publish_fixture(
+    store: &AssetStore,
+    identity: &AssetIdentity,
+    bytes: &[u8],
+    expected: Option<String>,
+) -> Result<asset_store::store::VerifiedIngestOutcome, asset_store::AssetError> {
+    store.ingest_verified(
+        VerifiedIngestRequest {
+            identity: identity.clone(),
+            bytes: bytes.to_vec(),
+            provenance: Provenance {
+                source_kind: "fixture".into(),
+                source_name: "fixture.bin".into(),
+            },
+            domain_metadata: None,
+            replace_expected_sha256: expected,
+        },
+        &FixedValidator::new(SemanticStatus::Verified),
+    )
+}
+
+#[test]
+fn schema_v5_upgrades_to_format_keys_without_changing_bytes_or_decisions() {
+    let temp = TempDir::new("schema-v5-upgrade");
+    let root = temp.path().join("store");
+    let store = open_kanji_store(&root);
+    let identity = AssetIdentity::new("kanji", "元").unwrap();
+    // Решение человека требует полностью декодируемого изображения.
+    let gif_bytes = {
+        let mut bytes = Vec::new();
+        let mut encoder = gif::Encoder::new(&mut bytes, 2, 2, &[0, 0, 0, 255, 255, 255]).unwrap();
+        encoder
+            .write_frame(&gif::Frame {
+                width: 2,
+                height: 2,
+                buffer: std::borrow::Cow::Borrowed(&[0, 1, 1, 0]),
+                ..gif::Frame::default()
+            })
+            .unwrap();
+        drop(encoder);
+        bytes
+    };
+    let gif = publish_fixture(&store, &identity, &gif_bytes, None)
+        .unwrap()
+        .asset
+        .unwrap();
+    store
+        .attest(asset_store::store::HumanAttestationRequest {
+            identity: identity.clone(),
+            expected_sha256: gif.sha256.clone(),
+            decision: asset_store::HumanDecision::Approve,
+            reason: "проверено человеком".into(),
+        })
+        .unwrap();
+    drop(store);
+
+    // Состояние предыдущей версии: та же раскладка, но схема 5.
+    for manifest_path in [
+        root.join("manifest.json"),
+        root.join(".runtime/manifest.json"),
+    ] {
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["schema_version"] = serde_json::json!(5);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+    let manifest_path = root.join("manifest.json");
+    let v5_bytes = fs::read(&manifest_path).unwrap();
+    let v5: serde_json::Value = serde_json::from_slice(&v5_bytes).unwrap();
+
+    // Чтение только для чтения не меняет манифест схемы 5.
+    let read = AssetStore::read_verified(
+        &root,
+        std::slice::from_ref(&identity),
+        &publishable_validator(),
+    )
+    .unwrap();
+    assert_eq!(read[0].bytes, gif_bytes);
+    assert_eq!(fs::read(&manifest_path).unwrap(), v5_bytes);
+
+    let store = open_kanji_store(&root);
+    assert!(store.layout_migrated_on_open());
+    let v6: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(v6["schema_version"], 6);
+    assert_eq!(
+        v6["assets"], v5["assets"],
+        "записи, SHA и решения не меняются"
+    );
+    assert_eq!(
+        v6["revision"].as_u64().unwrap(),
+        v5["revision"].as_u64().unwrap() + 1
+    );
+    assert_eq!(fs::read(root.join("assets/gif/元.gif")).unwrap(), gif_bytes);
+
+    // После перехода PNG того же символа — отдельная запись; GIF не меняется.
+    let png_bytes = [b"\x89PNG\r\n\x1a\n".as_slice(), b"local render"].concat();
+    let png = publish_fixture(&store, &identity, &png_bytes, None)
+        .unwrap()
+        .asset
+        .unwrap();
+    assert_eq!(png.consumer_filename, "元.png");
+    let records = store.verify_integrity().unwrap();
+    assert_eq!(records.len(), 2);
+    let kept_gif = records
+        .iter()
+        .find(|record| record.format == DetectedFormat::Gif)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(kept_gif).unwrap(),
+        v5["assets"][0],
+        "GIF, его SHA и решение человека сохранены"
+    );
+
+    // Событие публикации PNG знает свой слот; журнал согласован.
+    let events = store.journal_events(None, Some("元"), None).unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.format, Some(DetectedFormat::Png));
+    assert_eq!(last.new_sha256.as_deref(), Some(png.sha256.as_str()));
+    assert!(store.journal_check().unwrap().is_clean());
+    drop(store);
+    assert!(!open_kanji_store(&root).layout_migrated_on_open());
+}
+
+#[test]
+fn runtime_candidate_of_other_format_coexists_with_published_record() {
+    let temp = TempDir::new("cross-format-runtime");
+    let root = temp.path().join("store");
+    let store = open_kanji_store(&root);
+    let identity = AssetIdentity::new("kanji", "字").unwrap();
+    let png_bytes = [b"\x89PNG\r\n\x1a\n".as_slice(), b"published png"].concat();
+    publish_fixture(&store, &identity, &png_bytes, None).unwrap();
+    let source = temp.path().join("candidate.gif");
+    fs::write(&source, b"GIF89a pending candidate").unwrap();
+    let candidate = store
+        .ingest(IngestRequest {
+            identity: identity.clone(),
+            source_path: source,
+            expected_source_sha256: None,
+            domain_metadata: None,
+            replace_expected_sha256: None,
+        })
+        .unwrap();
+    assert!(
+        candidate.previous.is_none(),
+        "GIF-кандидат не вытесняет PNG"
+    );
+    assert_eq!(candidate.asset.lifecycle, LifecycleState::Pending);
+    let records = store.verify_integrity().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(fs::read(root.join("assets/png/字.png")).is_ok());
+    assert!(AssetStore::verify_publishable_corpus(&root, &publishable_validator()).is_ok());
+    let read = AssetStore::read_verified(
+        &root,
+        std::slice::from_ref(&identity),
+        &publishable_validator(),
+    )
+    .unwrap();
+    assert_eq!(
+        read[0].bytes, png_bytes,
+        "недоверенный GIF не вытесняет доверенный PNG"
+    );
 }

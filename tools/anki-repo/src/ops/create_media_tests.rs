@@ -773,12 +773,14 @@ fn pinned_missing_asset_and_filename_drift_are_stale_before_destination_checks()
         "stale_pinned_asset",
     );
 
+    // Форматы — независимые записи: появление доверенного GIF рядом с PNG
+    // меняет предпочтительное имя файла, и закреплённый запрос устаревает.
     let f = Fixture::new();
-    let old = f.asset("一", GIF, None);
-    let request = f.resolved_request(&["<img src=一.gif>"]);
+    f.asset("一", PNG, None);
+    let request = f.resolved_request(&["<img src=一.png>"]);
     fs::create_dir(f.export.join("media")).unwrap();
-    fs::write(f.export.join("media/一.gif"), GIF).unwrap();
-    f.asset("一", PNG, Some(old));
+    fs::write(f.export.join("media/一.png"), PNG).unwrap();
+    f.asset("一", GIF, None);
     reason(
         &create_with_options(&f.export, &request, true, None, &f.options).unwrap_err(),
         "stale_pinned_asset",
