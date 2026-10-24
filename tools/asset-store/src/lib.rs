@@ -33,6 +33,7 @@ mod kanji_ocr;
 mod kanji_review;
 pub mod kanji_validator;
 mod llama_server;
+pub mod local_render;
 pub mod model;
 pub mod pitch_accent;
 pub mod pitch_batch;

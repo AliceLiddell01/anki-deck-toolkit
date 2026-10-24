@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: c90c40b3aca25b5b3a6a9fd3550c94275ca69cc1 -->
+<!-- i18n-source-git-blob: 3880a7477f2ea1d2b201e758bca0d700566f0ae6 -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -54,11 +54,11 @@ Every PNG contains **exactly one** graph. `evidence.variant_selection` records a
 
 Dark-mode evidence links browser color-scheme settings, document class, computed background and PNG pixels. At least one background pixel must differ by no more than 8 per RGB channel from the observed color, and at least eight graph pixels must differ by more than 16 in some channel. Every PNG pixel must have `alpha=255`. In addition, every pixel outside the selected graph's painted area (allowing one physical pixel of antialiasing at its edge) must match the observed background within the same tolerance of 8: the actual bytes thus prove that the margins are clean, that neighboring variants and buttons are not captured, and that lines and glyphs do not touch the PNG edges. The margins are the page's genuine background from the native capture, not a drawn border. Browser provenance is compulsory. Validator v6 enforces the current rendering contract: proof from earlier versions does not inherit trust; incomplete proof, or proof in an earlier shape (for example with version 5 `graph_count` and `graph_union_rect`), yields `UNCERTAIN`.
 
-Manifest schema is version `5`. In addition to SHA-256, byte size, format, state, origin and semantic decision, each entry has `consumer_filename`, and the store has `domain_id`. Automatic `ValidationRecord` and optional `HumanAttestation` bind to exact identity and SHA. For pitch-accent, a human `Approve` does not replace the automatic `ValidationRecord`: the same bytes still require a record with status `VERIFIED` and the expected `validator.id`/`validator.version` for `PitchAccentImageValidator` v6. Human approval cannot rehabilitate old/incomplete evidence or `REJECTED`/`CORRUPT`; Kanji's existing approval policy remains unchanged. New bytes never inherit trust from a previous SHA, and record replacement requires compare-and-swap using the expected old SHA.
+Manifest schema is version `6`. In addition to SHA-256, byte size, format, state, origin and semantic decision, each entry has `consumer_filename`, and the store has `domain_id`. An entry is addressed by its slot: in the Kanji domain this is the pair (identity, format), so `漢.gif` and `漢.png` exist independently for one character, each with its own SHA-256, origin, evidence, and state. In domains without format variants (pitch-accent) the slot still equals the identity. A schema `5` manifest moves to `6` on a mutating open by atomic manifest replacement: only `schema_version` and the revision change; entries, bytes, SHA, and decisions are kept. Automatic `ValidationRecord` and optional `HumanAttestation` bind to exact identity and SHA. For pitch-accent, a human `Approve` does not replace the automatic `ValidationRecord`: the same bytes still require a record with status `VERIFIED` and the expected `validator.id`/`validator.version` for `PitchAccentImageValidator` v6. Human approval cannot rehabilitate old/incomplete evidence or `REJECTED`/`CORRUPT`; Kanji's existing approval policy remains unchanged. New bytes never inherit trust from a previous SHA, and record replacement requires compare-and-swap using the expected old SHA. It applies only within a slot: an expected SHA of another format's entry for the same identity is rejected as `identity_conflict`, so publishing a PNG neither replaces nor revokes trust in the GIF.
 
 Schema v3/v4 and the legacy flat Kanji layout can be read. A mutating open performs versioned migration under an exclusive lock: preserves old bytes with hard links, checks SHA-256, atomically updates the manifest and removes old flat links. `.tmp/` transaction markers support completion or rollback after interruption. Unchanged SHA, `ValidationRecord`, and `HumanAttestation` remain, without refetching. After commit, old/new canonical paths do not coexist. CLI JSON reports `store.layout_migrated_on_open`.
 
-`AssetStore::read_verified` remains a read API compatible with `KanjiDomainPolicy`. Other domains use `read_verified_with_policy`, which can read v3/v4 with legacy mapping and return the explicit consumer filename without modifying manifests, making state/lock files, changing layout, or performing recovery. Only a mutating open migrates. Exact bytes, checksum, size, format, validator identity, and human decision are checked.
+`AssetStore::read_verified` remains a read API compatible with `KanjiDomainPolicy` and, for a character with two trusted formats, returns the preferred one: GIF, then PNG. `read_verified_variants_with_policy` reads all trusted formats of a character together. Other domains use `read_verified_with_policy`, which can read v3/v4 with legacy mapping and return the explicit consumer filename without modifying manifests, making state/lock files, changing layout, or performing recovery. Only a mutating open migrates. Exact bytes, checksum, size, format, validator identity, and human decision are checked. Every read call takes a shared lock and re-validates the whole manifest and every corpus file, so read many assets as one batch rather than one call per asset. `visit_verified_variants_with_policy` streams a batch under one lock and one full validation: a store-wide error is returned before the first result, a per-request error is passed to the visitor with the request index without aborting the batch, and bytes are not accumulated in memory.
 
 The shared batch runtime owns safe filesystem operations under `.runtime/batches/<batch-id>`: `NOFOLLOW`, locks, revisions/CAS, atomic state writes, bounded reads, and SHA-addressed payloads. It does not know about `KanjiBatch`, `KanjiMetrics`, Yarxi data, or HTML reports: domain adapters own those. A plain-text test state exercises reopening and reading blobs without kanji or image semantics.
 
@@ -110,6 +110,7 @@ Full reads are capped at 256 MiB. Larger journals make `journal list`, `journal 
 | `intent_id` | Closing event's reference to the intent `event_id` |
 | `manifest_revision` | Combined revision of canonical and `.runtime` manifests |
 | `previous_sha256`, `new_sha256`, `previous_lifecycle`, `new_lifecycle` | Before/after record state |
+| `format` | slot format (`gif`, `png`) for domains with format variants; absent otherwise and not part of `event_key` |
 | `verified` | `true` if verified after event, `false` if unverified/removed, `null` if not about a single record |
 | `run_id`, `batch_id` | Optional execution context |
 | `provenance` | `source_kind:source_name`, no paths |
@@ -631,6 +632,50 @@ reprocessing recorded characters. The candidate provenance is `local_source`
 (`provider: local-directory`, file name); in the manifest it appears as
 `source_kind: local-directory` and `domain_metadata.local_source`. The file name
 only states under which identity the file was read.
+
+### Local PNG generation: `local-png`
+
+`kanji-assets local-png` builds Yarxi-style 174×174 kanji PNGs without Yarxi, the network, or external interpreters: the system Chromium draws the character over CDP with a local Noto Serif JP file, and the screenshot is taken natively at 174×174 without scaling. The calibrated `NotoSerifJP-Regular.otf` version 1.001 is stored in `tools/asset-store/fonts/` together with the SIL Open Font License 1.1 text (`OFL.txt`) and is used by default relative to `--repository-root`; `--font` sets another path. Only a file with the calibrated SHA-256 is accepted (`local_render::CALIBRATED_FONT_SHA256`; a test pins its match with the repository file). Another file is allowed only by `render --allow-uncalibrated-font`, and such output is marked uncalibrated; `run` and publication do not accept it.
+
+```bash
+# Generate PNGs into a new directory outside decks/; the store is not changed.
+cargo run --locked --bin kanji-assets -- --output json local-png render \
+  --out ./local-png 亜漢 --raw
+
+# Resumable corpus run: render, validator, blind OCR, publication.
+cargo run --locked --bin kanji-assets -- --output json local-png run \
+  --work-dir ./local-png-run --from-corpus --ocr --publish
+
+# Post-run store check and HTML report of the work directory.
+cargo run --locked --bin kanji-assets -- --output json local-png report --work-dir ./local-png-run
+
+# Review snapshot of characters that missed the gates, and applying its decisions.
+cargo run --locked --bin kanji-assets -- --output json local-png review-export --work-dir ./local-png-run
+cargo run --locked --bin kanji-assets -- --output json local-png review-apply \
+  --work-dir ./local-png-run --review-id <review_id>
+
+# Similarity metrics for two <character>.png directories.
+cargo run --locked --bin kanji-assets -- --output json local-png compare \
+  --reference ./reference --generated ./local-png
+```
+
+Algorithm `kanji-local-png-v1` fixes one geometry for all characters, with no per-character tables: font 70 CSS px, `line-height: 1`, glyph offset (+0.3125; −4) CSS px, background `#222`, 1 px `#808080` border, glyph `#fff`, `deviceScaleFactor` 2.175. Profile `b` (tile origin (21.0625; 0.0625) CSS px) is the default; profile `a` (5.0625; 4.9375) is selected only by an explicit `--profile a`. A coverage correction with exponent 1.10 is then applied to the channels inside the border. The exponent is calibrated for Chromium's Linux rasterization on a frozen calibration set and checked on a separate held-out set; the border is not corrected. `--raw` additionally saves the uncorrected screenshot for diagnostics. Each image carries evidence: font SHA-256 and version, Chromium version, profile, geometry, correction, and the `CSS.getPlatformFontsForNode` answer — the character must be drawn by exactly one custom font. A glyph missing from `cmap` yields `glyph_missing` before the browser starts; a system-font fallback, a network request from the page, a browser failure, transparency, or a different screenshot size yields a per-character error rather than an image. `--browsers` (1–4) sets the browser pool.
+
+`run --work-dir DIR` keeps the state of every code point in its own file `items/U+XXXX.json`, written atomically, so an interrupted run continues with the same call without redoing finished stages; `--limit N` caps unfinished characters per call, and `progress.log` shows stage progress. Algorithm parameters are recorded in `run.json`: reusing the directory with a different font or profile is refused. Targets are explicit characters and, with `--from-corpus`, every character with a trusted GIF or a historical PNG; `inventory-before.json` records the store state before the first run. Stages:
+
+1. render;
+2. `KanjiImageValidator` on the PNG bytes;
+3. for a character with a historical PNG, a control comparison against a copy of the original; the original in the store is not changed;
+4. with `--ocr`, blind OCR: the model receives only the image, the expected character is not part of the request and is compared after the answer; refusals are retried only with `--rescan`;
+5. with `--publish` (requires `--ocr`), publication — only if the validator returned `VERIFIED` and OCR recognized exactly the expected character.
+
+OCR is an additional check, not a source of trust: trust comes from the validator, OCR only blocks mismatches. `?`, another character, a timeout, `UNCERTAIN`, or `REJECTED` go to the issue register and are not published automatically: the third stage below handles them. Publication goes through `ingest_verified` into an empty PNG slot: origin `source_kind: local-render`, `domain_metadata.local_render` with evidence and `not_yarxi_capture: true`. An existing historical PNG is kept (`existing_original_kept`), a slot occupied by another PNG is not overwritten (`png_slot_occupied`), and the GIF does not take part in `compare-and-swap`. Repeating an already published character changes neither the revision nor the journal.
+
+Characters that missed both automatic stages go to the third stage — a decision on exact bytes, as for GIF batches. `review-export` creates the snapshot `review/<review_id>/` with `decisions.tsv` and `index.html` by group: `validator_doubt_ocr_match` (validator unsure, OCR matched), `ocr_mismatch`, `ocr_unrecognized`, `ocr_failed`, and `validator_doubt_ocr_mismatch`. Characters with an occupied PNG slot and already decided ones are not included; `review_id` is derived from the row set (code point and SHA-256). The `decision` column takes `approve`, `reject`, or `-`; an empty value means no decision; `approve` and `reject` require a basis in `reason`. `review-apply` checks the whole file before the first change: the snapshot, the SHA-256 of the current render, and that the character still needs review. `approve` follows the same store path as a human decision in a batch: a `pending` candidate with `local-render` origin, an exact automatic check, and a `HumanAttestation` `Approve` for the exact SHA-256; the character outcome is `published_after_review`. `reject` does not change the store (`review_rejected`). Repeating an applied snapshot changes nothing; exit code `3` signals a publication error.
+
+`report` checks the store after the run: integrity, unchanged SHA of every GIF and historical PNG relative to `inventory-before.json`, reading GIF and the published PNG together, 174×174 size, and journal consistency. It writes `report/summary.json`, `report/issues.json` (Unicode, expected and recognized character, SHA-256, validator status, artifact path), and `report/index.html` with previews, enlarged fragments, and difference maps for control characters. Exit code `3` is returned when any of these checks fails. The work directory and the `render --out` directory cannot be inside `decks/`.
+
+`ensure` and `batch` still treat a character as ready with any trusted format and prefer GIF: a local PNG does not replace a GIF and is not created by ordinary acquisition.
 
 ### Kanji batch processing
 

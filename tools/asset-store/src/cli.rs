@@ -32,6 +32,13 @@ mod review_ui;
 mod batch_cli;
 pub use batch_cli::{BatchActionArg, BatchCommand};
 
+#[path = "local_png_cli.rs"]
+mod local_png_cli;
+pub use local_png_cli::LocalPngCommand;
+
+#[path = "local_png_pipeline.rs"]
+mod local_png_pipeline;
+
 /// Командная строка `kanji-assets`.
 #[derive(Debug, Parser)]
 #[command(
@@ -123,6 +130,11 @@ pub enum Command {
     Journal {
         #[command(subcommand)]
         command: JournalCommand,
+    },
+    /// Локальный рендер PNG кандзи в стиле плитки Yarxi без обращения к сайту.
+    LocalPng {
+        #[command(subcommand)]
+        command: LocalPngCommand,
     },
     /// Конфигурация и диагностика локального inference (общая с `pitch-assets`).
     Inference {
@@ -301,6 +313,14 @@ pub fn execute(mut cli: Cli) -> CliOutput {
             }
         }
         return render_identify(identify_files(files, *top, &protected_roots), cli.output);
+    }
+    if let Command::LocalPng { command } = &cli.command {
+        for path in command.paths() {
+            protected_roots.extend(discover_decks_roots(path));
+        }
+        let result =
+            local_png_cli::execute(command, &store_path, &protected_roots, &cli.repository_root);
+        return render_local_png(operation, result, cli.output);
     }
     let prevalidated = match &cli.command {
         Command::Ingest {
@@ -508,6 +528,37 @@ fn identify_files(
         }),
         if failed { 3 } else { 0 },
     )
+}
+
+fn render_local_png(
+    operation: String,
+    result: Result<(serde_json::Value, u8), AssetError>,
+    format: OutputFormat,
+) -> CliOutput {
+    let (value, exit_code) = match result {
+        Ok(result) => result,
+        Err(error) => (
+            serde_json::json!({
+                "schema_version": 1,
+                "operation": operation,
+                "outcome": "failed",
+                "error": {"code": error.code.as_str(), "message": error.message},
+            }),
+            error.exit_code(),
+        ),
+    };
+    let stdout = match format {
+        OutputFormat::Json => format!(
+            "{}\n",
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
+        ),
+        OutputFormat::Human => local_png_cli::human_summary(&value),
+    };
+    CliOutput {
+        stdout,
+        stderr: String::new(),
+        exit_code,
+    }
 }
 
 fn render_identify((value, exit_code): (serde_json::Value, u8), format: OutputFormat) -> CliOutput {
@@ -723,6 +774,7 @@ impl Command {
             Self::Journal { command } => command.operation_name(),
             Self::Batch { command } => command.operation(),
             Self::Inference { command } => command.operation(),
+            Self::LocalPng { command } => command.operation(),
         }
     }
 }
@@ -872,6 +924,7 @@ fn execute_with_store(
         Command::Journal { command } => execute_journal(store, store_summary, command),
         Command::Inference { .. } => unreachable!("inference исполняется без хранилища"),
         Command::Identify { .. } => unreachable!("identify исполняется без хранилища"),
+        Command::LocalPng { .. } => unreachable!("local-png открывает хранилище самостоятельно"),
         Command::Validate { mode } => {
             let selection_mode: SelectionMode = mode.into();
             let validator = KanjiImageValidator::new();
@@ -1055,12 +1108,18 @@ fn ensure_characters(
     let mut blockers = Vec::new();
 
     for character in &characters {
+        // У символа могут быть независимые GIF и PNG; достаточно любого
+        // доверенного (GIF предпочтительнее), чтобы не обращаться к Yarxi.
+        let trusted = |asset: &&AssetRecord| {
+            asset.identity == character.identity()
+                && asset.lifecycle == LifecycleState::Verified
+                && asset.is_trusted_for(&validator_id)
+        };
         let existing = current
             .iter()
-            .find(|asset| asset.identity == character.identity());
-        let is_current = existing.is_some_and(|asset| {
-            asset.lifecycle == LifecycleState::Verified && asset.is_trusted_for(&validator_id)
-        });
+            .filter(trusted)
+            .min_by_key(|asset| asset.format != DetectedFormat::Gif);
+        let is_current = existing.is_some();
         if is_current {
             let mut summary =
                 summary_for_current(existing.expect("подтверждённая запись существует").clone());
@@ -1133,6 +1192,13 @@ fn ensure_characters(
                         SelectionResult::LeftmostPngFallback => "yarxi-leftmost.png",
                         SelectionResult::RenderedFontSamplePng => "yarxi-font-sample.png",
                     };
+                    // CAS действует только внутри записи того же формата: PNG
+                    // не заменяет GIF символа и наоборот.
+                    let acquired_format = DetectedFormat::from_signature(&media.bytes);
+                    let same_format = current.iter().find(|asset| {
+                        asset.identity == KanjiCharacter(character.clone()).identity()
+                            && asset.format == acquired_format
+                    });
                     let request = VerifiedIngestRequest {
                         identity: KanjiCharacter(character.clone()).identity(),
                         bytes: media.bytes.clone(),
@@ -1141,7 +1207,7 @@ fn ensure_characters(
                             source_name: source_name.into(),
                         },
                         domain_metadata: Some(metadata.clone()),
-                        replace_expected_sha256: old.map(|asset| asset.sha256.clone()),
+                        replace_expected_sha256: same_format.map(|asset| asset.sha256.clone()),
                     };
                     match store.ingest_verified(request, &validator) {
                         Ok(outcome) => {
@@ -1151,10 +1217,10 @@ fn ensure_characters(
                                     effective_status: Some(outcome.status),
                                     human_decision: None,
                                     identity: KanjiCharacter(character.clone()).identity(),
-                                    from_state: old.map(|asset| asset.lifecycle),
+                                    from_state: same_format.map(|asset| asset.lifecycle),
                                     to_state: None,
                                     sha256: Some(outcome.sha256),
-                                    previous_sha256: old.map(|asset| asset.sha256.clone()),
+                                    previous_sha256: same_format.map(|asset| asset.sha256.clone()),
                                     validation_status: Some(outcome.status),
                                     validator: Some(validator_id.clone()),
                                     evidence: outcome.evidence,
@@ -1165,7 +1231,8 @@ fn ensure_characters(
                             } else if let Some(record) = outcome.asset {
                                 let mut summary = summary_for_current(record);
                                 summary.changed = outcome.changed;
-                                summary.previous_sha256 = old.map(|asset| asset.sha256.clone());
+                                summary.previous_sha256 =
+                                    same_format.map(|asset| asset.sha256.clone());
                                 summary.item_outcome = Some(if outcome.changed {
                                     "verified_published".into()
                                 } else {

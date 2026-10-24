@@ -137,6 +137,19 @@ pub trait AssetDomainPolicy: std::fmt::Debug + Send + Sync {
         true
     }
 
+    /// Может ли одна идентичность иметь по независимой записи на каждый
+    /// публикуемый формат. Тогда ключ записи — пара «идентичность, формат», а
+    /// замена по CAS действует только внутри записи того же формата.
+    fn allows_format_variants(&self) -> bool {
+        false
+    }
+
+    /// Порядок предпочтения форматов, когда потребитель запрашивает
+    /// идентичность без формата. Пустой список — формат не различается.
+    fn format_preference(&self) -> &'static [DetectedFormat] {
+        &[]
+    }
+
     /// Доменный предел размера ресурса, если он установлен.
     fn max_asset_bytes(&self) -> Option<u64>;
 
@@ -332,6 +345,16 @@ impl AssetDomainPolicy for KanjiDomainPolicy {
 
     fn allows_verified_format(&self, format: DetectedFormat) -> bool {
         matches!(format, DetectedFormat::Gif | DetectedFormat::Png)
+    }
+
+    /// `漢.gif` и `漢.png` — независимые записи одного символа.
+    fn allows_format_variants(&self) -> bool {
+        true
+    }
+
+    /// Подлинный GIF предпочтительнее PNG, если вызывающий не указал формат.
+    fn format_preference(&self) -> &'static [DetectedFormat] {
+        &[DetectedFormat::Gif, DetectedFormat::Png]
     }
 
     fn max_asset_bytes(&self) -> Option<u64> {

@@ -29,11 +29,11 @@ unicode-normalization = "0.1.24"
 url = { version = "2", features = ["serde"] }
 reqwest = { version = "0.13.5", default-features = false }
 resvg = { version = "0.48.1", default-features = false, features = ["text"], optional = true }
-skrifa = { version = "0.44", default-features = false, features = ["std"], optional = true }
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
 zip = { version = "9.0.0", default-features = false }
 
 [features]
-reference-generator = ["dep:resvg", "dep:skrifa"]
+reference-generator = ["dep:resvg"]
 session-rotation-acceptance = []
 
 [dev-dependencies]

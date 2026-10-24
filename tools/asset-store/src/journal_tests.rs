@@ -412,7 +412,11 @@ fn recovery_facts_survive_a_failing_reconciliation() {
         .unwrap()
         .asset
         .unwrap();
-    fixture.publish(&marker, CANDIDATE_BYTES).unwrap();
+    let marker_record = fixture
+        .publish(&marker, CANDIDATE_BYTES)
+        .unwrap()
+        .asset
+        .unwrap();
 
     // Смерть процесса между фиксацией удаления и снятием байтов: открытие
     // завершит удаление и обязано записать событие о нём.
@@ -431,11 +435,12 @@ fn recovery_facts_survive_a_failing_reconciliation() {
     }
     // Второй сбой — расхождение transition marker: сверка откажет уже после
     // того, как восстановление удаления состоялось.
+    let mut mismatched = marker_record.clone();
+    mismatched.sha256 = "a".repeat(64);
     begin_transition(
         &fixture.store.root_handle,
-        &marker,
+        &mismatched,
         TransitionTarget::Canonical,
-        &"a".repeat(64),
     )
     .unwrap();
 

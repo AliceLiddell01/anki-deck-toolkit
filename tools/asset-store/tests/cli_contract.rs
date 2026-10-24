@@ -411,7 +411,7 @@ fn cli_json_reports_layout_migration_only_on_the_migrating_open() {
     assert_eq!(first_json["store"]["layout_migrated_on_open"], true);
     let migrated_manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    assert_eq!(migrated_manifest["schema_version"], 5);
+    assert_eq!(migrated_manifest["schema_version"], 6);
     assert!(migrated_manifest["assets"].as_array().unwrap().is_empty());
     assert!(!legacy_path.exists());
 
