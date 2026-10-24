@@ -615,3 +615,64 @@ fn batch_import_rejects_a_source_directory_under_decks_before_opening_the_store(
     assert_eq!(json(&output)["error"]["code"], "boundary_violation");
     assert!(!temp.path().join("owned-store").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn batch_import_rejects_a_symlink_to_decks_before_opening_the_store() {
+    let temp = TempDir::new();
+    let protected = temp.path().join("repository/decks/media");
+    fs::create_dir_all(&protected).unwrap();
+    let link = temp.path().join("staged");
+    std::os::unix::fs::symlink(&protected, &link).unwrap();
+
+    let output = cli(
+        &temp,
+        &[
+            "batch",
+            "import",
+            "--batch-id",
+            "local",
+            "--source-dir",
+            link.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(json(&output)["error"]["code"], "boundary_violation");
+    assert!(!temp.path().join("owned-store").exists());
+}
+
+#[test]
+fn batch_import_reads_a_checked_safe_directory_through_the_cli() {
+    let temp = TempDir::new();
+    let source = temp.path().join("staged");
+    fs::create_dir_all(&source).unwrap();
+    let start = cli(&temp, &["batch", "start", "--batch-id", "local", "水"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stdout)
+    );
+
+    let output = cli(
+        &temp,
+        &[
+            "batch",
+            "import",
+            "--batch-id",
+            "local",
+            "--source-dir",
+            source.to_str().unwrap(),
+        ],
+    );
+
+    // Технический отказ попытки, а не отказ команды: дескриптор проверенного
+    // каталога дошёл до импорта.
+    assert_eq!(output.status.code(), Some(3));
+    let value = json(&output);
+    assert_eq!(value["outcome"], "partial_progress");
+    assert_eq!(
+        value["batch"]["items"][0]["attempts"][0]["result"]["code"],
+        "local_source_missing"
+    );
+}

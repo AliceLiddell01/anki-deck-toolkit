@@ -5629,12 +5629,66 @@ fn unlink_if_exists(directory: &File, name: &OsString) -> Result<(), AssetError>
 }
 
 pub(crate) fn open_source_file(path: &Path) -> Result<File, AssetError> {
-    let file = open(
+    checked_source_file(
+        open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ),
         path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOFOLLOW,
+    )
+}
+
+/// Открывает одноуровневое имя только внутри уже открытого и проверенного каталога:
+/// подмена пути к каталогу или его родителей после проверки на чтение не влияет.
+pub(crate) fn open_source_file_at(directory: &File, name: &str) -> Result<File, AssetError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(AssetError::new(
+            ErrorCode::BoundaryViolation,
+            "имя исходного файла должно быть одним компонентом пути",
+        ));
+    }
+    checked_source_file(
+        openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ),
+        Path::new(name),
+    )
+}
+
+/// Открывает каталог источника и возвращает дескриптор, по которому проверяется
+/// граница и через который затем читаются файлы.
+pub(crate) fn open_source_directory(path: &Path) -> Result<File, AssetError> {
+    let directory = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|error| {
+        let error = std::io::Error::from(error);
+        if error.kind() == std::io::ErrorKind::NotADirectory {
+            AssetError::new(
+                ErrorCode::SourceNotRegular,
+                "источник локального импорта должен быть каталогом",
+            )
+        } else {
+            AssetError::new(
+                ErrorCode::SourceMissing,
+                format!("каталог локального импорта недоступен: {error}"),
+            )
+        }
+    })?;
+    Ok(File::from(directory))
+}
+
+fn checked_source_file(
+    opened: rustix::io::Result<rustix::fd::OwnedFd>,
+    path: &Path,
+) -> Result<File, AssetError> {
+    let file = opened.map_err(|error| {
         let error = std::io::Error::from(error);
         if error.kind() == std::io::ErrorKind::NotFound {
             AssetError::new(

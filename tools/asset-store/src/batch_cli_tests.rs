@@ -4227,17 +4227,43 @@ fn legacy_rejected_candidate_never_votes_or_publishes_as_aggregate() {
     );
 }
 
+fn checked_source(source_dir: &std::path::Path) -> CheckedSourceDirectory {
+    CheckedSourceDirectory::new(crate::store::open_source_directory(source_dir).unwrap())
+}
+
 fn import(fixture: &Fixture, id: &str, source_dir: &std::path::Path) -> (BatchResponse, u8) {
+    import_checked(fixture, id, source_dir, checked_source(source_dir))
+}
+
+fn import_checked(
+    fixture: &Fixture,
+    id: &str,
+    source_dir: &std::path::Path,
+    checked: CheckedSourceDirectory,
+) -> (BatchResponse, u8) {
     execute_command(
         &fixture.store,
         fixture.summary(),
         &BatchCommand::Import {
             batch_id: id.into(),
             source_dir: source_dir.to_path_buf(),
+            checked_source: Some(checked),
         },
         false,
     )
     .unwrap()
+}
+
+fn first_failure_code(state: &KanjiBatch, value: char) -> Option<String> {
+    let item = state
+        .items
+        .iter()
+        .find(|item| item.identity == identity(value))
+        .unwrap();
+    match &item.attempts.first()?.result {
+        BatchAttemptInput::Failed { code, .. } => Some(code.clone()),
+        BatchAttemptInput::Candidate { .. } => None,
+    }
 }
 
 fn source_snapshot(
@@ -4385,6 +4411,137 @@ fn local_import_resumes_only_unrecorded_identities_and_rejects_ambiguous_sources
     assert_eq!(code, 3, "水 всё ещё без источника");
 }
 
+#[cfg(unix)]
+#[test]
+fn local_import_reads_only_the_checked_directory_after_the_source_path_is_replaced() {
+    let fixture = Fixture::new();
+    let source = fixture.directory().join("local-source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("木.png"), glyph('木')).unwrap();
+    let protected = fixture.directory().join("decks/media");
+    fs::create_dir_all(&protected).unwrap();
+    fs::write(protected.join("元.png"), glyph('元')).unwrap();
+    let protected_before = source_snapshot(&protected);
+    fixture.start("swap", &['元', '木']);
+    let checked = checked_source(&source);
+
+    // После проверки прежний путь указывает внутрь decks/.
+    fs::rename(&source, fixture.directory().join("moved")).unwrap();
+    std::os::unix::fs::symlink(&protected, &source).unwrap();
+    import_checked(&fixture, "swap", &source, checked);
+
+    let state = fixture.load("swap");
+    assert_eq!(
+        first_failure_code(&state, '元').as_deref(),
+        Some("local_source_missing")
+    );
+    let ready = |value| {
+        state
+            .items
+            .iter()
+            .find(|item| item.identity == identity(value))
+            .unwrap()
+            .is_ready()
+    };
+    assert!(!ready('元'));
+    assert!(ready('木'), "файл читается из удерживаемого каталога");
+    assert!(
+        read_kanji_verified(
+            fixture.store.root(),
+            &[identity('元')],
+            &KanjiImageValidator::validator_identity(),
+        )
+        .is_err()
+    );
+    assert_eq!(source_snapshot(&protected), protected_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn local_import_ignores_a_replaced_parent_component_of_the_source_path() {
+    let fixture = Fixture::new();
+    let staging = fixture.directory().join("staging");
+    let source = staging.join("local");
+    fs::create_dir_all(&source).unwrap();
+    let decks = fixture.directory().join("decks");
+    fs::create_dir_all(decks.join("local")).unwrap();
+    fs::write(decks.join("local/元.png"), glyph('元')).unwrap();
+    fixture.start("parent", &['元']);
+    let checked = checked_source(&source);
+
+    // Подменён родительский компонент: staging/local теперь разрешается в decks/local.
+    fs::rename(&staging, fixture.directory().join("staging-old")).unwrap();
+    std::os::unix::fs::symlink(&decks, &staging).unwrap();
+    import_checked(&fixture, "parent", &source, checked);
+
+    let state = fixture.load("parent");
+    assert_eq!(
+        first_failure_code(&state, '元').as_deref(),
+        Some("local_source_missing")
+    );
+    assert!(state.items[0].published_sha256.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn local_import_turns_unsafe_or_unusable_files_into_technical_failures() {
+    let fixture = Fixture::new();
+    let source = fixture.directory().join("local-source");
+    fs::create_dir(&source).unwrap();
+    let protected = fixture.directory().join("decks/元.png");
+    fs::create_dir_all(protected.parent().unwrap()).unwrap();
+    fs::write(&protected, glyph('元')).unwrap();
+    std::os::unix::fs::symlink(&protected, source.join("元.png")).unwrap();
+    fs::write(source.join("木.png"), b"").unwrap();
+    let mut oversized = glyph('本');
+    oversized.resize(crate::kanji_validator::MAX_MEDIA_BYTES + 1, 0);
+    fs::write(source.join("本.png"), oversized).unwrap();
+    fixture.start("unsafe", &['元', '木', '本']);
+
+    let (_, code) = import(&fixture, "unsafe", &source);
+
+    assert_eq!(code, 3);
+    let state = fixture.load("unsafe");
+    assert_eq!(
+        first_failure_code(&state, '元').as_deref(),
+        Some("local_source_unreadable")
+    );
+    assert_eq!(
+        first_failure_code(&state, '木').as_deref(),
+        Some("media_empty")
+    );
+    assert_eq!(
+        first_failure_code(&state, '本').as_deref(),
+        Some("media_too_large")
+    );
+    assert!(state.items.iter().all(|item| !item.is_ready()));
+}
+
+#[test]
+fn local_import_without_a_checked_directory_fails_closed() {
+    let fixture = Fixture::new();
+    let source = fixture.directory().join("local-source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("元.png"), glyph('元')).unwrap();
+    fixture.start("unchecked", &['元']);
+    let before = fixture.load("unchecked");
+
+    let error = execute_command(
+        &fixture.store,
+        fixture.summary(),
+        &BatchCommand::Import {
+            batch_id: "unchecked".into(),
+            source_dir: source,
+            checked_source: None,
+        },
+        false,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::BoundaryViolation);
+    assert_eq!(fixture.load("unchecked").revision, before.revision);
+}
+
 #[test]
 fn local_import_requires_an_existing_batch_and_valid_id() {
     let fixture = Fixture::new();
@@ -4396,6 +4553,7 @@ fn local_import_requires_an_existing_batch_and_valid_id() {
         &BatchCommand::Import {
             batch_id: "absent".into(),
             source_dir: source.clone(),
+            checked_source: Some(checked_source(&source)),
         },
         false,
     )
@@ -4405,6 +4563,7 @@ fn local_import_requires_an_existing_batch_and_valid_id() {
         prevalidate(&BatchCommand::Import {
             batch_id: "../escape".into(),
             source_dir: source,
+            checked_source: None,
         })
         .is_err()
     );

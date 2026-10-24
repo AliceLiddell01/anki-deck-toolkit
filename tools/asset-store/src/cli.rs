@@ -18,7 +18,7 @@ use crate::model::{
 use crate::selection::SelectionMode;
 use crate::store::{
     AssetStore, IngestRequest, StoreOptions, VerifiedIngestRequest, fd_canonical_path,
-    open_source_file,
+    open_source_directory, open_source_file,
 };
 use crate::validation::SemanticValidator;
 use crate::yarxi::{AcquiredMedia, SelectionResult, acquire_many};
@@ -329,15 +329,15 @@ pub fn execute(mut cli: Cli) -> CliOutput {
             .and_then(|()| batch_cli::prevalidate_output(command, cli.output))
             .and_then(|()| match command {
                 BatchCommand::Import { source_dir, .. } => {
-                    validate_source_directory(source_dir, &protected_roots)
+                    validate_source_directory(source_dir, &protected_roots).map(Some)
                 }
-                _ => Ok(()),
+                _ => Ok(None),
             })
-            .map(|_| (None, None)),
+            .map(|source_directory| (None, source_directory)),
         Command::Validate { .. } => Ok((None, None)),
         _ => Ok((None, None)),
     };
-    let (selected_identity, source_file) = match prevalidated {
+    let (selected_identity, mut source_file) = match prevalidated {
         Ok((identity, source)) => (identity, source),
         Err(error) => {
             return render_error(
@@ -354,6 +354,16 @@ pub fn execute(mut cli: Cli) -> CliOutput {
             );
         }
     };
+    // Для `batch import` проверенным источником является дескриптор каталога: читать
+    // разрешено только через него, а не повторным разрешением `--source-dir`.
+    if let Command::Batch {
+        command: BatchCommand::Import { checked_source, .. },
+    } = &mut cli.command
+    {
+        *checked_source = source_file
+            .take()
+            .map(batch_cli::CheckedSourceDirectory::new);
+    }
     let mut options = StoreOptions::new(&store_path);
     for protected_root in protected_roots {
         options = options.protect_from(protected_root);
@@ -547,26 +557,26 @@ fn render_identify((value, exit_code): (serde_json::Value, u8), format: OutputFo
 }
 
 /// Каталог локального импорта не может лежать внутри `decks/` ни лексически,
-/// ни после разрешения symlink.
+/// ни после разрешения symlink. Каноническая проверка выполняется по уже открытому
+/// дескриптору, и этот же дескриптор возвращается для чтения файлов: последующая
+/// подмена пути или его родительских компонентов не меняет читаемый каталог.
 fn validate_source_directory(
     path: &std::path::Path,
     protected_roots: &BTreeSet<PathBuf>,
-) -> Result<(), AssetError> {
+) -> Result<std::fs::File, AssetError> {
     let lexical_source = normalize_absolute_path(path)?;
-    let canonical_source = std::fs::canonicalize(path).map_err(|error| {
-        AssetError::new(
-            ErrorCode::SourceMissing,
-            format!("каталог локального импорта недоступен: {error}"),
-        )
-    })?;
-    if !canonical_source.is_dir() {
-        return Err(AssetError::new(
-            ErrorCode::SourceNotRegular,
-            "источник локального импорта должен быть каталогом",
-        ));
-    }
     for protected_root in protected_roots {
         let lexical_root = normalize_absolute_path(protected_root)?;
+        if lexical_source.starts_with(&lexical_root) {
+            return Err(AssetError::new(
+                ErrorCode::BoundaryViolation,
+                "CLI kanji не читает исходные файлы из защищённого дерева decks",
+            ));
+        }
+    }
+    let directory = open_source_directory(path)?;
+    let opened_source = fd_canonical_path(&directory)?;
+    for protected_root in protected_roots {
         let canonical_root = match std::fs::canonicalize(protected_root) {
             Ok(root) => Some(root),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -577,16 +587,14 @@ fn validate_source_directory(
                 ));
             }
         };
-        if lexical_source.starts_with(&lexical_root)
-            || canonical_root.is_some_and(|root| canonical_source.starts_with(root))
-        {
+        if canonical_root.is_some_and(|root| opened_source.starts_with(root)) {
             return Err(AssetError::new(
                 ErrorCode::BoundaryViolation,
                 "CLI kanji не читает исходные файлы из защищённого дерева decks",
             ));
         }
     }
-    Ok(())
+    Ok(directory)
 }
 
 fn validate_explicit_source(

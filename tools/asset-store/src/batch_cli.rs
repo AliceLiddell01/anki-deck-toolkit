@@ -23,6 +23,18 @@ use crate::yarxi::{
     AcquisitionWorkerEventKind,
 };
 
+/// Открытый каталог локального импорта, прошедший проверку границы `decks/`.
+/// Файлы читаются только относительно него, поэтому повторное разрешение
+/// `--source-dir` после проверки не происходит.
+#[derive(Debug)]
+pub struct CheckedSourceDirectory(std::fs::File);
+
+impl CheckedSourceDirectory {
+    pub(super) fn new(directory: std::fs::File) -> Self {
+        Self(directory)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum BatchCommand {
     /// Создаёт сохранённый пакет; повторное использование доверенных ресурсов проверяется без нового получения.
@@ -58,6 +70,9 @@ pub enum BatchCommand {
         /// Каталог вне `decks/` с файлами, названными точным символом идентичности.
         #[arg(long)]
         source_dir: std::path::PathBuf,
+        /// Дескриптор `source_dir`, прошедший проверку границы до открытия хранилища.
+        #[arg(skip)]
+        checked_source: Option<CheckedSourceDirectory>,
     },
     /// Возвращает состояние и свидетельства, не запускает получение или публикацию.
     Status {
@@ -1474,8 +1489,15 @@ fn execute_command_with_snapshots_and_progress(
         }
         BatchCommand::Import {
             batch_id,
-            source_dir,
+            checked_source,
+            ..
         } => {
+            let source_dir = checked_source.as_ref().ok_or_else(|| {
+                AssetError::new(
+                    ErrorCode::BoundaryViolation,
+                    "каталог локального импорта не прошёл проверку границы decks",
+                )
+            })?;
             let (state, changed, issues) =
                 import_local_sources(store, batch_id, source_dir, reader)?;
             let outcome = if state.is_resolved() {
@@ -3051,7 +3073,7 @@ const LOCAL_SOURCE_PROVIDER_VERSION: &str = "local-directory-v1";
 fn import_local_sources(
     store: &AssetStore,
     batch_id: &str,
-    source_dir: &std::path::Path,
+    source_dir: &CheckedSourceDirectory,
     reader: &mut impl OwnerSnapshotReader,
 ) -> Result<(KanjiBatch, bool, Vec<BatchIssue>), AssetError> {
     let mut issues = Vec::new();
@@ -3094,16 +3116,16 @@ fn import_local_sources(
     Ok((state, changed, issues))
 }
 
-/// Ровно один обычный файл `<символ>.gif` или `<символ>.png` без symlink;
-/// чтение ограничено пределом владельца.
+/// Ровно один обычный файл `<символ>.gif` или `<символ>.png` без symlink внутри
+/// проверенного каталога; чтение ограничено пределом владельца.
 fn read_local_source(
-    source_dir: &std::path::Path,
+    source_dir: &CheckedSourceDirectory,
     identity: &AssetIdentity,
 ) -> Result<(Vec<u8>, String), (&'static str, String)> {
     let mut found = Vec::new();
     for extension in ["gif", "png"] {
         let file_name = format!("{}.{extension}", identity.key);
-        match crate::store::open_source_file(&source_dir.join(&file_name)) {
+        match crate::store::open_source_file_at(&source_dir.0, &file_name) {
             Ok(file) => found.push((file, file_name)),
             Err(error) if error.code == ErrorCode::SourceMissing => {}
             Err(error) => return Err(("local_source_unreadable", error.message)),
