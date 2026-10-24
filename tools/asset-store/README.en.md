@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 9a4441ccde70e963672793a2eef1238e3ff6d7cf -->
+<!-- i18n-source-git-blob: c90c40b3aca25b5b3a6a9fd3550c94275ca69cc1 -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -616,8 +616,11 @@ appears only when an entry has `error`.
 `batch import --batch-id ID --source-dir DIR` walks the batch's current frontier
 and for each identity looks for exactly one regular `<character>.gif` or
 `<character>.png` file without symlinks. The directory may not be inside
-`decks/`; files are only read. Bytes are checked by the same validator as Yarxi
-acquisition: `VERIFIED` is published by the owner, other technically valid
+`decks/`; files are only read. The boundary is checked before the store is opened
+against the already opened directory descriptor, and files are opened only
+relative to that descriptor: replacing `DIR` or one of its parent components
+after the check does not redirect reads. Bytes are checked by the same validator
+as Yarxi acquisition: `VERIFIED` is published by the owner, other technically valid
 candidates become `awaiting_human` and continue through `batch ocr`,
 `review-export` and human decisions. A missing file (`local_source_missing`), a
 GIF and PNG pair (`local_source_ambiguous`), a signature that contradicts the
