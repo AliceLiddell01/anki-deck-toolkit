@@ -860,50 +860,59 @@ fn control_stage(
     states: &mut [ItemState],
 ) -> Result<(), AssetError> {
     let validator = KanjiImageValidator::validator_identity();
-    for state in states.iter_mut() {
-        if !state.origins.contains(&TargetOrigin::ExistingPng) {
-            continue;
-        }
-        let Some(render) = state.render.clone() else {
-            continue;
-        };
-        if state.control.is_some() {
-            continue;
-        }
-        let original = AssetStore::read_verified_variants_with_policy(
-            store.root(),
-            &[(state.identity(), DetectedFormat::Png)],
-            &validator,
-            &KanjiDomainPolicy,
-        )?
-        .remove(0);
-        if original.record.provenance.source_kind == LOCAL_RENDER_SOURCE_KIND {
-            continue;
-        }
-        let reference_file = format!("references/{}.png", state.unicode);
-        write_atomic(&work.root().join(&reference_file), &original.bytes)?;
-        let decode = |bytes: &[u8]| {
-            image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
-                .map(|image| image.to_rgb8())
-                .map_err(|error| invalid(format!("декодирование PNG: {error}")))
-        };
-        let metrics = compare_images(
-            &decode(&original.bytes)?,
-            &decode(&work.read(&render.file)?)?,
-        )
-        .map_err(invalid)?;
-        state.control = Some(ControlState {
-            original_sha256: original.record.sha256.clone(),
-            original_provenance: format!(
-                "{}:{}",
-                original.record.provenance.source_kind, original.record.provenance.source_name
-            ),
-            reference_file,
-            metrics,
-        });
-        work.save_item(state)?;
+    let pending: Vec<usize> = states
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| {
+            state.origins.contains(&TargetOrigin::ExistingPng)
+                && state.render.is_some()
+                && state.control.is_none()
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let requests: Vec<_> = pending
+        .iter()
+        .map(|&index| (states[index].identity(), DetectedFormat::Png))
+        .collect();
+    AssetStore::visit_verified_variants_with_policy(
+        store.root(),
+        &requests,
+        &validator,
+        &KanjiDomainPolicy,
+        |request, original| {
+            let original = original?;
+            let state = &mut states[pending[request]];
+            let render = state.render.clone().expect("отобран рендер");
+            if original.record.provenance.source_kind == LOCAL_RENDER_SOURCE_KIND {
+                return Ok(());
+            }
+            let reference_file = format!("references/{}.png", state.unicode);
+            write_atomic(&work.root().join(&reference_file), &original.bytes)?;
+            let decode = |bytes: &[u8]| {
+                image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+                    .map(|image| image.to_rgb8())
+                    .map_err(|error| invalid(format!("декодирование PNG: {error}")))
+            };
+            let metrics = compare_images(
+                &decode(&original.bytes)?,
+                &decode(&work.read(&render.file)?)?,
+            )
+            .map_err(invalid)?;
+            state.control = Some(ControlState {
+                original_sha256: original.record.sha256.clone(),
+                original_provenance: format!(
+                    "{}:{}",
+                    original.record.provenance.source_kind, original.record.provenance.source_name
+                ),
+                reference_file,
+                metrics,
+            });
+            work.save_item(state)
+        },
+    )
 }
 
 /// Слепой OCR каждого сгенерированного PNG. Модели передаётся только кадр и
@@ -1655,6 +1664,19 @@ fn png_is_valid(bytes: &[u8]) -> bool {
             .is_ok_and(|image| image.width() == 174 && image.height() == 174)
 }
 
+/// Итог чтения опубликованных вариантов одного символа в отчёте.
+#[derive(Clone, Default)]
+struct PublishedReadCheck {
+    png_ok: bool,
+    gif_read: bool,
+    gif_ok: bool,
+    error: Option<String>,
+}
+
+fn describe_error(error: &AssetError) -> String {
+    format!("{}: {}", error.code.as_str(), error.message)
+}
+
 /// Отчёт по рабочему каталогу и финальному состоянию хранилища.
 ///
 /// Возвращает сводку и признак успешной проверки целостности.
@@ -1698,7 +1720,8 @@ pub(crate) fn report(store: &AssetStore, root: &Path) -> Result<(Value, bool), A
     let mut read_failures = Vec::new();
     let mut ocr_stats: BTreeMap<&str, usize> = BTreeMap::new();
     let mut validator_stats: BTreeMap<String, usize> = BTreeMap::new();
-    let mut dual_read_checked = 0usize;
+    let mut read_requests = Vec::new();
+    let mut read_owners = Vec::new();
     for item in &items {
         let outcome = item_outcome(item, &after);
         *counts.entry(outcome.to_owned()).or_insert(0) += 1;
@@ -1722,36 +1745,12 @@ pub(crate) fn report(store: &AssetStore, root: &Path) -> Result<(Value, bool), A
             *ocr_stats.entry("not_run").or_insert(0) += 1;
         }
         if matches!(outcome, "published" | "published_after_review") {
-            let render = item.render.as_ref().expect("опубликован рендер");
-            let mut requests = vec![(item.identity(), DetectedFormat::Png)];
+            let index = published.len();
+            read_requests.push((item.identity(), DetectedFormat::Png));
+            read_owners.push(index);
             if after.gif_sha256.contains_key(&item.character) {
-                requests.push((item.identity(), DetectedFormat::Gif));
-            }
-            match AssetStore::read_verified_variants_with_policy(
-                store.root(),
-                &requests,
-                &validator,
-                &KanjiDomainPolicy,
-            ) {
-                Ok(read) => {
-                    let png_ok = read[0].record.sha256 == render.sha256
-                        && read[0].record.consumer_filename == format!("{}.png", item.character)
-                        && png_is_valid(&read[0].bytes);
-                    let gif_ok = read.get(1).is_none_or(|gif| {
-                        Some(&gif.record.sha256) == before.gif_sha256.get(&item.character)
-                            && gif.record.consumer_filename == format!("{}.gif", item.character)
-                    });
-                    if read.len() == 2 {
-                        dual_read_checked += 1;
-                    }
-                    if !png_ok || !gif_ok {
-                        read_failures.push(json!({"character": item.character, "png_ok": png_ok, "gif_ok": gif_ok}));
-                    }
-                }
-                Err(error) => read_failures.push(json!({
-                    "character": item.character,
-                    "error": format!("{}: {}", error.code.as_str(), error.message),
-                })),
+                read_requests.push((item.identity(), DetectedFormat::Gif));
+                read_owners.push(index);
             }
             published.push(item);
         }
@@ -1786,6 +1785,64 @@ pub(crate) fn report(store: &AssetStore, root: &Path) -> Result<(Value, bool), A
                 "artifact": item.render.as_ref().map(|render| render.file.clone()),
                 "state_file": format!("items/{}.json", item.unicode),
             }));
+        }
+    }
+
+    // Все опубликованные варианты читаются одним согласованным снимком: манифест и
+    // корпус проверяются один раз, байты каждого запроса — по своей записи.
+    let mut checks = vec![PublishedReadCheck::default(); published.len()];
+    let snapshot = AssetStore::visit_verified_variants_with_policy(
+        store.root(),
+        &read_requests,
+        &validator,
+        &KanjiDomainPolicy,
+        |request, read| {
+            let item = published[read_owners[request]];
+            let check = &mut checks[read_owners[request]];
+            let read = match read {
+                Ok(read) => read,
+                Err(error) => {
+                    check.error.get_or_insert_with(|| describe_error(&error));
+                    return Ok(());
+                }
+            };
+            match read_requests[request].1 {
+                DetectedFormat::Png => {
+                    let render = item.render.as_ref().expect("опубликован рендер");
+                    check.png_ok = read.record.sha256 == render.sha256
+                        && read.record.consumer_filename == format!("{}.png", item.character)
+                        && png_is_valid(&read.bytes);
+                }
+                _ => {
+                    check.gif_read = true;
+                    check.gif_ok = Some(&read.record.sha256)
+                        == before.gif_sha256.get(&item.character)
+                        && read.record.consumer_filename == format!("{}.gif", item.character);
+                }
+            }
+            Ok(())
+        },
+    );
+    if let Err(error) = snapshot {
+        let error = describe_error(&error);
+        for check in &mut checks {
+            check.error = Some(error.clone());
+        }
+    }
+    let mut dual_read_checked = 0usize;
+    for (item, check) in published.iter().zip(&checks) {
+        if let Some(error) = &check.error {
+            read_failures.push(json!({"character": item.character, "error": error}));
+            continue;
+        }
+        let gif_ok = !check.gif_read || check.gif_ok;
+        if check.gif_read {
+            dual_read_checked += 1;
+        }
+        if !check.png_ok || !gif_ok {
+            read_failures.push(
+                json!({"character": item.character, "png_ok": check.png_ok, "gif_ok": gif_ok}),
+            );
         }
     }
 

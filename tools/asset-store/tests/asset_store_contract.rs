@@ -920,10 +920,79 @@ fn kanji_gif_and_png_are_independent_records_with_format_scoped_cas() {
     assert_eq!(explicit[0].bytes, png_bytes);
     assert_eq!(explicit[1].record.sha256, gif.sha256);
 
+    // Потоковое чтение: ошибка отдельного запроса не прерывает пакет.
+    let missing = AssetIdentity::new("kanji", "無").unwrap();
+    let requests = [
+        (identity.clone(), DetectedFormat::Png),
+        (missing, DetectedFormat::Png),
+        (identity.clone(), DetectedFormat::Gif),
+    ];
+    let mut visited = Vec::new();
+    AssetStore::visit_verified_variants_with_policy(
+        &root,
+        &requests,
+        &validator.identity(),
+        &asset_store::KanjiDomainPolicy,
+        |index, read| {
+            visited.push((
+                index,
+                read.map(|read| read.record.sha256)
+                    .map_err(|error| error.code),
+            ));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        visited,
+        [
+            (0, Ok(png.sha256.clone())),
+            (1, Err(ErrorCode::MissingAssetFile)),
+            (2, Ok(gif.sha256.clone())),
+        ]
+    );
+
+    // Ошибка, которую вернул сам `visit`, прерывает чтение.
+    let mut calls = 0;
+    let aborted = AssetStore::visit_verified_variants_with_policy(
+        &root,
+        &requests,
+        &validator.identity(),
+        &asset_store::KanjiDomainPolicy,
+        |_, _| {
+            calls += 1;
+            Err(asset_store::AssetError::new(
+                ErrorCode::IntegrityMismatch,
+                "стоп",
+            ))
+        },
+    )
+    .expect_err("ошибка visit прерывает пакет");
+    assert_eq!((calls, aborted.message.as_str()), (1, "стоп"));
+
     // Повторное открытие сохраняет обе записи.
     drop(store);
     let reopened = open_kanji_store(&root);
     assert_eq!(reopened.verify_integrity().unwrap().len(), 2);
+    drop(reopened);
+
+    // Повреждение любого файла корпуса отклоняет весь снимок до первого `visit`.
+    let tampered = root.join(&gif.storage_path);
+    fs::remove_file(&tampered).unwrap();
+    fs::write(&tampered, b"GIF89a tampered bytes!!").unwrap();
+    let mut calls = 0;
+    let corrupt = AssetStore::visit_verified_variants_with_policy(
+        &root,
+        &requests[..1],
+        &validator.identity(),
+        &asset_store::KanjiDomainPolicy,
+        |_, _| {
+            calls += 1;
+            Ok(())
+        },
+    )
+    .expect_err("повреждённый корпус отклоняется целиком");
+    assert_eq!((calls, corrupt.code), (0, ErrorCode::IntegrityMismatch));
 }
 
 #[test]

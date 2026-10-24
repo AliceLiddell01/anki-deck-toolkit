@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 145f36e029dc5a3391470d7f8f0ef80c5732ef33 -->
+<!-- i18n-source-git-blob: 3880a7477f2ea1d2b201e758bca0d700566f0ae6 -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -58,7 +58,7 @@
 
 旧版 v3/v4 清单和原先平铺的汉字目录仍可读取。以写入模式打开时会在独占锁内执行版本迁移：通过硬链接保留旧字节、验证 SHA-256、原子更新清单，再删除旧平铺链接。`.tmp/` 中的事务标记允许中断后继续或回滚。未变化的 SHA、`ValidationRecord`、`HumanAttestation` 均保留，无需重新下载。完成后新旧规范路径不会同时存在。CLI JSON 报告 `store.layout_migrated_on_open`。
 
-`AssetStore::read_verified` 仍是兼容读取的汉字 API；对具有两种可信格式的字符返回首选格式：先 GIF，后 PNG。`read_verified_variants_with_policy` 同时读取字符的所有可信格式。其他领域使用 `read_verified_with_policy`；该 API 可通过旧映射读取 v3/v4，并返回明确的消费者文件名，**不修改清单、不创建状态或锁文件、不迁移布局或触发恢复**。只有写入模式打开才会迁移；读取时验证精确字节、校验和、大小、格式、验证器身份及人工决定。
+`AssetStore::read_verified` 仍是兼容读取的汉字 API；对具有两种可信格式的字符返回首选格式：先 GIF，后 PNG。`read_verified_variants_with_policy` 同时读取字符的所有可信格式。其他领域使用 `read_verified_with_policy`；该 API 可通过旧映射读取 v3/v4，并返回明确的消费者文件名，**不修改清单、不创建状态或锁文件、不迁移布局或触发恢复**。只有写入模式打开才会迁移；读取时验证精确字节、校验和、大小、格式、验证器身份及人工决定。每次读取调用都会获取共享锁并重新验证整个清单和语料库中的每个文件，因此读取多个资源时应作为一个批次，而不是每个资源调用一次。`visit_verified_variants_with_policy` 在一次锁和一次完整验证下流式读取批次：整个存储的错误在第一个结果之前返回，单个请求的错误连同请求索引传给处理函数且不中断批次，字节不会在内存中累积。
 
 公共批处理运行时负责 `.runtime/batches/<batch-id>` 下安全的文件机制：`NOFOLLOW`、锁、修订号/CAS、原子状态写入、有界读取和按 SHA 寻址的内容。它不依赖 `KanjiBatch`、`KanjiMetrics`、Yarxi 数据或 HTML 报告，这些都由领域适配器负责。纯文本测试状态验证重新打开和读取内容，无需汉字或图片规则。
 

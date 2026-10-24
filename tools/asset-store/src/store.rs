@@ -740,13 +740,65 @@ impl AssetStore {
         Self::read_verified_requests(root, &requests, expected_validator, policy, before_read)
     }
 
+    /// Потоково читает доверенные байты точно указанных форматов под одной
+    /// разделяемой блокировкой и одной полной проверкой манифеста на весь пакет.
+    ///
+    /// Ошибка хранилища в целом (блокировка, `owner`, манифест, файлы корпуса)
+    /// возвращается до первого обращения к `visit`. Ошибка отдельного запроса
+    /// передаётся в `visit` вместе с его индексом и не прерывает пакет; ошибка,
+    /// которую вернул сам `visit`, прерывает чтение. Байты не накапливаются:
+    /// каждый результат принадлежит `visit`.
+    pub fn visit_verified_variants_with_policy(
+        root: impl AsRef<Path>,
+        requests: &[(AssetIdentity, DetectedFormat)],
+        expected_validator: &ValidatorIdentity,
+        policy: &dyn AssetDomainPolicy,
+        visit: impl FnMut(usize, Result<VerifiedAssetBytes, AssetError>) -> Result<(), AssetError>,
+    ) -> Result<(), AssetError> {
+        let requests: Vec<_> = requests
+            .iter()
+            .map(|(identity, format)| (identity.clone(), Some(*format)))
+            .collect();
+        Self::visit_verified_requests(
+            root.as_ref(),
+            &requests,
+            expected_validator,
+            policy,
+            |_| {},
+            visit,
+        )
+    }
+
     fn read_verified_requests(
         root: &Path,
         requests: &[(AssetIdentity, Option<DetectedFormat>)],
         expected_validator: &ValidatorIdentity,
         policy: &dyn AssetDomainPolicy,
-        mut before_read: impl FnMut(&AssetRecord),
+        before_read: impl FnMut(&AssetRecord),
     ) -> Result<Vec<VerifiedAssetBytes>, AssetError> {
+        let mut result = Vec::with_capacity(requests.len());
+        Self::visit_verified_requests(
+            root,
+            requests,
+            expected_validator,
+            policy,
+            before_read,
+            |_, read| {
+                result.push(read?);
+                Ok(())
+            },
+        )?;
+        Ok(result)
+    }
+
+    fn visit_verified_requests(
+        root: &Path,
+        requests: &[(AssetIdentity, Option<DetectedFormat>)],
+        expected_validator: &ValidatorIdentity,
+        policy: &dyn AssetDomainPolicy,
+        mut before_read: impl FnMut(&AssetRecord),
+        mut visit: impl FnMut(usize, Result<VerifiedAssetBytes, AssetError>) -> Result<(), AssetError>,
+    ) -> Result<(), AssetError> {
         validate_validator_identity(expected_validator)?;
         let requested = resolve_store_root(root)?;
         let directory = open_existing_store_root(&requested)?;
@@ -766,86 +818,91 @@ impl AssetStore {
         } else {
             validate_verified_manifest(&directory, &manifest, policy)?;
         }
-        let mut result = Vec::new();
-        for (identity, format) in requests {
-            policy.validate_identity(identity)?;
-            let record = match format {
-                Some(format) => manifest
-                    .assets
-                    .iter()
-                    .find(|record| in_slot(policy, record, identity, *format)),
-                None => preferred_record(policy, &manifest.assets, identity, |record| {
-                    is_trusted_for_policy(record, expected_validator, policy)
-                }),
-            }
-            .ok_or_else(|| {
-                AssetError::with_details(
-                    ErrorCode::MissingAssetFile,
-                    "в каноническом хранилище нет проверенного изображения",
-                    match format {
-                        Some(format) => serde_json::json!({"identity": identity, "format": format}),
-                        None => serde_json::json!({"identity": identity}),
-                    },
-                )
-            })?;
-            if !is_trusted_for_policy(record, expected_validator, policy) {
-                return Err(AssetError::new(
-                    ErrorCode::InvalidValidationEvidence,
-                    "ресурс не имеет доверенного решения `verified` от ожидаемой версии валидатора",
-                ));
-            }
-            let mut record = record.clone();
-            if record.consumer_filename.is_empty() {
-                record.consumer_filename = policy
-                    .legacy_location(&record.identity, &record.sha256, record.format)
-                    .ok_or_else(|| {
-                        AssetError::new(
-                            ErrorCode::UnsupportedSchemaVersion,
-                            "legacy manifest не имеет consumer filename для этой domain policy",
-                        )
-                    })?
-                    .consumer_filename;
-            }
-            validate_record_consumer_filename(&record)?;
-            before_read(&record);
-            let human_approved = record.current_human_decision() == Some(HumanDecision::Approve);
-            let maximum = policy.max_asset_bytes().unwrap_or(MAX_HUMAN_APPROVED_BYTES);
-            if human_approved && record.byte_length > maximum {
-                return Err(AssetError::new(
-                    ErrorCode::IntegrityMismatch,
-                    "изображение, одобренное человеком, превышает установленный предел размера",
-                ));
-            }
-            let file = if manifest.schema_version < NESTED_LAYOUT_SCHEMA_VERSION {
-                checked_legacy_asset_file(&directory, &record, policy)?
-            } else {
-                checked_asset_file(&directory, &record, policy)?
-            };
-            let bytes = if human_approved {
-                read_bounded_asset_bytes(file, maximum as usize, "чтение проверенных байтов")?
-            } else {
-                let mut bytes = Vec::new();
-                file.take(record.byte_length.saturating_add(1))
-                    .read_to_end(&mut bytes)
-                    .map_err(|error| AssetError::io("чтение проверенных байтов", error))?;
-                bytes
-            };
-            let format = DetectedFormat::from_signature(&bytes);
-            if format != record.format
-                || bytes.len() as u64 != record.byte_length
-                || sha256_hex(&bytes) != record.sha256
-            {
-                return Err(AssetError::new(
-                    ErrorCode::IntegrityMismatch,
-                    "прочитанные байты не совпадают с проверенной записью",
-                ));
-            }
-            if human_approved {
-                validate_image_decode(&bytes)?;
-            }
-            result.push(VerifiedAssetBytes { record, bytes });
+        for (index, (identity, format)) in requests.iter().enumerate() {
+            let read = (|| {
+                policy.validate_identity(identity)?;
+                let record = match format {
+                    Some(format) => manifest
+                        .assets
+                        .iter()
+                        .find(|record| in_slot(policy, record, identity, *format)),
+                    None => preferred_record(policy, &manifest.assets, identity, |record| {
+                        is_trusted_for_policy(record, expected_validator, policy)
+                    }),
+                }
+                .ok_or_else(|| {
+                    AssetError::with_details(
+                        ErrorCode::MissingAssetFile,
+                        "в каноническом хранилище нет проверенного изображения",
+                        match format {
+                            Some(format) => {
+                                serde_json::json!({"identity": identity, "format": format})
+                            }
+                            None => serde_json::json!({"identity": identity}),
+                        },
+                    )
+                })?;
+                if !is_trusted_for_policy(record, expected_validator, policy) {
+                    return Err(AssetError::new(
+                        ErrorCode::InvalidValidationEvidence,
+                        "ресурс не имеет доверенного решения `verified` от ожидаемой версии валидатора",
+                    ));
+                }
+                let mut record = record.clone();
+                if record.consumer_filename.is_empty() {
+                    record.consumer_filename = policy
+                        .legacy_location(&record.identity, &record.sha256, record.format)
+                        .ok_or_else(|| {
+                            AssetError::new(
+                                ErrorCode::UnsupportedSchemaVersion,
+                                "legacy manifest не имеет consumer filename для этой domain policy",
+                            )
+                        })?
+                        .consumer_filename;
+                }
+                validate_record_consumer_filename(&record)?;
+                before_read(&record);
+                let human_approved =
+                    record.current_human_decision() == Some(HumanDecision::Approve);
+                let maximum = policy.max_asset_bytes().unwrap_or(MAX_HUMAN_APPROVED_BYTES);
+                if human_approved && record.byte_length > maximum {
+                    return Err(AssetError::new(
+                        ErrorCode::IntegrityMismatch,
+                        "изображение, одобренное человеком, превышает установленный предел размера",
+                    ));
+                }
+                let file = if manifest.schema_version < NESTED_LAYOUT_SCHEMA_VERSION {
+                    checked_legacy_asset_file(&directory, &record, policy)?
+                } else {
+                    checked_asset_file(&directory, &record, policy)?
+                };
+                let bytes = if human_approved {
+                    read_bounded_asset_bytes(file, maximum as usize, "чтение проверенных байтов")?
+                } else {
+                    let mut bytes = Vec::new();
+                    file.take(record.byte_length.saturating_add(1))
+                        .read_to_end(&mut bytes)
+                        .map_err(|error| AssetError::io("чтение проверенных байтов", error))?;
+                    bytes
+                };
+                let format = DetectedFormat::from_signature(&bytes);
+                if format != record.format
+                    || bytes.len() as u64 != record.byte_length
+                    || sha256_hex(&bytes) != record.sha256
+                {
+                    return Err(AssetError::new(
+                        ErrorCode::IntegrityMismatch,
+                        "прочитанные байты не совпадают с проверенной записью",
+                    ));
+                }
+                if human_approved {
+                    validate_image_decode(&bytes)?;
+                }
+                Ok(VerifiedAssetBytes { record, bytes })
+            })();
+            visit(index, read)?;
         }
-        Ok(result)
+        Ok(())
     }
 
     /// Проверяет публикуемое в `Git` представление корпуса кандзи без создания,

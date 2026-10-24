@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 145f36e029dc5a3391470d7f8f0ef80c5732ef33 -->
+<!-- i18n-source-git-blob: 3880a7477f2ea1d2b201e758bca0d700566f0ae6 -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -58,7 +58,7 @@ Manifest schema is version `6`. In addition to SHA-256, byte size, format, state
 
 Schema v3/v4 and the legacy flat Kanji layout can be read. A mutating open performs versioned migration under an exclusive lock: preserves old bytes with hard links, checks SHA-256, atomically updates the manifest and removes old flat links. `.tmp/` transaction markers support completion or rollback after interruption. Unchanged SHA, `ValidationRecord`, and `HumanAttestation` remain, without refetching. After commit, old/new canonical paths do not coexist. CLI JSON reports `store.layout_migrated_on_open`.
 
-`AssetStore::read_verified` remains a read API compatible with `KanjiDomainPolicy` and, for a character with two trusted formats, returns the preferred one: GIF, then PNG. `read_verified_variants_with_policy` reads all trusted formats of a character together. Other domains use `read_verified_with_policy`, which can read v3/v4 with legacy mapping and return the explicit consumer filename without modifying manifests, making state/lock files, changing layout, or performing recovery. Only a mutating open migrates. Exact bytes, checksum, size, format, validator identity, and human decision are checked.
+`AssetStore::read_verified` remains a read API compatible with `KanjiDomainPolicy` and, for a character with two trusted formats, returns the preferred one: GIF, then PNG. `read_verified_variants_with_policy` reads all trusted formats of a character together. Other domains use `read_verified_with_policy`, which can read v3/v4 with legacy mapping and return the explicit consumer filename without modifying manifests, making state/lock files, changing layout, or performing recovery. Only a mutating open migrates. Exact bytes, checksum, size, format, validator identity, and human decision are checked. Every read call takes a shared lock and re-validates the whole manifest and every corpus file, so read many assets as one batch rather than one call per asset. `visit_verified_variants_with_policy` streams a batch under one lock and one full validation: a store-wide error is returned before the first result, a per-request error is passed to the visitor with the request index without aborting the batch, and bytes are not accumulated in memory.
 
 The shared batch runtime owns safe filesystem operations under `.runtime/batches/<batch-id>`: `NOFOLLOW`, locks, revisions/CAS, atomic state writes, bounded reads, and SHA-addressed payloads. It does not know about `KanjiBatch`, `KanjiMetrics`, Yarxi data, or HTML reports: domain adapters own those. A plain-text test state exercises reopening and reading blobs without kanji or image semantics.
 
