@@ -7,3 +7,5 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 *:Zone.Identifier
+# Шрифты хранятся побайтово: от SHA-256 зависит калибровка рендера.
+*.otf binary

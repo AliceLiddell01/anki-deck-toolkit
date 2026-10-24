@@ -2,7 +2,7 @@
 
 [Русский](README.md) · [English](README.en.md) · **简体中文**
 
-<!-- i18n-source-git-blob: 7993c5c3eab69b2a618a88c7bbcbea9e66e758f2 -->
+<!-- i18n-source-git-blob: 145f36e029dc5a3391470d7f8f0ef80c5732ef33 -->
 
 `asset-store` 是用于程序管理资源的公共 Rust 库，负责清单、校验和、完整性及生命周期。领域专用 CLI `kanji-assets` 负责查找 Yarxi 条目、验证汉字图片，并把通过验证的文件发布到规范资源库。本工具不读取 `decks/**/media/`，不更改 `media_files`，也不会把图片复制到牌组中。
 
@@ -594,16 +594,16 @@ cargo run --locked --bin kanji-assets -- --output json batch import \
 
 ### 本地生成 PNG：`local-png`
 
-`kanji-assets local-png` 在不使用 Yarxi、网络和外部解释器的情况下生成 Yarxi 风格的 174×174 汉字 PNG：系统 Chromium 通过 CDP 使用本地 Noto Serif JP 文件绘制字符，截图以原生 174×174 获取，不做缩放。字体不包含在仓库中；默认只接受已校准的 `NotoSerifJP-Regular.otf` 1.001 版（SHA-256 记录在 `local_render::CALIBRATED_FONT_SHA256`）。其他文件只能通过 `render --allow-uncalibrated-font` 使用，结果标记为未校准；`run` 和发布不接受它。
+`kanji-assets local-png` 在不使用 Yarxi、网络和外部解释器的情况下生成 Yarxi 风格的 174×174 汉字 PNG：系统 Chromium 通过 CDP 使用本地 Noto Serif JP 文件绘制字符，截图以原生 174×174 获取，不做缩放。已校准的 `NotoSerifJP-Regular.otf` 1.001 版与 SIL Open Font License 1.1 文本（`OFL.txt`）一起存放在 `tools/asset-store/fonts/` 中，默认相对于 `--repository-root` 使用；`--font` 可指定其他路径。只接受具有已校准 SHA-256 的文件（`local_render::CALIBRATED_FONT_SHA256`，测试固定其与仓库文件一致）。其他文件只能通过 `render --allow-uncalibrated-font` 使用，结果标记为未校准；`run` 和发布不接受它。
 
 ```bash
 # 在 decks/ 之外的新目录中生成 PNG；存储不变。
 cargo run --locked --bin kanji-assets -- --output json local-png render \
-  --font ./NotoSerifJP-Regular.otf --out ./local-png 亜漢 --raw
+  --out ./local-png 亜漢 --raw
 
 # 可恢复的语料库运行：渲染、验证器、盲 OCR、发布。
 cargo run --locked --bin kanji-assets -- --output json local-png run \
-  --font ./NotoSerifJP-Regular.otf --work-dir ./local-png-run --from-corpus --ocr --publish
+  --work-dir ./local-png-run --from-corpus --ocr --publish
 
 # 运行后的存储检查及工作目录的 HTML 报告。
 cargo run --locked --bin kanji-assets -- --output json local-png report --work-dir ./local-png-run

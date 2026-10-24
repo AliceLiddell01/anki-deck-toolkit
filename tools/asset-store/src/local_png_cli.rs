@@ -18,9 +18,9 @@ use crate::local_render::{GeometryProfile, LocalFont, LocalRenderer, RenderedKan
 pub enum LocalPngCommand {
     /// Рисует PNG указанных символов в новый каталог; хранилище не открывается.
     Render {
-        /// Локальный файл шрифта; по умолчанию требуется откалиброванный SHA-256.
+        /// Файл шрифта; по умолчанию — откалиброванный шрифт репозитория.
         #[arg(long)]
-        font: PathBuf,
+        font: Option<PathBuf>,
         /// Разрешить другой файл шрифта; результат помечается неоткалиброванным.
         #[arg(long)]
         allow_uncalibrated_font: bool,
@@ -43,9 +43,9 @@ pub enum LocalPngCommand {
     /// Возобновляемый массовый прогон: рендер, штатная проверка, слепой OCR и
     /// публикация прошедших PNG через хранилище. Повтор продолжает с места остановки.
     Run {
-        /// Локальный файл откалиброванного шрифта.
+        /// Файл откалиброванного шрифта; по умолчанию — шрифт репозитория.
         #[arg(long)]
-        font: PathBuf,
+        font: Option<PathBuf>,
         /// Фаза захвата; `b` — штатная, `a` — только явный выбор.
         #[arg(long, value_enum, default_value_t = GeometryProfile::B)]
         profile: GeometryProfile,
@@ -136,6 +136,14 @@ impl LocalPngCommand {
             Self::Compare { .. } => "local-png compare",
         }
     }
+}
+
+/// Откалиброванный шрифт, хранящийся в репозитории (SIL OFL 1.1, `fonts/OFL.txt`).
+pub(crate) const BUNDLED_FONT: &str = "tools/asset-store/fonts/NotoSerifJP-Regular.otf";
+
+fn font_path(font: &Option<PathBuf>, repository_root: &Path) -> PathBuf {
+    font.clone()
+        .unwrap_or_else(|| repository_root.join(BUNDLED_FONT))
 }
 
 /// Символ из имени `<символ>.png` или `U+XXXX.png`.
@@ -372,7 +380,7 @@ pub(crate) fn execute(
                 ));
             }
             let work_dir = ensure_outside_protected(work_dir, protected_roots)?;
-            let font = LocalFont::load(font, false)
+            let font = LocalFont::load(&font_path(font, repository_root), false)
                 .map_err(|message| AssetError::new(ErrorCode::InvalidTransition, message))?;
             let store = open_store()?;
             let mut ocr_options = ocr_options.clone();
@@ -481,7 +489,7 @@ pub(crate) fn execute(
         } => {
             let characters = parse_characters(characters)?;
             let out = ensure_outside_protected(out, protected_roots)?;
-            let font = LocalFont::load(font, *allow_uncalibrated_font)
+            let font = LocalFont::load(&font_path(font, repository_root), *allow_uncalibrated_font)
                 .map_err(|message| AssetError::new(ErrorCode::InvalidTransition, message))?;
             prepare_empty_directory(&out)?;
             if *raw {

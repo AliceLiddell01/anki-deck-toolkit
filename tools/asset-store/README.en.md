@@ -2,7 +2,7 @@
 
 [Русский](README.md) · **English** · [简体中文](README.zh-CN.md)
 
-<!-- i18n-source-git-blob: 7993c5c3eab69b2a618a88c7bbcbea9e66e758f2 -->
+<!-- i18n-source-git-blob: 145f36e029dc5a3391470d7f8f0ef80c5732ef33 -->
 
 `asset-store` is the shared Rust library for program-managed assets, responsible for manifests, checksums, integrity, and lifecycle. The domain-specific `kanji-assets` CLI provides Yarxi entry discovery, kanji image validation, and publication of approved files to the canonical corpus. The tool does not read `decks/**/media/`, does not modify `media_files`, and does not copy images into decks.
 
@@ -635,16 +635,16 @@ only states under which identity the file was read.
 
 ### Local PNG generation: `local-png`
 
-`kanji-assets local-png` builds Yarxi-style 174×174 kanji PNGs without Yarxi, the network, or external interpreters: the system Chromium draws the character over CDP with a local Noto Serif JP file, and the screenshot is taken natively at 174×174 without scaling. The font is not part of the repository; by default only the calibrated `NotoSerifJP-Regular.otf` version 1.001 is accepted (its SHA-256 is recorded in `local_render::CALIBRATED_FONT_SHA256`). Another file is allowed only by `render --allow-uncalibrated-font`, and such output is marked uncalibrated; `run` and publication do not accept it.
+`kanji-assets local-png` builds Yarxi-style 174×174 kanji PNGs without Yarxi, the network, or external interpreters: the system Chromium draws the character over CDP with a local Noto Serif JP file, and the screenshot is taken natively at 174×174 without scaling. The calibrated `NotoSerifJP-Regular.otf` version 1.001 is stored in `tools/asset-store/fonts/` together with the SIL Open Font License 1.1 text (`OFL.txt`) and is used by default relative to `--repository-root`; `--font` sets another path. Only a file with the calibrated SHA-256 is accepted (`local_render::CALIBRATED_FONT_SHA256`; a test pins its match with the repository file). Another file is allowed only by `render --allow-uncalibrated-font`, and such output is marked uncalibrated; `run` and publication do not accept it.
 
 ```bash
 # Generate PNGs into a new directory outside decks/; the store is not changed.
 cargo run --locked --bin kanji-assets -- --output json local-png render \
-  --font ./NotoSerifJP-Regular.otf --out ./local-png 亜漢 --raw
+  --out ./local-png 亜漢 --raw
 
 # Resumable corpus run: render, validator, blind OCR, publication.
 cargo run --locked --bin kanji-assets -- --output json local-png run \
-  --font ./NotoSerifJP-Regular.otf --work-dir ./local-png-run --from-corpus --ocr --publish
+  --work-dir ./local-png-run --from-corpus --ocr --publish
 
 # Post-run store check and HTML report of the work directory.
 cargo run --locked --bin kanji-assets -- --output json local-png report --work-dir ./local-png-run

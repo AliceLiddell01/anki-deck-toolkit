@@ -1478,20 +1478,23 @@ cargo run --locked --bin kanji-assets -- --output json batch import \
 `kanji-assets local-png` строит PNG кандзи 174×174 в стиле Yarxi без Yarxi,
 сети и внешних интерпретаторов: системный Chromium через CDP рисует символ
 локальным файлом Noto Serif JP, снимок берётся нативно в 174×174 без
-масштабирования. Шрифт в репозиторий не входит; по умолчанию принимается только
-откалиброванный файл `NotoSerifJP-Regular.otf` версии 1.001 (SHA-256 записан в
-`local_render::CALIBRATED_FONT_SHA256`). Другой файл разрешает только
+масштабирования. Откалиброванный файл `NotoSerifJP-Regular.otf` версии 1.001
+хранится в `tools/asset-store/fonts/` вместе с текстом лицензии SIL Open Font
+License 1.1 (`OFL.txt`) и используется по умолчанию относительно
+`--repository-root`; `--font` задаёт другой путь. Принимается только файл с
+откалиброванным SHA-256 (`local_render::CALIBRATED_FONT_SHA256`, его совпадение
+с файлом репозитория закреплено тестом). Другой файл разрешает только
 `render --allow-uncalibrated-font`, и такой результат помечается
 неоткалиброванным; `run` и публикация его не принимают.
 
 ```bash
 # Сгенерировать PNG в новый каталог вне decks/; хранилище не меняется.
 cargo run --locked --bin kanji-assets -- --output json local-png render \
-  --font ./NotoSerifJP-Regular.otf --out ./local-png 亜漢 --raw
+  --out ./local-png 亜漢 --raw
 
 # Возобновляемый прогон по корпусу: рендер, валидатор, слепой OCR, публикация.
 cargo run --locked --bin kanji-assets -- --output json local-png run \
-  --font ./NotoSerifJP-Regular.otf --work-dir ./local-png-run --from-corpus --ocr --publish
+  --work-dir ./local-png-run --from-corpus --ocr --publish
 
 # Пост-проверка хранилища и HTML-отчёт рабочего каталога.
 cargo run --locked --bin kanji-assets -- --output json local-png report --work-dir ./local-png-run

@@ -798,6 +798,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repository_font_is_the_calibrated_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fonts/NotoSerifJP-Regular.otf");
+        let font = LocalFont::load(&path, false).expect("шрифт репозитория откалиброван");
+        assert_eq!(font.sha256, CALIBRATED_FONT_SHA256);
+        assert!(font.has_glyph('漢'));
+    }
+
+    #[test]
     fn coverage_correction_keeps_frame_and_extremes() {
         assert_eq!(correct_channel(34), 34);
         assert_eq!(correct_channel(0), 34);
